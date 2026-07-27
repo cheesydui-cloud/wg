@@ -38,7 +38,7 @@ sudo apt install -y git
 git clone https://github.com/cheesydui-cloud/wg.git
 cd wg
 
-# 3. 一键安装（自动生成随机密码）
+# 3. 一键安装（默认用户名 admin，自动生成随机密码）
 sudo bash install.sh
 ```
 
@@ -60,12 +60,19 @@ sudo APP_DIR=/opt/wg-panel WG_PORT=51821 WG_UDP_PORT=51820 WG_PASSWORD='你的�
 
 ```text
 面板地址: http://服务器IP:51821
-初始密码: xxxxxxxxxxxx
-服务管理: systemctl status wg-panel
+用户名:   admin
+密  码:   xxxxxxxxxxxx
+服务状态: systemctl status wg-panel
 数据目录: /opt/wg-panel/data
 ```
 
-浏览器打开该地址即可使用。
+浏览器打开该地址，使用 **admin + 终端打印的随机密码** 登录。
+
+忘记密码可查看（仅 root）：
+
+```bash
+sudo cat /opt/wg-panel/data/initial-credentials.txt
+```
 
 ---
 
@@ -222,6 +229,7 @@ docker run -d --name wg-panel --network host --cap-add NET_ADMIN --cap-add SYS_M
 |------|------|------|
 | `WG_PORT` | `51821` | 面板 HTTP 端口 |
 | `WG_HOST` | `0.0.0.0` | 监听地址 |
+| `WG_USERNAME` | `admin` | 面板登录用户名（默认 admin） |
 | `WG_PASSWORD` | 空 | 首次初始化密码；`install.sh` 未设置时会随机生成 |
 | `WG_DATA_DIR` | `./data` | 数据目录（状态、备份配置） |
 | `WG_ALLOW_APPLY` | `1` | 是否允许写入系统并操作接口（`0` 关闭） |

@@ -8,6 +8,7 @@ const {
   PORT,
   HOST,
   PASSWORD,
+  USERNAME,
   ROOT,
   loadState,
   saveState,
@@ -19,11 +20,17 @@ const wg = require('./wg-manager');
 ensureDataDir();
 let state = loadState();
 
+// 兼容旧数据：补默认用户名
+if (!state.username) {
+  state.username = auth.DEFAULT_USERNAME;
+  saveState(state);
+}
+
 // 环境变量密码：若未设置面板密码且提供了 WG_PASSWORD，则初始化
 if (!state.passwordHash && PASSWORD) {
-  auth.setPassword(state, PASSWORD);
+  auth.setPassword(state, PASSWORD, USERNAME || auth.DEFAULT_USERNAME);
   saveState(state);
-  console.log('[wg-panel] 已使用环境变量 WG_PASSWORD 初始化登录密码');
+  console.log(`[wg-panel] 已初始化登录账号: ${state.username}（来自环境变量）`);
 }
 
 function persist() {
@@ -82,6 +89,8 @@ app.get('/api/status', async (req, res) => {
     needSetup: auth.needsSetup(state),
     loggedIn,
     wizardDone: Boolean(state.wizardDone),
+    defaultUsername: auth.DEFAULT_USERNAME,
+    username: loggedIn ? state.username || auth.DEFAULT_USERNAME : undefined,
     tools,
     interface: loggedIn ? iface : undefined,
     clientCount: state.clients.length,
@@ -101,11 +110,12 @@ app.post('/api/setup', (req, res) => {
   if (!auth.needsSetup(state)) {
     return res.status(400).json({ error: '已完成初始化，请直接登录' });
   }
-  const { password } = req.body || {};
+  const { password, username } = req.body || {};
   if (!password || String(password).length < 6) {
     return res.status(400).json({ error: '密码至少 6 位' });
   }
-  auth.setPassword(state, String(password));
+  const user = String(username || auth.DEFAULT_USERNAME).trim() || auth.DEFAULT_USERNAME;
+  auth.setPassword(state, String(password), user);
   wg.ensureServerKeys(state);
   if (!state.server.postUp) {
     state.server.postUp = wg.defaultPostUp(state.server.interfaceName);
@@ -118,13 +128,13 @@ app.post('/api/setup', (req, res) => {
     sameSite: 'lax',
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
-  res.json({ ok: true, message: '初始化成功' });
+  res.json({ ok: true, message: '初始化成功', username: state.username });
 });
 
 app.post('/api/login', (req, res) => {
-  const { password } = req.body || {};
-  if (!auth.verifyPassword(state, String(password || ''))) {
-    return res.status(401).json({ error: '密码错误' });
+  const { password, username } = req.body || {};
+  if (!auth.verifyLogin(state, username, String(password || ''))) {
+    return res.status(401).json({ error: '用户名或密码错误' });
   }
   const token = auth.createSession();
   res.cookie('wg_session', token, {
@@ -132,7 +142,7 @@ app.post('/api/login', (req, res) => {
     sameSite: 'lax',
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
-  res.json({ ok: true });
+  res.json({ ok: true, username: state.username || auth.DEFAULT_USERNAME });
 });
 
 app.post('/api/logout', (req, res) => {
@@ -142,16 +152,19 @@ app.post('/api/logout', (req, res) => {
 });
 
 app.post('/api/password', (req, res) => {
-  const { currentPassword, newPassword } = req.body || {};
+  const { currentPassword, newPassword, newUsername } = req.body || {};
   if (!auth.verifyPassword(state, String(currentPassword || ''))) {
     return res.status(401).json({ error: '当前密码错误' });
   }
   if (!newPassword || String(newPassword).length < 6) {
     return res.status(400).json({ error: '新密码至少 6 位' });
   }
-  auth.setPassword(state, String(newPassword));
+  const user = newUsername !== undefined
+    ? String(newUsername || auth.DEFAULT_USERNAME).trim() || auth.DEFAULT_USERNAME
+    : state.username || auth.DEFAULT_USERNAME;
+  auth.setPassword(state, String(newPassword), user);
   persist();
-  res.json({ ok: true, message: '密码已更新' });
+  res.json({ ok: true, message: '账号已更新', username: state.username });
 });
 
 app.get('/api/server', (req, res) => {
@@ -365,12 +378,14 @@ app.post('/api/import', (req, res) => {
   const passwordHash = state.passwordHash;
   const passwordSalt = state.passwordSalt;
   const sessionSecret = state.sessionSecret;
+  const username = state.username || auth.DEFAULT_USERNAME;
   state.server = { ...state.server, ...body.server };
   state.clients = body.clients;
   state.wizardDone = body.wizardDone !== false;
   state.passwordHash = passwordHash;
   state.passwordSalt = passwordSalt;
   state.sessionSecret = sessionSecret;
+  state.username = username;
   persist();
   res.json({ ok: true, message: `已导入 ${state.clients.length} 个客户端` });
 });

@@ -98,9 +98,13 @@ function renderSetup() {
       <div class="auth-card">
         <div class="logo">WG</div>
         <h1>欢迎使用</h1>
-        <p class="muted">首次使用，请设置面板登录密码。密码只保存在你的服务器上。</p>
-        <div class="tip">建议使用强密码，并通过防火墙限制面板端口访问。</div>
+        <p class="muted">首次使用请设置登录账号。默认用户名 <strong>admin</strong>，密码只保存在服务器上。</p>
+        <div class="tip">若通过 install.sh 安装，终端会打印随机密码；也可在此重新设置。</div>
         <form id="setup-form">
+          <div class="form-row">
+            <label>用户名</label>
+            <input class="field" type="text" name="username" value="admin" required autocomplete="username" />
+          </div>
           <div class="form-row">
             <label>登录密码 ${help('至少 6 位，用于保护面板')}</label>
             <input class="field" type="password" name="password" minlength="6" required placeholder="请输入密码" autocomplete="new-password" />
@@ -117,12 +121,13 @@ function renderSetup() {
   document.getElementById('setup-form').onsubmit = async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
+    const username = fd.get('username') || 'admin';
     const password = fd.get('password');
     const password2 = fd.get('password2');
     const err = document.getElementById('setup-err');
     if (password !== password2) { err.textContent = '两次密码不一致'; return; }
     try {
-      await api('/api/setup', { method: 'POST', body: { password } });
+      await api('/api/setup', { method: 'POST', body: { username, password } });
       toast('初始化成功');
       await boot();
     } catch (ex) { err.textContent = ex.message; }
@@ -130,6 +135,7 @@ function renderSetup() {
 }
 
 function renderLogin() {
+  const defaultUser = state.status?.defaultUsername || 'admin';
   app.innerHTML = `
     <div class="auth-screen">
       <div class="auth-card">
@@ -138,19 +144,26 @@ function renderLogin() {
         <p class="muted">WireGuard 服务端配置管理</p>
         <form id="login-form">
           <div class="form-row">
+            <label>用户名</label>
+            <input class="field" type="text" name="username" value="${esc(defaultUser)}" required autocomplete="username" />
+          </div>
+          <div class="form-row">
             <label>密码</label>
             <input class="field" type="password" name="password" required placeholder="输入面板密码" autocomplete="current-password" />
           </div>
           <button class="btn btn-primary" style="width:100%" type="submit">登录</button>
           <p class="field-hint" id="login-err" style="color:var(--danger)"></p>
+          <p class="field-hint">默认用户名 <strong>admin</strong>，密码见安装时终端输出</p>
         </form>
       </div>
     </div>`;
   document.getElementById('login-form').onsubmit = async (e) => {
     e.preventDefault();
-    const password = new FormData(e.target).get('password');
+    const fd = new FormData(e.target);
+    const username = fd.get('username') || 'admin';
+    const password = fd.get('password');
     try {
-      await api('/api/login', { method: 'POST', body: { password } });
+      await api('/api/login', { method: 'POST', body: { username, password } });
       await boot();
     } catch (ex) {
       document.getElementById('login-err').textContent = ex.message;
@@ -530,10 +543,11 @@ function renderSettings() {
     <div class="page-header"><div><h2>设置</h2><p>密码、备份与主题</p></div></div>
     <div class="grid grid-2">
       <div class="card">
-        <h3>修改登录密码</h3>
+        <h3>修改登录账号</h3>
+        <div class="form-row"><label>当前用户名</label><input class="field" id="pw-user" value="${esc(state.status?.username || 'admin')}" /></div>
         <div class="form-row"><label>当前密码</label><input class="field" type="password" id="pw-old" /></div>
         <div class="form-row"><label>新密码</label><input class="field" type="password" id="pw-new" minlength="6" /></div>
-        <button class="btn btn-primary" id="pw-save">更新密码</button>
+        <button class="btn btn-primary" id="pw-save">更新账号</button>
       </div>
       <div class="card">
         <h3>数据备份</h3>
@@ -565,10 +579,18 @@ function renderSettings() {
 function bindSettings() {
   document.getElementById('pw-save').onclick = async () => {
     try {
-      await api('/api/password', { method: 'POST', body: { currentPassword: val('pw-old'), newPassword: val('pw-new') } });
-      toast('密码已更新');
+      const res = await api('/api/password', {
+        method: 'POST',
+        body: {
+          currentPassword: val('pw-old'),
+          newPassword: val('pw-new'),
+          newUsername: val('pw-user') || 'admin',
+        },
+      });
+      toast(res.message || '账号已更新');
       document.getElementById('pw-old').value = '';
       document.getElementById('pw-new').value = '';
+      if (state.status) state.status.username = res.username || val('pw-user') || 'admin';
     } catch (ex) { toast(ex.message, 'err'); }
   };
   document.getElementById('exp-btn').onclick = () => { window.location.href = '/api/export'; };

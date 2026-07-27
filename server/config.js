@@ -15,6 +15,7 @@ function ensureDataDir() {
 function defaultState() {
   return {
     version: 1,
+    username: 'admin',
     passwordHash: null,
     passwordSalt: null,
     sessionSecret: crypto.randomBytes(32).toString('hex'),
@@ -67,6 +68,7 @@ function saveState(state) {
 const PORT = Number(process.env.WG_PORT || process.env.PORT || 51821);
 const HOST = process.env.WG_HOST || '0.0.0.0';
 const PASSWORD = process.env.WG_PASSWORD || '';
+const USERNAME = process.env.WG_USERNAME || 'admin';
 const WG_QUICK = process.env.WG_QUICK_BIN || 'wg-quick';
 const WG_BIN = process.env.WG_BIN || 'wg';
 const ALLOW_APPLY = process.env.WG_ALLOW_APPLY !== '0';
@@ -78,6 +80,7 @@ module.exports = {
   PORT,
   HOST,
   PASSWORD,
+  USERNAME,
   WG_QUICK,
   WG_BIN,
   ALLOW_APPLY,

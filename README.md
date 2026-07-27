@@ -3,7 +3,7 @@
 中文、新手友好的 **mieru / mita 出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v2.0.0**
+当前版本：**v2.0.1**
 
 > **v2 起默认协议是 mieru，不再是 WireGuard。**  
 > 老板移动前置 + 落地家宽只支持 mieru 时，请用本版本。  
@@ -56,6 +56,19 @@ sudo bash install.sh --update
 ```
 
 浏览器打开 `http://面板IP:51821`。
+
+#### 忘记登录密码（不会丢配置）
+
+`--update` **不会**改登录密码。重置：
+
+```bash
+cd ~/wg && git pull
+sudo bash install.sh --reset-password '你的新密码'
+# 或：
+sudo node /opt/wg-panel/scripts/reset-password.js --restart '你的新密码'
+```
+
+默认用户名 `admin`。凭据也会写到 `/opt/wg-panel/data/initial-credentials.txt`。
 
 ### 2. 向导选「另一台落地机」
 

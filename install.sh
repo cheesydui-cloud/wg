@@ -6,10 +6,12 @@ set -euo pipefail
 #   sudo bash install.sh
 #   sudo WG_PASSWORD='你的密码' bash install.sh
 #   sudo bash install.sh --update
+#   sudo bash install.sh --reset-password '新密码'
 #
 # 默认登录用户名：admin
 # v2+ 协议为 mieru；WireGuard 见 tag v1.4.1
 # 未指定 WG_PASSWORD 且首次安装时自动生成随机密码
+# --update 不会改登录密码；忘记密码请用 --reset-password
 
 APP_DIR="${APP_DIR:-/opt/wg-panel}"
 PANEL_PORT="${WG_PORT:-51821}"
@@ -17,21 +19,64 @@ WG_PORT_UDP="${WG_UDP_PORT:-51820}"
 SERVICE_NAME="wg-panel"
 DEFAULT_USER="${WG_USERNAME:-admin}"
 UPDATE_MODE=0
+RESET_PASSWORD=""
 
-for arg in "$@"; do
+args=("$@")
+i=0
+while [[ $i -lt ${#args[@]} ]]; do
+  arg="${args[$i]}"
   case "$arg" in
     --update|-u) UPDATE_MODE=1 ;;
+    --reset-password|--set-password)
+      i=$((i + 1))
+      RESET_PASSWORD="${args[$i]:-}"
+      if [[ -z "${RESET_PASSWORD}" ]]; then
+        echo "用法: sudo bash install.sh --reset-password '新密码'"
+        exit 1
+      fi
+      ;;
     --help|-h)
-      echo "用法: sudo bash install.sh [--update]"
-      echo "  --update  更新代码，保留 data 与已有密码"
+      echo "用法: sudo bash install.sh [--update] [--reset-password 新密码]"
+      echo "  --update              更新代码，保留 data 与已有密码"
+      echo "  --reset-password P    重置登录密码为 P（至少 6 位）并重启服务"
       exit 0
       ;;
   esac
+  i=$((i + 1))
 done
 
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "请使用 root 运行：sudo bash install.sh"
   exit 1
+fi
+
+# 仅重置密码：不重装
+if [[ -n "${RESET_PASSWORD}" && "${UPDATE_MODE}" -eq 0 && ! -f "${APP_DIR}/package.json" ]]; then
+  :
+fi
+if [[ -n "${RESET_PASSWORD}" ]]; then
+  STATE_JSON="${APP_DIR}/data/state.json"
+  if [[ ! -f "${STATE_JSON}" ]]; then
+    echo "未找到 ${STATE_JSON}，请先安装面板"
+    exit 1
+  fi
+  if [[ ${#RESET_PASSWORD} -lt 6 ]]; then
+    echo "密码至少 6 位"
+    exit 1
+  fi
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  RESET_JS=""
+  if [[ -f "${APP_DIR}/scripts/reset-password.js" ]]; then
+    RESET_JS="${APP_DIR}/scripts/reset-password.js"
+  elif [[ -f "${SCRIPT_DIR}/scripts/reset-password.js" ]]; then
+    RESET_JS="${SCRIPT_DIR}/scripts/reset-password.js"
+  else
+    echo "找不到 scripts/reset-password.js"
+    exit 1
+  fi
+  echo "==> 重置面板登录密码"
+  node "${RESET_JS}" --data-dir "${APP_DIR}/data" --user "${DEFAULT_USER}" --restart "${RESET_PASSWORD}"
+  exit 0
 fi
 
 echo "==> 安装系统依赖"

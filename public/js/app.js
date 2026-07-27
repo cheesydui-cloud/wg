@@ -281,7 +281,8 @@ function renderLogin() {
               placeholder="点这里输入密码" />
             <button type="button" class="btn btn-ghost" id="li-toggle" title="显示/隐藏">隐藏</button>
           </div>
-          <p class="field-hint">若输入框无法改：点一次密码框，全选后直接输入；或用下方「命令行重置」。</p>
+          <p class="field-hint">若输不进去：点密码框 → 全选 → 直接输入。忘记密码在面板机执行：
+            <code>sudo bash install.sh --reset-password '新密码'</code></p>
           <button type="submit" class="btn btn-primary btn-block" id="li-go">登录</button>
         </form>
       </div>

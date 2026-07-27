@@ -1,11 +1,12 @@
 {
   "name": "wg-panel",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "mieru / mita \u51fa\u53e3\u7ba1\u7406\u9762\u677f\uff08\u9762\u677f + Agent \u8fdc\u7a0b\u843d\u5730\uff09",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
-    "dev": "node --watch server/index.js"
+    "dev": "node --watch server/index.js",
+    "reset-password": "node scripts/reset-password.js"
   },
   "engines": {
     "node": ">=18"

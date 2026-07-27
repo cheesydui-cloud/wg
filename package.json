@@ -1,7 +1,7 @@
 {
   "name": "wg-panel",
-  "version": "1.1.0",
-  "description": "新手友好的 WireGuard 服务端配置管理面板",
+  "version": "1.1.1",
+  "description": "\u65b0\u624b\u53cb\u597d\u7684 WireGuard \u670d\u52a1\u7aef\u914d\u7f6e\u7ba1\u7406\u9762\u677f",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",

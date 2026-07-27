@@ -178,7 +178,12 @@ function authMiddleware(getState) {
   return (req, res, next) => {
     const state = getState();
     if (needsSetup(state)) {
-      if (req.path === '/api/setup' || req.path === '/api/status' || req.path.startsWith('/api/setup')) {
+      if (
+        req.path === '/api/setup' ||
+        req.path === '/api/status' ||
+        req.path === '/api/health' ||
+        req.path.startsWith('/api/setup')
+      ) {
         return next();
       }
       if (req.path.startsWith('/api/')) {

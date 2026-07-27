@@ -142,7 +142,9 @@ app.get('/install-mita.sh', (req, res) => {
 });
 
 app.get('/api/status', async (req, res) => {
-  const loggedIn = Boolean(req.user);
+  // 注意：/api/status 在 auth 中间件里放行，不会挂 req.user；必须自己读 cookie
+  const token = req.cookies?.wg_session || req.headers['x-session-token'];
+  const loggedIn = auth.isAuthed(token);
   const modeInfo = publicModeInfo();
   const dirty = loggedIn ? isUnifiedDirty() : false;
   res.json({

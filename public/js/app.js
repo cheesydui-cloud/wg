@@ -297,20 +297,28 @@ function renderLogin() {
   };
   const go = async (e) => {
     e?.preventDefault?.();
+    const btn = document.getElementById('li-go');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '登录中…';
+    }
     try {
+      const user = document.getElementById('li-user').value.trim() || 'admin';
+      const password = document.getElementById('li-pass').value;
       await api('/api/login', {
         method: 'POST',
-        body: {
-          username: document.getElementById('li-user').value.trim() || 'admin',
-          // 密码不要 trim 尾部空格以外的内容；仅去掉首尾空白
-          password: document.getElementById('li-pass').value,
-        },
+        body: { username: user, password },
       });
+      toast('登录成功');
       await boot();
     } catch (err) {
-      toast(err.message, 'err');
+      toast(err.message || '登录失败', 'err');
       passEl.focus();
       passEl.select();
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '登录';
+      }
     }
   };
   document.getElementById('li-form').onsubmit = go;

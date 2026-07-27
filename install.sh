@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# WireGuard 配置面板一键安装 / 更新（Debian/Ubuntu）
+# mieru 出口面板一键安装 / 更新（Debian/Ubuntu）
 # 用法：
 #   sudo bash install.sh
 #   sudo WG_PASSWORD='你的密码' bash install.sh
 #   sudo bash install.sh --update
 #
 # 默认登录用户名：admin
+# v2+ 协议为 mieru；WireGuard 见 tag v1.4.1
 # 未指定 WG_PASSWORD 且首次安装时自动生成随机密码
 
 APP_DIR="${APP_DIR:-/opt/wg-panel}"
@@ -36,7 +37,7 @@ fi
 echo "==> 安装系统依赖"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y curl ca-certificates wireguard wireguard-tools iptables openssl
+apt-get install -y curl ca-certificates iptables openssl
 
 if ! command -v node >/dev/null 2>&1; then
   echo "==> 安装 Node.js 20"
@@ -81,9 +82,9 @@ cd "${APP_DIR}"
 echo "==> 安装 npm 依赖"
 npm install --omit=dev
 
-echo "==> 开启 IPv4 转发"
+echo "==> 开启 IPv4 转发（mita 出站可选）"
 mkdir -p /etc/sysctl.d
-cat >/etc/sysctl.d/99-wireguard.conf <<'EOF'
+cat >/etc/sysctl.d/99-mieru-panel.conf <<'EOF'
 net.ipv4.ip_forward=1
 EOF
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
@@ -153,7 +154,7 @@ fi
 echo "==> 创建 / 更新 systemd 服务"
 cat >/etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]
-Description=WireGuard Config Panel
+Description=mieru Exit Panel
 After=network.target
 
 [Service]
@@ -181,7 +182,6 @@ fi
 
 if command -v ufw >/dev/null 2>&1; then
   ufw allow "${PANEL_PORT}/tcp" >/dev/null 2>&1 || true
-  ufw allow "${WG_PORT_UDP}/udp" >/dev/null 2>&1 || true
 fi
 
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -189,11 +189,12 @@ VER="$(node -p "require('${APP_DIR}/package.json').version" 2>/dev/null || echo 
 echo ""
 echo "============================================"
 if [[ "${UPDATE_MODE}" -eq 1 && "${SHOW_CRED}" -eq 0 ]]; then
-  echo " 更新完成！版本 v${VER}"
+  echo " 更新完成！版本 v${VER}（mieru）"
   echo " 面板地址: http://${IP:-服务器IP}:${PANEL_PORT}"
   echo " 登录账号保持不变（data 已保留）"
+  echo " 请在落地机重装 Agent，再点「一键落地」安装 mita"
 else
-  echo " 安装完成！版本 v${VER}"
+  echo " 安装完成！版本 v${VER}（mieru）"
   echo " 面板地址: http://${IP:-服务器IP}:${PANEL_PORT}"
   echo " 用户名:   ${DEFAULT_USER}"
   echo " 密  码:   ${WG_PASSWORD}"
@@ -201,6 +202,7 @@ else
     echo " （随机密码，请立即保存；也可查看 ${APP_DIR}/data/initial-credentials.txt）"
   fi
 fi
+echo " 协议: mieru / mita（非 WireGuard）"
 echo " 服务状态: systemctl status ${SERVICE_NAME}"
 echo " 查看日志: journalctl -u ${SERVICE_NAME} -f"
 echo " 数据目录: ${APP_DIR}/data"

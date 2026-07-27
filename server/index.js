@@ -18,33 +18,30 @@ const {
   ensureDataDir,
 } = require('./config');
 const auth = require('./auth');
-const wg = require('./wg-manager');
+const mieru = require('./mieru');
 const nodes = require('./nodes');
 
 ensureDataDir();
 auth.setSessionsFile(SESSIONS_FILE);
 let state = loadState();
 nodes.ensureNodes(state);
+mieru.ensureMieruDefaults(state);
+persist();
 
 if (!state.username) {
   state.username = auth.DEFAULT_USERNAME;
   saveState(state);
 }
 
-// 环境变量密码：若未设置面板密码且提供了 WG_PASSWORD，则初始化
 if (!state.passwordHash && PASSWORD) {
   auth.setPassword(state, PASSWORD, USERNAME || auth.DEFAULT_USERNAME);
-  // 安装脚本会设 WG_FORCE_PASSWORD_CHANGE=1；手动指定密码默认不强制
   state.forcePasswordChange = FORCE_PASSWORD_CHANGE;
   saveState(state);
-  console.log(`[wg-panel] 已初始化登录账号: ${state.username}（来自环境变量）`);
+  console.log(`[panel] 已初始化登录账号: ${state.username}`);
 }
 
 function persist() {
-  // agent 模式：统一 server/clients 同步到主节点
-  if (state.mode === 'agent') {
-    nodes.syncPrimaryFromState(state);
-  }
+  if (state.mode === 'agent') nodes.syncPrimaryFromState(state);
   saveState(state);
 }
 
@@ -54,25 +51,6 @@ function clientIp(req) {
     req.socket?.remoteAddress ||
     ''
   );
-}
-
-function healClientIps(list, serverAddress) {
-  let healed = 0;
-  for (const c of list || []) {
-    if (c.enabled === false) continue;
-    if (wg.isValidClientAddress(c.address)) continue;
-    try {
-      c.address = wg.nextClientAddress(
-        serverAddress,
-        (list || []).filter((x) => x.id !== c.id)
-      );
-      c.updatedAt = new Date().toISOString();
-      healed += 1;
-    } catch {
-      /* leave for apply to report */
-    }
-  }
-  return healed;
 }
 
 function markDirtyUnified() {
@@ -85,17 +63,27 @@ function markDirtyUnified() {
 function isUnifiedDirty() {
   if (state.mode === 'agent') {
     const primary = nodes.getPrimaryNode(state);
-    return primary ? nodes.isNodeDirty(primary, wg) : false;
+    return primary ? nodes.isNodeDirty(primary, { configHash: mieru.configHash }) : mieru.isDirty(state);
   }
-  return wg.isDirty(state);
+  return mieru.isDirty(state);
+}
+
+function publicServer(s) {
+  return {
+    listenPort: Number(s.listenPort) || 7901,
+    protocol: mieru.normalizeProtocol(s.protocol),
+    endpoint: s.endpoint || '',
+    mtu: s.mtu ?? 1400,
+    multiplexing: s.multiplexing || 'MULTIPLEXING_LOW',
+    trafficPattern: s.trafficPattern || 'conservative',
+  };
 }
 
 function publicModeInfo() {
   const primary = nodes.getPrimaryNode(state);
   const pub = primary ? nodes.publicNode(primary) : null;
   if (pub && primary) {
-    pub.dirty = nodes.isNodeDirty(primary, wg);
-    // 最近任务摘要
+    pub.dirty = nodes.isNodeDirty(primary, { configHash: mieru.configHash });
     const jobs = primary.jobs || [];
     const latest = jobs[0] || null;
     pub.latestJob = latest
@@ -108,9 +96,13 @@ function publicModeInfo() {
           finishedAt: latest.finishedAt,
         }
       : null;
+    const report = primary.lastReport || {};
+    pub.mita = report.mita || null;
+    pub.exitPublicIp = report.exitPublicIp || null;
   }
   return {
     mode: state.mode || 'local',
+    protocol: state.protocol || 'mieru',
     primaryNodeId: state.primaryNodeId || null,
     primaryNode: pub,
     showAdvancedNodes: Boolean(state.settings?.showAdvancedNodes),
@@ -118,50 +110,10 @@ function publicModeInfo() {
   };
 }
 
-function publicServer(s) {
-  return {
-    interfaceName: s.interfaceName,
-    listenPort: s.listenPort,
-    publicKey: s.publicKey,
-    address: s.address,
-    endpoint: s.endpoint,
-    dns: s.dns,
-    mtu: s.mtu,
-    postUp: s.postUp,
-    postDown: s.postDown,
-    confPath: s.confPath,
-    hasPrivateKey: Boolean(s.privateKey),
-  };
-}
-
-function publicClient(c, livePeer) {
-  return {
-    id: c.id,
-    name: c.name,
-    publicKey: c.publicKey,
-    address: c.address,
-    allowedIPs: c.allowedIPs,
-    persistentKeepalive: c.persistentKeepalive,
-    enabled: c.enabled !== false,
-    createdAt: c.createdAt,
-    updatedAt: c.updatedAt,
-    note: c.note || '',
-    hasPresharedKey: Boolean(c.presharedKey),
-    online: Boolean(livePeer?.online),
-    latestHandshake: livePeer?.latestHandshake || '',
-    transfer: livePeer?.transfer || '',
-    transferRx: livePeer?.transferRx || '',
-    transferTx: livePeer?.transferTx || '',
-    endpointLive: livePeer?.endpoint || '',
-  };
-}
-
-function peerMapFromStatus(iface) {
-  const map = new Map();
-  for (const p of iface?.peers || []) {
-    if (p.publicKey) map.set(p.publicKey, p);
-  }
-  return map;
+function panelBaseUrl(req) {
+  const host = req.headers['x-forwarded-host'] || req.headers.host || `127.0.0.1:${PORT}`;
+  const proto = req.headers['x-forwarded-proto'] || 'http';
+  return `${proto}://${host}`.replace(/\/$/, '');
 }
 
 const app = express();
@@ -170,32 +122,28 @@ app.use(cookieParser());
 app.use(auth.authMiddleware(() => state));
 app.use(express.static(path.join(ROOT, 'public')));
 
-// ---------- Public ----------
-
 app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     version: require(path.join(ROOT, 'package.json')).version,
+    protocol: 'mieru',
     uptime: process.uptime(),
   });
 });
 
+app.get('/install-agent.sh', (req, res) => {
+  res.type('text/x-shellscript');
+  res.sendFile(path.join(ROOT, 'install-agent.sh'));
+});
+
+app.get('/install-mita.sh', (req, res) => {
+  res.type('text/x-shellscript');
+  res.sendFile(path.join(ROOT, 'scripts', 'install-mita.sh'));
+});
+
 app.get('/api/status', async (req, res) => {
-  const tools = await wg.checkTools();
-  const token = req.cookies?.wg_session;
-  const loggedIn = auth.isAuthed(token);
-  let iface = { up: false, peers: [] };
+  const loggedIn = Boolean(req.user);
   const modeInfo = publicModeInfo();
-  if (loggedIn) {
-    if (state.mode === 'agent') {
-      const primary = nodes.getPrimaryNode(state);
-      const report = primary?.lastReport?.interface;
-      if (report) iface = report;
-      else if (primary?.lastReport) iface = primary.lastReport.interface || iface;
-    } else if (state.server.interfaceName) {
-      iface = await wg.getInterfaceStatus(state.server.interfaceName);
-    }
-  }
   const dirty = loggedIn ? isUnifiedDirty() : false;
   res.json({
     needSetup: auth.needsSetup(state),
@@ -206,43 +154,25 @@ app.get('/api/status', async (req, res) => {
     forcePasswordChange: loggedIn ? Boolean(state.forcePasswordChange) : false,
     dirty,
     lastAppliedAt: loggedIn ? state.lastAppliedAt : undefined,
-    tools,
-    interface: loggedIn ? iface : undefined,
-    clientCount: state.clients.length,
+    clientCount: (state.clients || []).length,
     version: require(path.join(ROOT, 'package.json')).version,
+    protocol: 'mieru',
     mode: modeInfo.mode,
     primaryNodeId: modeInfo.primaryNodeId,
     primaryNode: loggedIn ? modeInfo.primaryNode : undefined,
-    showAdvancedNodes: modeInfo.showAdvancedNodes,
     clientsNeedRescan: loggedIn ? Boolean(state.clientsNeedRescan) : false,
-    server: loggedIn
-      ? {
-          interfaceName: state.server.interfaceName,
-          endpoint: state.server.endpoint,
-          listenPort: state.server.listenPort,
-          address: state.server.address,
-          publicKey: state.server.publicKey,
-        }
-      : undefined,
+    server: loggedIn ? publicServer(state.server) : undefined,
+    legacyWireGuard: loggedIn ? Boolean(state.legacyWireGuard) : false,
   });
 });
 
 app.post('/api/setup', (req, res) => {
-  if (!auth.needsSetup(state)) {
-    return res.status(400).json({ error: '已完成初始化，请直接登录' });
-  }
-  const { password, username } = req.body || {};
-  if (!password || String(password).length < 6) {
-    return res.status(400).json({ error: '密码至少 6 位' });
-  }
-  const user = String(username || auth.DEFAULT_USERNAME).trim() || auth.DEFAULT_USERNAME;
-  auth.setPassword(state, String(password), user);
+  if (!auth.needsSetup(state)) return res.status(400).json({ error: '已完成初始化' });
+  const username = String(req.body?.username || auth.DEFAULT_USERNAME).trim() || auth.DEFAULT_USERNAME;
+  const password = String(req.body?.password || '');
+  if (password.length < 6) return res.status(400).json({ error: '密码至少 6 位' });
+  auth.setPassword(state, password, username);
   state.forcePasswordChange = false;
-  wg.ensureServerKeys(state);
-  if (!state.server.postUp) {
-    state.server.postUp = wg.defaultPostUp(state.server.interfaceName);
-    state.server.postDown = wg.defaultPostDown(state.server.interfaceName);
-  }
   persist();
   const token = auth.createSession();
   res.cookie('wg_session', token, {
@@ -250,12 +180,13 @@ app.post('/api/setup', (req, res) => {
     sameSite: 'lax',
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
-  res.json({ ok: true, message: '初始化成功', username: state.username });
+  res.json({ ok: true, username: state.username });
 });
 
 app.post('/api/login', (req, res) => {
-  const { password, username } = req.body || {};
   const ip = clientIp(req);
+  const username = String(req.body?.username || '');
+  const password = req.body?.password;
   const lock = auth.getLockStatus(ip, username);
   if (lock.locked) {
     return res.status(429).json({
@@ -267,13 +198,12 @@ app.post('/api/login', (req, res) => {
     const after = auth.recordLoginFailure(ip, username);
     if (after.locked) {
       return res.status(429).json({
-        error: `用户名或密码错误，账号已临时锁定 ${Math.ceil(auth.LOCK_MS / 60000)} 分钟`,
+        error: `用户名或密码错误，账号已临时锁定`,
         retryAfterSec: after.retryAfterSec,
       });
     }
     return res.status(401).json({
       error: `用户名或密码错误，还可尝试 ${after.remainingAttempts} 次`,
-      remainingAttempts: after.remainingAttempts,
     });
   }
   auth.clearLoginFailures(ip, username);
@@ -314,7 +244,7 @@ app.post('/api/password', (req, res) => {
   res.json({ ok: true, message: '账号已更新', username: state.username });
 });
 
-// ---------- Server ----------
+// ---------- Server (mieru) ----------
 
 app.get('/api/server', (req, res) => {
   res.json({
@@ -323,6 +253,7 @@ app.get('/api/server', (req, res) => {
     dirty: isUnifiedDirty(),
     lastAppliedAt: state.lastAppliedAt,
     clientsNeedRescan: Boolean(state.clientsNeedRescan),
+    protocol: 'mieru',
   });
 });
 
@@ -330,322 +261,105 @@ app.put('/api/server', (req, res) => {
   const body = req.body || {};
   const s = state.server;
   const prevEndpoint = String(s.endpoint || '');
-  const prevListen = Number(s.listenPort);
-  const prevServerHash = (() => {
+  const prevPort = Number(s.listenPort);
+  const prevProto = mieru.normalizeProtocol(s.protocol);
+  const prevHash = (() => {
     try {
-      return wg.configHash({ server: { ...s }, clients: state.clients });
+      return mieru.configHash(state);
     } catch {
       return null;
     }
   })();
 
-  const fields = [
-    'interfaceName',
-    'listenPort',
-    'address',
-    'endpoint',
-    'dns',
-    'mtu',
-    'postUp',
-    'postDown',
-    'confPath',
-  ];
-  for (const f of fields) {
-    if (body[f] !== undefined) s[f] = body[f];
-  }
-  if (body.listenPort !== undefined) {
-    const fallback = state.mode === 'agent' ? 7901 : 51820;
-    s.listenPort = Number(body.listenPort) || fallback;
-  }
-  if (body.mtu !== undefined) s.mtu = body.mtu === '' || body.mtu === null ? null : Number(body.mtu);
+  if (body.listenPort !== undefined) s.listenPort = Number(body.listenPort) || 7901;
+  if (body.protocol !== undefined) s.protocol = mieru.normalizeProtocol(body.protocol);
+  if (body.endpoint !== undefined) s.endpoint = String(body.endpoint || '').trim();
+  if (body.mtu !== undefined) s.mtu = body.mtu === '' || body.mtu === null ? 1400 : Number(body.mtu);
+  if (body.multiplexing !== undefined) s.multiplexing = body.multiplexing;
+  if (body.trafficPattern !== undefined) s.trafficPattern = body.trafficPattern;
 
-  // 端口变更时同步 Endpoint 端口
   if (body.syncEndpointPort && s.endpoint) {
-    const parsed = wg.parseEndpoint(s.endpoint);
+    const parsed = mieru.parseEndpoint(s.endpoint);
     const host = parsed.host || String(s.endpoint).replace(/:\d+$/, '');
     if (host) s.endpoint = `${host}:${s.listenPort}`;
+  } else if (s.endpoint && !String(s.endpoint).includes(':') && s.listenPort) {
+    s.endpoint = `${String(s.endpoint).trim()}:${s.listenPort}`;
   }
 
-  // 规范化 endpoint：host:port
-  if (s.endpoint) {
-    const ep = String(s.endpoint).trim();
-    if (ep && !ep.includes(':') && s.listenPort) {
-      s.endpoint = `${ep}:${s.listenPort}`;
-    }
-  }
-
-  if (body.regenerateKeys) {
-    const kp = wg.generateKeyPair();
-    s.privateKey = kp.privateKey;
-    s.publicKey = kp.publicKey;
-  } else if (body.privateKey) {
-    if (!wg.isValidKey(body.privateKey)) {
-      return res.status(400).json({ error: '私钥格式无效（需要 32 字节 base64）' });
-    }
-    s.privateKey = body.privateKey.trim();
-    s.publicKey = wg.derivePublicKey(s.privateKey);
-  }
-
-  wg.ensureServerKeys(state);
   if (body.wizardDone !== undefined) state.wizardDone = Boolean(body.wizardDone);
 
   const endpointChanged = prevEndpoint !== String(s.endpoint || '');
-  if (endpointChanged) state.clientsNeedRescan = true;
-
-  // 始终把统一 server 同步到主节点（含 endpoint）
-  if (state.mode === 'agent') nodes.syncPrimaryFromState(state);
-
-  // 用服务端 conf hash 判断是否真的需要 apply（endpoint/dns 不在服务端 conf 里）
-  let serverConfChanged = Boolean(body.regenerateKeys || body.privateKey);
+  let serverConfChanged = false;
   try {
-    const nextHash = wg.configHash({ server: { ...s }, clients: state.clients });
-    if (prevServerHash && nextHash !== prevServerHash) serverConfChanged = true;
-    if (!serverConfChanged && prevServerHash && nextHash === prevServerHash) {
-      // 仅客户端侧字段：清掉误标脏
-      if (state.mode === 'agent') {
-        const node = nodes.getPrimaryNode(state);
-        if (node && node.lastAppliedHash && nextHash === node.lastAppliedHash) {
-          node._dirtyFlag = false;
-        }
-      }
-    }
+    const nextHash = mieru.configHash(state);
+    serverConfChanged =
+      prevHash !== nextHash ||
+      prevPort !== Number(s.listenPort) ||
+      prevProto !== mieru.normalizeProtocol(s.protocol);
   } catch {
     serverConfChanged = true;
   }
 
-  if (serverConfChanged) markDirtyUnified();
+  if (endpointChanged) state.clientsNeedRescan = true;
+  if (state.mode === 'agent') nodes.syncPrimaryFromState(state);
+
+  if (serverConfChanged) {
+    markDirtyUnified();
+  } else if (state.mode === 'agent') {
+    const node = nodes.getPrimaryNode(state);
+    if (node && node.lastAppliedHash) {
+      try {
+        if (mieru.configHash(state) === node.lastAppliedHash) node._dirtyFlag = false;
+      } catch {
+        /* */
+      }
+    }
+  }
 
   persist();
-  const tipParts = [];
-  if (endpointChanged) {
-    tipParts.push('Endpoint 已更新。手机旧隧道不会自动变，请删除后重新扫码');
-  }
-  if (serverConfChanged) {
-    tipParts.push(isUnifiedDirty() ? '服务端配置有变，请点「应用配置」或「一键落地」' : '');
-  }
+  const tips = [];
+  if (endpointChanged) tips.push('入站地址已更新，请重新复制/扫码客户端链接');
+  if (serverConfChanged && isUnifiedDirty()) tips.push('服务端参数有变，请点「应用配置」或「一键落地」');
   res.json({
     server: publicServer(state.server),
     wizardDone: state.wizardDone,
     dirty: isUnifiedDirty(),
-    mode: state.mode,
     endpointChanged,
     serverConfChanged,
     clientsNeedRescan: Boolean(state.clientsNeedRescan),
-    tip: tipParts.filter(Boolean).join('。') || '已保存',
+    tip: tips.join('。') || '已保存',
   });
 });
 
-/** 确认用户已重扫全部客户端 */
 app.post('/api/clients/rescan-ack', (req, res) => {
   state.clientsNeedRescan = false;
   persist();
   res.json({ ok: true, clientsNeedRescan: false });
 });
 
-app.post('/api/server/nat-template', async (req, res) => {
-  const iface = state.server.interfaceName || 'wg0';
-  const egress = await wg.detectDefaultInterface();
-  const egressIface = req.body?.egressIface || egress.iface || 'eth0';
-  state.server.postUp = wg.defaultPostUp(iface, egressIface);
-  state.server.postDown = wg.defaultPostDown(iface, egressIface);
-  persist();
+// ---------- Clients = mieru users ----------
+
+app.get('/api/clients', (req, res) => {
+  mieru.ensureMieruDefaults(state);
   res.json({
-    postUp: state.server.postUp,
-    postDown: state.server.postDown,
-    egressIface,
-    detected: egress,
-    tip: `已使用出口网卡 ${egressIface}。如不正确可手动修改。`,
-    dirty: wg.isDirty(state),
-  });
-});
-
-// ---------- 落地 / 网关出口 ----------
-
-app.get('/api/exit/status', async (req, res) => {
-  try {
-    const status = await wg.getExitStatus(state);
-    res.json(status);
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-/**
- * 一键落地（统一）：
- * - local：本机 setupExit + apply
- * - agent：同步到主节点并下发 exit job
- */
-app.post('/api/exit/setup', async (req, res) => {
-  try {
-    const body = req.body || {};
-    healClientIps(state.clients, state.server.address);
-
-    // 客户端全局代理
-    if (body.fullTunnelClients !== false) {
-      for (const c of state.clients || []) {
-        c.allowedIPs = '0.0.0.0/0, ::/0';
-        if (!c.persistentKeepalive) c.persistentKeepalive = 25;
-        c.updatedAt = new Date().toISOString();
-      }
-    }
-
-    if (state.mode === 'agent') {
-      const node = nodes.getPrimaryNode(state);
-      if (!node) {
-        return res.status(400).json({
-          ok: false,
-          error: '当前为远程出口模式，但还没有落地节点。请先在向导或出口页安装 Agent',
-        });
-      }
-      nodes.syncPrimaryFromState(state);
-      // 预写 NAT 模板到 state（agent 会按目标机网卡重写并回传）
-      if (!state.server.postUp || !/MASQUERADE/i.test(state.server.postUp)) {
-        const iface = state.server.interfaceName || 'wg0';
-        state.server.postUp = wg.defaultPostUp(iface, body.egressIface || 'eth0');
-        state.server.postDown = wg.defaultPostDown(iface, body.egressIface || 'eth0');
-        node.server.postUp = state.server.postUp;
-        node.server.postDown = state.server.postDown;
-      }
-      nodes.markNodeDirty(node);
-      const job = nodes.enqueueJob(node, 'exit', { fullTunnel: true });
-      persist();
-      return res.json({
-        ok: true,
-        mode: 'agent',
-        job,
-        applied: false,
-        pending: true,
-        message: node.lastSeenAt
-          ? '已向落地节点下发「一键落地」，请等待 Agent 执行（约 10 秒）'
-          : '任务已创建，但 Agent 尚未上线，请先在落地机安装 Agent',
-        server: publicServer(state.server),
-        node: nodes.publicNode(node),
-        dirty: true,
-      });
-    }
-
-    const result = await wg.setupExit(state, {
-      apply: body.apply !== false,
-      fullTunnelClients: false, // 已在上面处理
-      egressIface: body.egressIface || undefined,
-    });
-    persist();
-    const iface = await wg.getInterfaceStatus(state.server.interfaceName);
-    res.status(result.ok && (result.applied || body.apply === false) ? 200 : 500).json({
-      ...result,
-      mode: 'local',
-      server: publicServer(state.server),
-      interface: iface,
-      dirty: wg.isDirty(state),
-      lastAppliedAt: state.lastAppliedAt,
-    });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-app.get('/api/server/config', (req, res) => {
-  wg.ensureServerKeys(state);
-  const config = wg.buildServerConfig(state);
-  if (req.query.format === 'download') {
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename="${state.server.interfaceName || 'wg0'}.conf"`
-    );
-    return res.send(config);
-  }
-  res.json({ config, path: state.server.confPath, dirty: wg.isDirty(state) });
-});
-
-// ---------- Clients ----------
-
-app.get('/api/clients', async (req, res) => {
-  let iface = { up: false, peers: [] };
-  if (state.mode === 'agent') {
-    const primary = nodes.getPrimaryNode(state);
-    iface = primary?.lastReport?.interface || iface;
-    // 合并节点上客户端的 live 字段
-    if (primary?.clients) {
-      const liveMap = new Map(primary.clients.map((c) => [c.id, c]));
-      for (const c of state.clients) {
-        const live = liveMap.get(c.id);
-        if (live) {
-          c._online = live._online;
-          c._latestHandshake = live._latestHandshake;
-          c._transfer = live._transfer;
-        }
-      }
-    }
-  } else {
-    iface = await wg.getInterfaceStatus(state.server.interfaceName);
-  }
-  const map = peerMapFromStatus(iface);
-  res.json({
-    clients: state.clients.map((c) => {
-      const live = map.get(c.publicKey);
-      const pub = publicClient(c, live);
-      if (!live && c._online) {
-        pub.online = Boolean(c._online);
-        pub.latestHandshake = c._latestHandshake || '';
-        pub.transfer = c._transfer || '';
-      }
-      return pub;
-    }),
+    clients: state.clients.map((c) => mieru.publicClient(c)),
     dirty: isUnifiedDirty(),
     clientsNeedRescan: Boolean(state.clientsNeedRescan),
-    interfaceUp: Boolean(iface.up),
     mode: state.mode,
+    protocol: 'mieru',
   });
-});
-
-app.get('/api/clients/export/zip-json', (req, res) => {
-  wg.ensureServerKeys(state);
-  try {
-    const files = state.clients.map((c) => ({
-      name: `${wg.sanitizeName(c.name)}.conf`,
-      content: wg.buildClientConfig(state, c),
-    }));
-    res.json({ files, count: files.length });
-  } catch (err) {
-    res.status(400).json({ error: err.message, code: err.code });
-  }
 });
 
 app.post('/api/clients', (req, res) => {
   const body = req.body || {};
-  const name = (body.name || '').trim() || `客户端-${state.clients.length + 1}`;
-  wg.ensureServerKeys(state);
-
-  let address = (body.address || '').trim();
-  if (!address) {
-    try {
-      address = wg.nextClientAddress(state.server.address, state.clients);
-    } catch (err) {
-      return res.status(400).json({ error: err.message });
-    }
+  const name = (body.name || '').trim() || mieru.randomUsername();
+  if (state.clients.some((c) => c.name === name)) {
+    return res.status(400).json({ error: '用户名已存在' });
   }
-  try {
-    address = wg.normalizeClientAddress(address);
-  } catch (err) {
-    return res.status(400).json({ error: `客户端 IP 无效: ${err.message}` });
-  }
-  if (!address) {
-    return res.status(400).json({ error: '客户端内网 IP 不能为空' });
-  }
-
-  const kp = wg.generateKeyPair();
-  const usePsk = body.usePresharedKey !== false;
   const client = {
     id: crypto.randomUUID(),
     name,
-    privateKey: kp.privateKey,
-    publicKey: kp.publicKey,
-    presharedKey: usePsk ? wg.generatePresharedKey() : '',
-    address,
-    allowedIPs: (body.allowedIPs && String(body.allowedIPs).trim()) || '0.0.0.0/0, ::/0',
-    persistentKeepalive:
-      body.persistentKeepalive !== undefined ? Number(body.persistentKeepalive) : 25,
+    password: (body.password || '').trim() || mieru.randomPassword(18),
     enabled: body.enabled !== false,
     note: body.note || '',
     createdAt: new Date().toISOString(),
@@ -656,7 +370,7 @@ app.post('/api/clients', (req, res) => {
   markDirtyUnified();
   persist();
   res.status(201).json({
-    client: publicClient(client),
+    client: mieru.publicClient(client),
     dirty: true,
     mode: state.mode,
   });
@@ -664,357 +378,164 @@ app.post('/api/clients', (req, res) => {
 
 app.put('/api/clients/:id', (req, res) => {
   const c = state.clients.find((x) => x.id === req.params.id);
-  if (!c) return res.status(404).json({ error: '客户端不存在' });
+  if (!c) return res.status(404).json({ error: '用户不存在' });
   const body = req.body || {};
-  if (body.name !== undefined) c.name = String(body.name).trim() || c.name;
-  if (body.address !== undefined) {
-    let address = String(body.address).trim();
-    if (!address) {
-      try {
-        address = wg.nextClientAddress(
-          state.server.address,
-          state.clients.filter((x) => x.id !== c.id)
-        );
-      } catch (err) {
-        return res.status(400).json({ error: err.message });
-      }
+  if (body.name !== undefined) {
+    const name = String(body.name).trim();
+    if (!name) return res.status(400).json({ error: '用户名不能为空' });
+    if (state.clients.some((x) => x.id !== c.id && x.name === name)) {
+      return res.status(400).json({ error: '用户名已存在' });
     }
-    try {
-      address = wg.normalizeClientAddress(address);
-    } catch (err) {
-      return res.status(400).json({ error: `客户端 IP 无效: ${err.message}` });
-    }
-    if (!address) return res.status(400).json({ error: '客户端内网 IP 不能为空' });
-    c.address = address;
+    c.name = name;
   }
-  // 修复历史脏数据：已有客户端若无 IP，保存时自动补齐
-  if (!wg.isValidClientAddress(c.address)) {
-    try {
-      c.address = wg.nextClientAddress(
-        state.server.address,
-        state.clients.filter((x) => x.id !== c.id)
-      );
-    } catch (err) {
-      return res.status(400).json({ error: `客户端缺少内网 IP：${err.message}` });
-    }
+  if (body.password !== undefined && String(body.password).trim()) {
+    c.password = String(body.password).trim();
+    state.clientsNeedRescan = true;
   }
-  if (body.allowedIPs !== undefined) {
-    const a = String(body.allowedIPs).trim();
-    c.allowedIPs = a || '0.0.0.0/0, ::/0';
-  }
-  if (body.persistentKeepalive !== undefined) {
-    c.persistentKeepalive = Number(body.persistentKeepalive) || 0;
+  if (body.regeneratePassword) {
+    c.password = mieru.randomPassword(18);
+    state.clientsNeedRescan = true;
   }
   if (body.enabled !== undefined) c.enabled = Boolean(body.enabled);
   if (body.note !== undefined) c.note = String(body.note);
-  if (body.regenerateKeys) {
-    const kp = wg.generateKeyPair();
-    c.privateKey = kp.privateKey;
-    c.publicKey = kp.publicKey;
-  }
-  if (body.regeneratePsk) c.presharedKey = wg.generatePresharedKey();
-  if (body.removePsk) c.presharedKey = '';
   c.updatedAt = new Date().toISOString();
   markDirtyUnified();
   persist();
-  res.json({ client: publicClient(c), dirty: true });
+  res.json({ client: mieru.publicClient(c), dirty: true, clientsNeedRescan: state.clientsNeedRescan });
 });
 
 app.delete('/api/clients/:id', (req, res) => {
+  const enabled = state.clients.filter((c) => c.enabled !== false);
+  const target = state.clients.find((x) => x.id === req.params.id);
+  if (!target) return res.status(404).json({ error: '用户不存在' });
+  if (enabled.length <= 1 && target.enabled !== false) {
+    return res.status(400).json({ error: '至少保留一个启用用户' });
+  }
   const idx = state.clients.findIndex((x) => x.id === req.params.id);
-  if (idx < 0) return res.status(404).json({ error: '客户端不存在' });
   const [removed] = state.clients.splice(idx, 1);
   markDirtyUnified();
   persist();
-  res.json({ ok: true, removed: publicClient(removed), dirty: true });
+  res.json({ ok: true, removed: mieru.publicClient(removed), dirty: true });
 });
 
 app.get('/api/clients/:id/config', async (req, res) => {
   const c = state.clients.find((x) => x.id === req.params.id);
-  if (!c) return res.status(404).json({ error: '客户端不存在' });
-  if (!state.server.publicKey) wg.ensureServerKeys(state);
-  let config;
+  if (!c) return res.status(404).json({ error: '用户不存在' });
+  const format = String(req.query.format || 'json');
+  const proto = req.query.protocol || undefined;
+  let shareLink;
+  let clientJson;
   try {
-    config = wg.buildClientConfig(state, c);
+    shareLink = mieru.buildShareLink(state, c, proto);
+    clientJson = mieru.buildClientJson(state, c, proto);
   } catch (err) {
-    return res.status(400).json({ error: err.message, code: err.code || 'CONFIG' });
+    return res.status(400).json({ error: err.message, code: err.code });
   }
-  const format = req.query.format || 'text';
+
+  if (format === 'link' || format === 'text') {
+    return res.type('text/plain').send(shareLink);
+  }
   if (format === 'download') {
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename="${wg.sanitizeName(c.name)}.conf"`
-    );
-    return res.send(config);
+    res.setHeader('Content-Disposition', `attachment; filename="${c.name || 'mieru'}.json"`);
+    return res.json(clientJson);
   }
   if (format === 'qr') {
-    try {
-      const dataUrl = await QRCode.toDataURL(config, {
-        errorCorrectionLevel: 'M',
-        margin: 1,
-        width: 280,
-      });
-      return res.json({
-        config,
-        qr: dataUrl,
-        name: c.name,
-        endpoint: state.server.endpoint,
-        mode: state.mode,
-        tip:
-          state.mode === 'agent'
-            ? '请确认手机连的是落地机 Endpoint，不是面板 IP'
-            : '扫码后打开隧道，到「诊断」页查看是否握手',
-      });
-    } catch (err) {
-      return res.status(500).json({ error: '二维码生成失败: ' + err.message, config });
-    }
+    const qr = await QRCode.toDataURL(shareLink, { margin: 1, width: 280 });
+    return res.json({
+      name: c.name,
+      endpoint: state.server.endpoint,
+      shareLink,
+      config: JSON.stringify(clientJson, null, 2),
+      qr,
+      tip: '使用支持 mieru 的客户端导入链接或 JSON（小火箭/NekoBox/官方 mieru）',
+    });
   }
-  res.json({ config, name: c.name, endpoint: state.server.endpoint });
+  res.json({
+    name: c.name,
+    endpoint: state.server.endpoint,
+    shareLink,
+    client: clientJson,
+    tip: '手机导入 mierus:// 或 JSON，不要用 WireGuard',
+  });
 });
 
-// ---------- System / apply ----------
-
-app.get('/api/preflight', async (req, res) => {
-  wg.ensureServerKeys(state);
-  const result = await wg.preflight(state);
-  res.json(result);
-});
+// ---------- Apply / Exit ----------
 
 app.post('/api/apply', async (req, res) => {
-  wg.ensureServerKeys(state);
-  const healed = healClientIps(state.clients, state.server.address);
-  if (healed) persist();
-
-  // 远程模式：下发到主节点
+  mieru.ensureMieruDefaults(state);
   if (state.mode === 'agent') {
     const node = nodes.getPrimaryNode(state);
     if (!node) {
-      return res.status(400).json({
-        ok: false,
-        error: '远程出口模式但没有主节点，请先安装 Agent',
-      });
+      return res.status(400).json({ ok: false, error: '远程模式但没有主节点，请先安装 Agent' });
     }
     nodes.syncPrimaryFromState(state);
     nodes.markNodeDirty(node);
-    const job = nodes.enqueueJob(node, 'apply', {});
+    const job = nodes.enqueueJob(node, 'mieru_apply', {});
     persist();
     return res.json({
       ok: true,
       mode: 'agent',
       pending: true,
       job,
-      healedClients: healed,
       message: node.lastSeenAt
-        ? '已向落地节点下发「应用配置」，等待 Agent 执行（约 10 秒）'
+        ? '已下发「应用 mita 配置」到落地机'
         : '任务已创建，但 Agent 尚未上线',
-      node: nodes.publicNode(node),
-      dirty: isUnifiedDirty(),
-      clientsNeedRescan: Boolean(state.clientsNeedRescan),
+      dirty: true,
     });
   }
-
-  const result = await wg.applyConfig(state);
-  if (result.ok) persist();
-  const iface = await wg.getInterfaceStatus(state.server.interfaceName);
-  res.status(result.ok ? 200 : 500).json({
-    ...result,
-    mode: 'local',
-    healedClients: healed,
-    interface: iface,
-    dirty: isUnifiedDirty(),
-    lastAppliedAt: state.lastAppliedAt,
-    clientsNeedRescan: Boolean(state.clientsNeedRescan),
+  // local：提示需在本机有 mita；面板尽量不直接装（root 环境）
+  return res.status(400).json({
+    ok: false,
+    error: '本机模式请在本机 root 执行 mita 安装，或切换为远程落地机模式',
+    tip: '推荐：出口服务器 → 远程落地机 → 一键落地',
   });
 });
 
-app.post('/api/interface/stop', async (req, res) => {
-  const result = await wg.stopInterface(state.server.interfaceName);
-  res.status(result.ok ? 200 : 500).json(result);
-});
-
-app.get('/api/interface/status', async (req, res) => {
-  const iface = await wg.getInterfaceStatus(state.server.interfaceName);
-  const tools = await wg.checkTools();
-  res.json({
-    interface: iface,
-    tools,
-    dirty: wg.isDirty(state),
-    lastAppliedAt: state.lastAppliedAt,
-  });
-});
-
-app.get('/api/system/public-ip', async (req, res) => {
-  const result = await wg.detectPublicIp();
-  res.status(result.ok ? 200 : 500).json(result);
-});
-
-app.get('/api/system/egress', async (req, res) => {
-  const result = await wg.detectDefaultInterface();
-  res.json(result);
-});
-
-app.post('/api/system/fill-endpoint', async (req, res) => {
-  const port = state.server.listenPort || 51820;
-  let host = (req.body && req.body.host) || '';
-  let source = 'manual';
-  if (!host) {
-    // agent 模式禁止自动用面板出网 IP 当 Endpoint
-    if (state.mode === 'agent' && !req.body?.force) {
-      return res.status(400).json({
-        ok: false,
-        error:
-          '远程出口模式请手动填写落地机的入站地址（外部连接 IP 或移动入口），不要使用面板出网 IP',
-        tip: '例如 114.x.x.x:7901 或 211.x.x.x:7901',
-      });
-    }
-    const ip = await wg.detectPublicIp();
-    if (!ip.ok) return res.status(500).json(ip);
-    host = ip.ip;
-    source = ip.source || 'detect';
+app.post('/api/exit/setup', async (req, res) => {
+  mieru.ensureMieruDefaults(state);
+  if (state.mode !== 'agent') {
+    return res.status(400).json({
+      ok: false,
+      error: '一键落地请使用远程落地机模式（家宽装 Agent）',
+    });
   }
-  state.server.endpoint = `${host}:${port}`;
-  markDirtyUnified();
+  const node = nodes.getPrimaryNode(state);
+  if (!node) return res.status(400).json({ ok: false, error: '没有主节点' });
+  nodes.syncPrimaryFromState(state);
+  nodes.markNodeDirty(node);
+  const job = nodes.enqueueJob(node, 'exit', {});
   persist();
   res.json({
     ok: true,
-    endpoint: state.server.endpoint,
-    source,
-    warning:
-      source !== 'manual'
-        ? '探测到的是「出网 IP」，入口前置/CM 机器请改成商家给的外部连接或移动入口 IP'
-        : undefined,
-    server: publicServer(state.server),
-    dirty: true,
-  });
-});
-
-// ---------- 模式 / 诊断 / 统一出口 ----------
-
-app.get('/api/mode', (req, res) => {
-  res.json(publicModeInfo());
-});
-
-/**
- * 切换出口模式
- * body: { mode: 'local'|'agent', template?: 'cm'|'vps', name?: string, panelUrl?: string }
- */
-app.post('/api/mode', (req, res) => {
-  const body = req.body || {};
-  const mode = body.mode === 'agent' ? 'agent' : 'local';
-
-  if (mode === 'local') {
-    state.mode = 'local';
-    // 保留 primaryNodeId 以便再切回，但不强制清除节点数据
-    persist();
-    return res.json({
-      ok: true,
-      ...publicModeInfo(),
-      message: '已切换为本机出口：WireGuard 跑在面板这台机器上',
-    });
-  }
-
-  const { node, token, created } = nodes.ensurePrimaryNode(state, {
-    name: body.name || '落地出口',
-    template: body.template || 'cm',
-  });
-  // CM 模板默认端口
-  if (body.template === 'cm' || (!body.template && created)) {
-    if (!node.server.listenPort || node.server.listenPort === 51820) {
-      node.server.listenPort = 7901;
-    }
-    if (!state.server.listenPort || state.server.listenPort === 51820) {
-      state.server.listenPort = 7901;
-    }
-  }
-  if (body.template === 'vps' && created) {
-    node.server.listenPort = 51820;
-    state.server.listenPort = 51820;
-  }
-  // 同步密钥：优先已有 state
-  wg.ensureServerKeys(state);
-  node.server = { ...node.server, ...state.server };
-  node.clients = state.clients;
-  const base = body.panelUrl || panelBaseUrl(req);
-  const installCmd =
-    token || node.tokenPlain
-      ? nodes.installCommand({
-          panelUrl: base,
-          token: token || node.tokenPlain,
-          name: node.name,
-        })
-      : null;
-  persist();
-  res.json({
-    ok: true,
-    ...publicModeInfo(),
-    created,
-    token: token || (created ? node.tokenPlain : undefined),
-    installCommand: installCmd,
-    panelUrl: base,
-    server: publicServer(state.server),
-    message: created
-      ? '已创建远程出口，请在落地机执行安装命令'
-      : '已切换为远程出口模式',
+    mode: 'agent',
+    pending: true,
+    job,
+    message: node.lastSeenAt
+      ? '已下发「一键落地」：安装/配置 mita 并放行端口'
+      : '任务已创建，等待 Agent 上线',
+    node: nodes.publicNode(node),
   });
 });
 
 app.get('/api/exit/overview', async (req, res) => {
-  const modeInfo = publicModeInfo();
-  let exitStatus = null;
-  let agent = null;
-  if (state.mode === 'local') {
-    try {
-      exitStatus = await wg.getExitStatus(state);
-    } catch (err) {
-      exitStatus = { ok: false, error: err.message };
-    }
-  } else {
-    const node = nodes.getPrimaryNode(state);
-    agent = node ? nodes.publicNode(node) : null;
-    const report = node?.lastReport || null;
-    exitStatus = {
-      ok: true,
-      mode: 'agent',
-      ready: Boolean(
-        agent?.online &&
-          state.server?.endpoint &&
-          report?.interface?.up &&
-          report?.forward &&
-          report?.natActive
-      ),
-      forward: report?.forward ?? null,
-      natActive: report?.natActive ?? null,
-      interfaceUp: Boolean(report?.interface?.up),
-      endpoint: state.server?.endpoint || '',
-      egressIface: report?.egressIface || '',
-      exitPublicIp: report?.exitPublicIp || null,
-      tips: [
-        !agent ? '请先安装落地 Agent' : null,
-        agent && !agent.online ? 'Agent 离线' : null,
-        !state.server?.endpoint ? '请填写 Endpoint' : null,
-        report && !report.interface?.up ? '接口未启动，请一键落地/应用' : null,
-        report && !report.natActive ? 'NAT 未生效，请一键落地' : null,
-      ].filter(Boolean),
-    };
-  }
+  const primary = nodes.getPrimaryNode(state);
+  const report = primary?.lastReport || null;
   res.json({
-    ...modeInfo,
-    server: publicServer(state.server),
-    clientCount: state.clients.length,
-    dirty:
-      state.mode === 'agent'
-        ? Boolean(modeInfo.primaryNode?.dirty)
-        : wg.isDirty(state),
-    lastAppliedAt: state.lastAppliedAt,
-    exitStatus,
+    mode: state.mode,
+    protocol: 'mieru',
+    online: primary ? nodes.isNodeOnline(primary) : false,
+    mita: report?.mita || null,
+    exitPublicIp: report?.exitPublicIp || null,
+    endpoint: state.server.endpoint,
+    listenPort: state.server.listenPort,
+    dirty: isUnifiedDirty(),
   });
 });
 
 app.get('/api/diagnose', async (req, res) => {
   try {
     const primary = nodes.getPrimaryNode(state);
-    const result = await wg.diagnose(state, {
+    const result = mieru.diagnose(state, {
       mode: state.mode || 'local',
       report: primary?.lastReport || null,
       agentOnline: primary ? nodes.isNodeOnline(primary) : false,
@@ -1045,17 +566,55 @@ app.get('/api/diagnose', async (req, res) => {
   }
 });
 
-app.get('/api/primary/install-command', (req, res) => {
-  if (state.mode !== 'agent') {
-    return res.status(400).json({ error: '当前不是远程出口模式' });
+// ---------- Mode ----------
+
+app.get('/api/mode', (req, res) => {
+  res.json(publicModeInfo());
+});
+
+app.post('/api/mode', (req, res) => {
+  const mode = req.body?.mode === 'agent' ? 'agent' : 'local';
+  if (mode === 'local') {
+    state.mode = 'local';
+    state.primaryNodeId = null;
+    persist();
+    return res.json({
+      ok: true,
+      message: '已切换本机出口（需本机自备 mita）',
+      ...publicModeInfo(),
+      server: publicServer(state.server),
+    });
   }
+  const { node, token, created } = nodes.ensurePrimaryNode(state, {
+    name: req.body?.name || '落地出口',
+    template: req.body?.template || 'cm',
+  });
+  // mieru 默认端口
+  if (!state.server.listenPort) state.server.listenPort = 7901;
+  state.server.protocol = state.server.protocol || 'TCP';
+  nodes.syncPrimaryFromState(state);
+  const base = panelBaseUrl(req);
+  const installCmd = nodes.installCommand({
+    panelUrl: base,
+    token: token || node.tokenPlain,
+    name: node.name,
+  });
+  persist();
+  res.json({
+    ok: true,
+    message: created ? '已创建远程出口节点' : '已切换远程落地',
+    installCommand: installCmd,
+    ...publicModeInfo(),
+    server: publicServer(state.server),
+  });
+});
+
+app.get('/api/primary/install-command', (req, res) => {
+  if (state.mode !== 'agent') return res.status(400).json({ error: '当前不是远程出口模式' });
   const node = nodes.getPrimaryNode(state);
   if (!node) return res.status(404).json({ error: '没有主节点' });
   if (!node.tokenPlain) {
-    return res.status(400).json({
-      error: 'Token 不可见，请轮换 Token 后重新安装',
-      needRotate: true,
-    });
+    return res.status(400).json({ error: 'Token 不可见，请轮换 Token', needRotate: true });
   }
   const base = req.query.panelUrl || panelBaseUrl(req);
   res.json({
@@ -1064,378 +623,123 @@ app.get('/api/primary/install-command', (req, res) => {
       token: node.tokenPlain,
       name: node.name,
     }),
-    token: node.tokenPlain,
-    panelUrl: base,
-    node: nodes.publicNode(node, { includeToken: true }),
   });
 });
 
 app.post('/api/primary/token', (req, res) => {
-  if (state.mode !== 'agent') {
-    return res.status(400).json({ error: '当前不是远程出口模式' });
-  }
   const node = nodes.getPrimaryNode(state);
   if (!node) return res.status(404).json({ error: '没有主节点' });
   const token = nodes.rotateNodeToken(node);
-  const base = req.body?.panelUrl || panelBaseUrl(req);
+  const base = panelBaseUrl(req);
   persist();
   res.json({
     ok: true,
-    token,
-    installCommand: nodes.installCommand({ panelUrl: base, token, name: node.name }),
-    tip: '旧 Token 已失效，请在落地机重新执行安装命令',
+    installCommand: nodes.installCommand({
+      panelUrl: base,
+      token,
+      name: node.name,
+    }),
   });
 });
 
-app.get('/api/backups', (req, res) => {
-  res.json({ backups: wg.listBackups() });
-});
-
-app.get('/api/next-ip', (req, res) => {
-  try {
-    const ip = wg.nextClientAddress(state.server.address, state.clients);
-    res.json({ address: ip });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
 app.get('/api/export', (req, res) => {
-  const dump = {
+  res.json({
     version: state.version,
-    wizardDone: state.wizardDone,
-    server: state.server,
-    clients: state.clients,
+    protocol: state.protocol,
+    mode: state.mode,
+    server: publicServer(state.server),
+    clients: state.clients.map((c) => mieru.publicClient(c)),
     exportedAt: new Date().toISOString(),
-  };
-  res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Content-Disposition', 'attachment; filename="wg-panel-backup.json"');
-  res.send(JSON.stringify(dump, null, 2));
+  });
 });
 
-app.post('/api/import', (req, res) => {
-  const body = req.body || {};
-  if (!body.server || !Array.isArray(body.clients)) {
-    return res.status(400).json({ error: '备份文件格式无效' });
-  }
-  const passwordHash = state.passwordHash;
-  const passwordSalt = state.passwordSalt;
-  const sessionSecret = state.sessionSecret;
-  const username = state.username || auth.DEFAULT_USERNAME;
-  const forcePasswordChange = state.forcePasswordChange;
-  state.server = { ...state.server, ...body.server };
-  state.clients = body.clients;
-  state.wizardDone = body.wizardDone !== false;
-  state.passwordHash = passwordHash;
-  state.passwordSalt = passwordSalt;
-  state.sessionSecret = sessionSecret;
-  state.username = username;
-  state.forcePasswordChange = forcePasswordChange;
-  state.lastAppliedHash = null;
-  persist();
-  res.json({ ok: true, message: `已导入 ${state.clients.length} 个客户端`, dirty: true });
-});
-
-// ---------- 节点（中心面板 + 边缘 Agent） ----------
+// ---------- Agent ----------
 
 function agentAuth(req, res) {
-  const h = req.headers.authorization || '';
-  const token = h.startsWith('Bearer ') ? h.slice(7).trim() : req.headers['x-agent-token'];
+  const hdr = req.headers.authorization || '';
+  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : req.query.token || '';
   const node = nodes.findNodeByToken(state, token);
   if (!node) {
-    res.status(401).json({ error: '无效的 Agent Token' });
+    res.status(401).json({ error: '无效 Agent Token' });
     return null;
   }
   return node;
 }
 
-function panelBaseUrl(req) {
-  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').toString().split(',')[0].trim();
-  const host = (req.headers['x-forwarded-host'] || req.headers.host || `127.0.0.1:${PORT}`).toString();
-  return `${proto}://${host}`;
-}
-
-app.get('/install-agent.sh', (req, res) => {
-  res.type('text/plain; charset=utf-8');
-  res.sendFile(path.join(ROOT, 'install-agent.sh'));
-});
-
-app.get('/api/nodes', (req, res) => {
-  nodes.ensureNodes(state);
-  res.json({
-    nodes: state.nodes.map((n) => nodes.publicNode(n)),
-    count: state.nodes.length,
-  });
-});
-
-app.post('/api/nodes', (req, res) => {
-  const body = req.body || {};
-  const { node, token } = nodes.createNode(state, {
-    name: body.name,
-    note: body.note,
-  });
-  persist();
-  const base = body.panelUrl || panelBaseUrl(req);
-  res.status(201).json({
-    node: nodes.publicNode(node, { includeToken: true }),
-    token,
-    installCommand: nodes.installCommand({ panelUrl: base, token, name: node.name }),
-    panelUrl: base,
-    tip: '请复制安装命令，在「落地服务器」上以 root 执行。Token 请妥善保管。',
-  });
-});
-
-app.get('/api/nodes/:id', (req, res) => {
-  const node = nodes.findNode(state, req.params.id);
-  if (!node) return res.status(404).json({ error: '节点不存在' });
-  res.json({
-    node: nodes.publicNode(node, { includeToken: Boolean(node.tokenPlain) }),
-    server: nodes.publicNodeServer(node.server),
-    clients: (node.clients || []).map((c) => nodes.publicNodeClient(c)),
-    jobs: (node.jobs || []).slice(0, 20),
-    tokenAvailable: Boolean(node.tokenPlain),
-  });
-});
-
-app.put('/api/nodes/:id', (req, res) => {
-  const node = nodes.findNode(state, req.params.id);
-  if (!node) return res.status(404).json({ error: '节点不存在' });
-  const body = req.body || {};
-  if (body.name !== undefined) node.name = String(body.name).trim() || node.name;
-  if (body.note !== undefined) node.note = String(body.note);
-  if (body.server && typeof body.server === 'object') {
-    const fields = [
-      'interfaceName',
-      'listenPort',
-      'address',
-      'endpoint',
-      'dns',
-      'mtu',
-      'postUp',
-      'postDown',
-      'confPath',
-    ];
-    for (const f of fields) {
-      if (body.server[f] !== undefined) node.server[f] = body.server[f];
-    }
-    if (body.server.listenPort !== undefined) {
-      node.server.listenPort = Number(body.server.listenPort) || 7901;
-    }
-    if (body.server.mtu !== undefined) {
-      node.server.mtu =
-        body.server.mtu === '' || body.server.mtu === null ? null : Number(body.server.mtu);
-    }
-    if (body.server.regenerateKeys) {
-      const kp = wg.generateKeyPair();
-      node.server.privateKey = kp.privateKey;
-      node.server.publicKey = kp.publicKey;
-    }
-    nodes.markNodeDirty(node);
-  }
-  persist();
-  res.json({ node: nodes.publicNode(node), server: nodes.publicNodeServer(node.server) });
-});
-
-app.delete('/api/nodes/:id', (req, res) => {
-  const removed = nodes.deleteNode(state, req.params.id);
-  if (!removed) return res.status(404).json({ error: '节点不存在' });
-  persist();
-  res.json({ ok: true, removed: nodes.publicNode(removed) });
-});
-
-app.post('/api/nodes/:id/token', (req, res) => {
-  const node = nodes.findNode(state, req.params.id);
-  if (!node) return res.status(404).json({ error: '节点不存在' });
-  const token = nodes.rotateNodeToken(node);
-  persist();
-  const base = req.body?.panelUrl || panelBaseUrl(req);
-  res.json({
-    ok: true,
-    token,
-    installCommand: nodes.installCommand({ panelUrl: base, token, name: node.name }),
-    tip: '旧 Token 已失效，请在目标机重新安装/更新 agent 环境变量',
-  });
-});
-
-app.get('/api/nodes/:id/install-command', (req, res) => {
-  const node = nodes.findNode(state, req.params.id);
-  if (!node) return res.status(404).json({ error: '节点不存在' });
-  if (!node.tokenPlain) {
-    return res.status(400).json({
-      error: 'Token 仅在创建或轮换时可见，请点击「轮换 Token」生成新命令',
-    });
-  }
-  const base = req.query.panelUrl || panelBaseUrl(req);
-  res.json({
-    installCommand: nodes.installCommand({
-      panelUrl: base,
-      token: node.tokenPlain,
-      name: node.name,
-    }),
-    token: node.tokenPlain,
-    panelUrl: base,
-  });
-});
-
-app.post('/api/nodes/:id/clients', (req, res) => {
-  const node = nodes.findNode(state, req.params.id);
-  if (!node) return res.status(404).json({ error: '节点不存在' });
-  const body = req.body || {};
-  const name = (body.name || '').trim() || `客户端-${(node.clients || []).length + 1}`;
-  let address = (body.address || '').trim();
-  if (!address) {
-    try {
-      address = wg.nextClientAddress(node.server.address, node.clients || []);
-    } catch (err) {
-      return res.status(400).json({ error: err.message });
-    }
-  }
-  try {
-    address = wg.normalizeClientAddress(address);
-  } catch (err) {
-    return res.status(400).json({ error: err.message });
-  }
-  const kp = wg.generateKeyPair();
-  const client = {
-    id: crypto.randomUUID(),
-    name,
-    privateKey: kp.privateKey,
-    publicKey: kp.publicKey,
-    presharedKey: body.usePresharedKey === false ? '' : wg.generatePresharedKey(),
-    address,
-    allowedIPs: (body.allowedIPs && String(body.allowedIPs).trim()) || '0.0.0.0/0, ::/0',
-    persistentKeepalive:
-      body.persistentKeepalive !== undefined ? Number(body.persistentKeepalive) : 25,
-    enabled: true,
-    note: body.note || '',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
-  if (!Array.isArray(node.clients)) node.clients = [];
-  node.clients.push(client);
-  nodes.markNodeDirty(node);
-  persist();
-  res.status(201).json({ client: nodes.publicNodeClient(client), node: nodes.publicNode(node) });
-});
-
-app.get('/api/nodes/:id/clients/:cid/config', async (req, res) => {
-  const node = nodes.findNode(state, req.params.id);
-  if (!node) return res.status(404).json({ error: '节点不存在' });
-  const c = (node.clients || []).find((x) => x.id === req.params.cid);
-  if (!c) return res.status(404).json({ error: '客户端不存在' });
-  const fakeState = { server: node.server, clients: node.clients };
-  wg.ensureServerKeys(fakeState);
-  const config = wg.buildClientConfig(fakeState, c);
-  const format = req.query.format || 'text';
-  if (format === 'download') {
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename="${wg.sanitizeName(c.name)}.conf"`
-    );
-    return res.send(config);
-  }
-  if (format === 'qr') {
-    const qr = await QRCode.toDataURL(config, { margin: 1, width: 280 });
-    return res.json({ name: c.name, config, qr });
-  }
-  res.type('text/plain').send(config);
-});
-
-app.delete('/api/nodes/:id/clients/:cid', (req, res) => {
-  const node = nodes.findNode(state, req.params.id);
-  if (!node) return res.status(404).json({ error: '节点不存在' });
-  const idx = (node.clients || []).findIndex((x) => x.id === req.params.cid);
-  if (idx < 0) return res.status(404).json({ error: '客户端不存在' });
-  const [removed] = node.clients.splice(idx, 1);
-  nodes.markNodeDirty(node);
-  persist();
-  res.json({ ok: true, removed: nodes.publicNodeClient(removed) });
-});
-
-app.post('/api/nodes/:id/apply', (req, res) => {
-  const node = nodes.findNode(state, req.params.id);
-  if (!node) return res.status(404).json({ error: '节点不存在' });
-  const job = nodes.enqueueJob(node, 'apply', {});
-  persist();
-  res.json({
-    ok: true,
-    job,
-    message: node.lastSeenAt
-      ? '已下发「应用配置」任务，等待 Agent 拉取执行'
-      : '任务已创建，但节点尚未上线，请先在目标机安装 Agent',
-    node: nodes.publicNode(node),
-  });
-});
-
-app.post('/api/nodes/:id/exit', (req, res) => {
-  const node = nodes.findNode(state, req.params.id);
-  if (!node) return res.status(404).json({ error: '节点不存在' });
-  // 节点侧落地：把客户端改为全局代理，NAT 由 agent 在目标机写入
-  for (const c of node.clients || []) {
-    c.allowedIPs = '0.0.0.0/0, ::/0';
-    if (!c.persistentKeepalive) c.persistentKeepalive = 25;
-    c.updatedAt = new Date().toISOString();
-  }
-  nodes.markNodeDirty(node);
-  const job = nodes.enqueueJob(node, 'exit', {});
-  persist();
-  res.json({
-    ok: true,
-    job,
-    message: '已下发「一键落地」任务到节点（转发+NAT+应用）',
-    node: nodes.publicNode(node),
-  });
-});
-
-// Agent endpoints
 app.post('/api/agent/hello', (req, res) => {
   const node = agentAuth(req, res);
   if (!node) return;
-  nodes.touchNode(node, {
-    hostname: req.body?.hostname,
-    agentVersion: req.body?.agentVersion,
-    meta: { nameHint: req.body?.name || '' },
-  });
-  if (req.body?.name && !node.name) node.name = String(req.body.name);
+  const body = req.body || {};
+  node.hostname = body.hostname || node.hostname;
+  node.agentVersion = body.agentVersion || node.agentVersion;
+  node.lastSeenAt = new Date().toISOString();
+  if (body.name) node.name = body.name;
   persist();
-  res.json({ ok: true, nodeId: node.id, name: node.name });
+  res.json({ ok: true, nodeId: node.id, protocol: 'mieru' });
 });
 
 app.post('/api/agent/heartbeat', (req, res) => {
   const node = agentAuth(req, res);
   if (!node) return;
+  const body = req.body || {};
   nodes.touchNode(node, {
-    hostname: req.body?.hostname,
-    agentVersion: req.body?.agentVersion,
-    meta: req.body?.meta,
-    status: req.body?.status,
+    hostname: body.hostname,
+    agentVersion: body.agentVersion,
+    meta: body.meta,
+    status: body.status,
   });
-  // 主节点：把 live 客户端状态与 postUp 同步回统一 state
+  nodes.reclaimStaleJobs(node);
+  const pending = nodes.getPendingJobs(node, 3);
+  nodes.leaseJobs(node, pending);
+  // 主节点同步
   if (state.mode === 'agent' && state.primaryNodeId === node.id) {
     nodes.syncStateFromPrimary(state, node);
   }
-  const pending = nodes.getPendingJobs(node, 5);
-  nodes.leaseJobs(node, pending);
-  // 告诉 agent 当前期望的接口名
-  const ifaceName = node.server?.interfaceName || 'wg0';
   persist();
   res.json({
     ok: true,
-    nodeId: node.id,
-    interfaceName: ifaceName,
     jobs: pending.map((j) => ({ id: j.id, type: j.type, payload: j.payload || {} })),
+    protocol: 'mieru',
   });
 });
 
 app.get('/api/agent/bundle', (req, res) => {
   const node = agentAuth(req, res);
   if (!node) return;
-  // 确保主节点用最新统一配置
   if (state.mode === 'agent' && state.primaryNodeId === node.id) {
     nodes.syncPrimaryFromState(state);
   }
-  const bundle = nodes.buildAgentBundle(node, wg);
+  mieru.ensureMieruDefaults(state);
+  // 用统一 state 构建（用户在 state.clients）
+  const fake = {
+    server: { ...state.server, ...(node.server || {}) },
+    clients: state.clients,
+  };
+  let serverConfig;
+  try {
+    serverConfig = mieru.buildServerConfig(fake);
+  } catch (err) {
+    return res.status(400).json({ error: err.message, code: err.code });
+  }
+  const hash = mieru.configHash(fake);
+  const bundle = {
+    protocol: 'mieru',
+    server: {
+      listenPort: Number(fake.server.listenPort) || 7901,
+      protocol: mieru.normalizeProtocol(fake.server.protocol),
+      endpoint: fake.server.endpoint || '',
+      mtu: fake.server.mtu,
+      multiplexing: fake.server.multiplexing,
+    },
+    users: (fake.clients || []).map((c) => ({
+      id: c.id,
+      name: c.name,
+      password: c.password,
+      enabled: c.enabled !== false,
+    })),
+    serverConfig,
+    configHash: hash,
+  };
   persist();
   res.json(bundle);
 });
@@ -1454,29 +758,20 @@ app.post('/api/agent/job-result', (req, res) => {
   const job = nodes.completeJob(node, jobId, { ok, message, detail });
   if (!job) return res.status(404).json({ error: '任务不存在' });
 
-  // exit：回写 NAT 到 node + 统一 state，避免二次 apply 冲掉
-  if (ok && job.type === 'exit' && detail) {
-    const iface = node.server?.interfaceName || 'wg0';
-    const egress = detail.egress || detail.egressIface || 'eth0';
-    if (detail.postUp) {
-      node.server.postUp = detail.postUp;
-      node.server.postDown = detail.postDown || node.server.postDown;
-    } else if (!node.server.postUp || !/MASQUERADE/i.test(node.server.postUp)) {
-      node.server.postUp = wg.defaultPostUp(iface, egress);
-      node.server.postDown = wg.defaultPostDown(iface, egress);
-    }
+  if (ok && (job.type === 'apply' || job.type === 'exit' || job.type === 'mieru_apply' || job.type === 'mieru_install')) {
+    const hash = detail?.configHash || (() => {
+      try {
+        return mieru.configHash(state);
+      } catch {
+        return null;
+      }
+    })();
+    if (hash) nodes.markNodeClean(node, hash);
     if (state.mode === 'agent' && state.primaryNodeId === node.id) {
-      state.server.postUp = node.server.postUp;
-      state.server.postDown = node.server.postDown;
-    }
-  }
-
-  if (ok && (job.type === 'apply' || job.type === 'exit')) {
-    const hash = detail?.configHash || nodes.configHashForNode(node, wg);
-    nodes.markNodeClean(node, hash);
-    if (state.mode === 'agent' && state.primaryNodeId === node.id) {
-      state.lastAppliedHash = hash;
-      state.lastAppliedAt = node.lastAppliedAt;
+      if (hash) {
+        state.lastAppliedHash = hash;
+        state.lastAppliedAt = node.lastAppliedAt;
+      }
       nodes.syncStateFromPrimary(state, node);
     }
   }
@@ -1484,18 +779,17 @@ app.post('/api/agent/job-result', (req, res) => {
   res.json({ ok: true, job });
 });
 
-// SPA fallback
 app.get('*', (req, res) => {
   res.sendFile(path.join(ROOT, 'public', 'index.html'));
 });
 
 app.listen(PORT, HOST, () => {
-  console.log(`\n  WireGuard 配置面板已启动`);
+  console.log(`\n  出口管理面板已启动（mieru）`);
   console.log(`  版本: ${require(path.join(ROOT, 'package.json')).version}`);
-  console.log(`  面板地址: http://${HOST === '0.0.0.0' ? '服务器IP' : HOST}:${PORT}`);
-  console.log(`  数据目录: ${DATA_DIR}`);
+  console.log(`  地址: http://${HOST === '0.0.0.0' ? '服务器IP' : HOST}:${PORT}`);
+  console.log(`  数据: ${DATA_DIR}`);
   if (auth.needsSetup(state)) {
-    console.log(`  首次访问请在网页设置登录账号（默认用户名 admin）`);
+    console.log(`  首次访问请设置登录账号`);
   }
   console.log('');
 });

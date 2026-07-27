@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# WireGuard 边缘 Agent 安装脚本（在「落地服务器 / 美国家宽」上执行）
+# mieru 边缘 Agent 安装脚本（在「落地服务器 / 美国家宽」上执行）
 # 用法（由面板生成）：
 #   curl -fsSL "http://面板地址:51821/install-agent.sh" | sudo env \
 #     WG_PANEL_URL="http://面板地址:51821" \
@@ -70,7 +70,7 @@ chmod 755 "${APP_DIR}/index.js"
 cat > "${APP_DIR}/package.json" <<EOF
 {
   "name": "wg-agent",
-  "version": "1.4.1",
+  "version": "2.0.0",
   "private": true,
   "main": "index.js"
 }
@@ -114,13 +114,13 @@ sleep 2
 if systemctl is-active --quiet "${SERVICE_NAME}"; then
   echo ""
   echo "=========================================="
-  echo "  Agent 已安装并运行 (v1.4.1)"
+  echo "  Agent 已安装并运行 (v2.0.0 · mieru)"
   echo "  名称: ${NAME}"
   echo "  面板: ${PANEL_URL}"
   echo "  服务: systemctl status ${SERVICE_NAME}"
   echo "=========================================="
-  echo "回到面板「出口服务器」确认状态为「在线」。"
-  echo "然后填写 Endpoint（入站 IP:UDP端口）→ 一键落地 → 客户端扫码。"
+  echo "回到面板「出口服务器」确认「在线」。"
+  echo "填写入站 IP + TCP 端口 → 一键落地（装 mita）→ 客户端复制 mierus 链接。"
   echo ""
   echo "重要：商家需放行 WireGuard 的 UDP 端口（如 7901）。"
   echo "      SSH 的 TCP 通 ≠ UDP 通。仅发送无握手时先查 UDP 映射。"

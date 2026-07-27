@@ -1,5 +1,4 @@
 const crypto = require('crypto');
-const cryptoWg = require('./crypto-wg');
 
 const ONLINE_MS = 90 * 1000;
 const JOB_KEEP = 40;
@@ -18,21 +17,24 @@ function newId() {
 }
 
 function defaultNodeServer(template = 'cm') {
-  const kp = cryptoWg.generateKeyPair();
-  // cm: 7901；vps: 51820
-  const listenPort = template === 'vps' ? 51820 : 7901;
+  // cm / 家宽前置：7901 TCP（mieru）；vps 也可用 7901
+  const listenPort = template === 'vps' ? 8443 : 7901;
   return {
-    interfaceName: 'wg0',
     listenPort,
-    privateKey: kp.privateKey,
-    publicKey: kp.publicKey,
-    address: '10.8.0.1/24',
+    protocol: 'TCP',
     endpoint: '',
+    mtu: 1400,
+    multiplexing: 'MULTIPLEXING_LOW',
+    trafficPattern: 'conservative',
+    // legacy WG fields unused in v2
+    interfaceName: 'wg0',
+    privateKey: '',
+    publicKey: '',
+    address: '10.8.0.1/24',
     dns: '1.1.1.1',
-    mtu: 1420,
     postUp: '',
     postDown: '',
-    confPath: '/etc/wireguard/wg0.conf',
+    confPath: '',
   };
 }
 
@@ -63,8 +65,7 @@ function publicNode(node, { includeToken = false } = {}) {
     clientCount: (node.clients || []).length,
     endpoint: node.server?.endpoint || '',
     listenPort: Number(node.server?.listenPort) || 7901,
-    publicKey: node.server?.publicKey || '',
-    interfaceName: node.server?.interfaceName || 'wg0',
+    protocol: node.server?.protocol || 'TCP',
     dirty: isNodeDirty(node, null),
     lastAppliedAt: node.lastAppliedAt || null,
     pendingJobs: (node.jobs || []).filter((j) => j.status === 'pending' || j.status === 'running')
@@ -77,17 +78,12 @@ function publicNode(node, { includeToken = false } = {}) {
 function publicNodeServer(s) {
   if (!s) return null;
   return {
-    interfaceName: s.interfaceName,
     listenPort: Number(s.listenPort) || 7901,
-    publicKey: s.publicKey,
-    address: s.address,
-    endpoint: s.endpoint,
-    dns: s.dns,
-    mtu: s.mtu,
-    postUp: s.postUp,
-    postDown: s.postDown,
-    confPath: s.confPath,
-    hasPrivateKey: Boolean(s.privateKey),
+    protocol: s.protocol || 'TCP',
+    endpoint: s.endpoint || '',
+    mtu: s.mtu ?? 1400,
+    multiplexing: s.multiplexing || 'MULTIPLEXING_LOW',
+    trafficPattern: s.trafficPattern || 'conservative',
   };
 }
 
@@ -95,20 +91,11 @@ function publicNodeClient(c) {
   return {
     id: c.id,
     name: c.name,
-    publicKey: c.publicKey,
-    address: c.address,
-    allowedIPs: c.allowedIPs,
-    persistentKeepalive: c.persistentKeepalive,
     enabled: c.enabled !== false,
+    note: c.note || '',
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
-    note: c.note || '',
-    hasPresharedKey: Boolean(c.presharedKey),
-    online: Boolean(c._online),
-    latestHandshake: c._latestHandshake || '',
-    transfer: c._transfer || '',
-    transferRx: c._transferRx || '',
-    transferTx: c._transferTx || '',
+    hasPassword: Boolean(c.password),
   };
 }
 
@@ -200,7 +187,7 @@ function ensurePrimaryNode(state, { name, template } = {}) {
   state.mode = 'agent';
   state.primaryNodeId = node.id;
   // 若统一 state 已有配置，同步到节点
-  if (state.server?.privateKey) {
+  if (state.server?.listenPort || state.server?.endpoint) {
     node.server = { ...node.server, ...state.server };
   } else if (node.server) {
     state.server = { ...state.server, ...node.server };
@@ -235,22 +222,27 @@ function deleteNode(state, id) {
   return removed;
 }
 
-function configHashForNode(node, wg) {
+function configHashForNode(node, hasher) {
   const fakeState = { server: node.server, clients: node.clients };
-  wg.ensureServerKeys(fakeState);
-  node.server = fakeState.server;
-  return wg.configHash(fakeState);
+  if (hasher && typeof hasher.configHash === 'function') {
+    return hasher.configHash(fakeState);
+  }
+  if (hasher && typeof hasher === 'object' && hasher.configHash) {
+    return hasher.configHash(fakeState);
+  }
+  // fallback：简单 hash
+  const crypto = require('crypto');
+  return crypto.createHash('sha256').update(JSON.stringify(fakeState)).digest('hex');
 }
 
-function isNodeDirty(node, wg) {
+function isNodeDirty(node, hasher) {
   if (node._dirtyFlag) return true;
   if (!node.lastAppliedHash) {
-    return (node.clients || []).length > 0 || Boolean(node.server?.privateKey);
+    return (node.clients || []).length > 0 || Boolean(node.server?.listenPort);
   }
-  // 有 wg 时用配置 hash 校准，避免 flag 卡住
-  if (wg) {
+  if (hasher) {
     try {
-      const h = configHashForNode(node, wg);
+      const h = configHashForNode(node, hasher);
       return h !== node.lastAppliedHash;
     } catch {
       return Boolean(node._dirtyFlag);
@@ -365,56 +357,37 @@ function touchNode(node, report = {}) {
   }
 }
 
-function buildAgentBundle(node, wg) {
-  const fakeState = { server: node.server, clients: node.clients || [] };
-  wg.ensureServerKeys(fakeState);
-  node.server = fakeState.server;
-  const skipped = [];
-  for (const c of node.clients || []) {
-    if (c.enabled === false) continue;
-    if (wg.isValidClientAddress(c.address)) continue;
+/**
+ * 兼容旧调用；v2 实际 bundle 由 server/index.js 用 mieru 构建
+ */
+function buildAgentBundle(node, hasher) {
+  const fakeState = { server: node.server || {}, clients: node.clients || [] };
+  let configHash = null;
+  if (hasher && typeof hasher.configHash === 'function') {
     try {
-      c.address = wg.nextClientAddress(
-        node.server.address,
-        node.clients.filter((x) => x.id !== c.id)
-      );
+      configHash = hasher.configHash(fakeState);
     } catch {
-      skipped.push(c.name || c.id);
+      configHash = null;
     }
   }
-  const config = wg.buildServerConfig(fakeState);
-  const hash = wg.configHash(fakeState);
-  const peerCount = (node.clients || []).filter(
-    (c) => c.enabled !== false && c.publicKey && wg.peerAllowedIps(c)
-  ).length;
   return {
+    protocol: 'mieru',
     nodeId: node.id,
     name: node.name,
     server: {
-      interfaceName: node.server.interfaceName,
-      listenPort: node.server.listenPort,
-      address: node.server.address,
-      endpoint: node.server.endpoint,
-      dns: node.server.dns,
-      mtu: node.server.mtu,
-      postUp: node.server.postUp,
-      postDown: node.server.postDown,
-      confPath: node.server.confPath,
-      publicKey: node.server.publicKey,
+      listenPort: Number(node.server?.listenPort) || 7901,
+      protocol: node.server?.protocol || 'TCP',
+      endpoint: node.server?.endpoint || '',
+      mtu: node.server?.mtu ?? 1400,
+      multiplexing: node.server?.multiplexing || 'MULTIPLEXING_LOW',
     },
-    privateKey: node.server.privateKey,
-    clients: (node.clients || []).map((c) => ({
+    users: (node.clients || []).map((c) => ({
       id: c.id,
       name: c.name,
-      publicKey: c.publicKey,
-      address: c.address,
+      password: c.password,
       enabled: c.enabled !== false,
-      presharedKey: c.presharedKey || '',
     })),
-    config,
-    configHash: hash,
-    expectedPeers: peerCount,
-    skippedClients: skipped,
+    configHash,
   };
 }
 

@@ -354,7 +354,15 @@ app.get('/api/clients', (req, res) => {
 
 app.post('/api/clients', (req, res) => {
   const body = req.body || {};
-  const name = (body.name || '').trim() || mieru.randomUsername();
+  let name = (body.name || '').trim();
+  const note = (body.note || '').trim();
+  // 中文备注不能当 mita 登录名
+  if (name && !mieru.isValidMieruUsername(name)) {
+    return res.status(400).json({
+      error: '登录用户名只能用英文/数字/._-（例如 u7af760）。「我的手机」请填到备注',
+    });
+  }
+  if (!name) name = mieru.randomUsername();
   if (state.clients.some((c) => c.name === name)) {
     return res.status(400).json({ error: '用户名已存在' });
   }
@@ -363,7 +371,7 @@ app.post('/api/clients', (req, res) => {
     name,
     password: (body.password || '').trim() || mieru.randomPassword(18),
     enabled: body.enabled !== false,
-    note: body.note || '',
+    note: note || '',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
@@ -385,10 +393,18 @@ app.put('/api/clients/:id', (req, res) => {
   if (body.name !== undefined) {
     const name = String(body.name).trim();
     if (!name) return res.status(400).json({ error: '用户名不能为空' });
+    if (!mieru.isValidMieruUsername(name)) {
+      return res.status(400).json({
+        error: '登录用户名只能用英文/数字/._-。中文名称请写在备注里',
+      });
+    }
     if (state.clients.some((x) => x.id !== c.id && x.name === name)) {
       return res.status(400).json({ error: '用户名已存在' });
     }
-    c.name = name;
+    if (c.name !== name) {
+      c.name = name;
+      state.clientsNeedRescan = true;
+    }
   }
   if (body.password !== undefined && String(body.password).trim()) {
     c.password = String(body.password).trim();

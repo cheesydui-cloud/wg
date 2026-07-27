@@ -905,12 +905,13 @@ async function renderClients() {
     <div class="card">
       ${
         state.clients.length
-          ? `<table><thead><tr><th>用户名</th><th>密码</th><th>状态</th><th></th></tr></thead><tbody>
+          ? `<table><thead><tr><th>登录用户名</th><th>密码</th><th>备注</th><th>状态</th><th></th></tr></thead><tbody>
           ${state.clients
             .map(
               (c) => `<tr>
-            <td class="mono">${esc(c.name)}</td>
+            <td class="mono"><strong>${esc(c.name)}</strong></td>
             <td class="mono">${esc(c.password)}</td>
+            <td>${esc(c.note || '-')}</td>
             <td>${c.enabled !== false ? '<span class="badge ok">启用</span>' : '<span class="badge">停用</span>'}</td>
             <td class="btn-row">
               <button class="btn btn-sm btn-primary" data-qr="${c.id}">链接</button>
@@ -920,7 +921,8 @@ async function renderClients() {
           </tr>`
             )
             .join('')}
-        </tbody></table>`
+        </tbody></table>
+        <p class="field-hint" style="margin-top:10px">小火箭「用户」必须填<strong>登录用户名</strong>（如 u7af760），不能填「我的手机」这类备注。</p>`
           : '<p class="muted">还没有用户，点「添加用户」</p>'
       }
     </div>
@@ -956,12 +958,13 @@ function openClientModal(client) {
   openModal({
     title: isEdit ? '编辑用户' : '添加用户',
     body: `
-      <label>用户名</label>
-      <input class="field mono" id="c-name" value="${esc(client?.name || '')}" placeholder="留空自动生成" />
+      <label>登录用户名（小火箭「用户」栏，须英文/数字）</label>
+      <input class="field mono" id="c-name" value="${esc(client?.name || '')}" placeholder="留空自动生成，如 u7af760" />
+      <p class="field-hint">不要填「我的手机」。中文名称请写备注。</p>
       <label>密码${isEdit ? '（留空不改）' : ''}</label>
       <input class="field mono" id="c-pass" value="" placeholder="${isEdit ? '留空保持原密码' : '留空自动生成'}" />
-      <label>备注</label>
-      <input class="field" id="c-note" value="${esc(client?.note || '')}" />
+      <label>备注 / 显示名（仅面板展示）</label>
+      <input class="field" id="c-note" value="${esc(client?.note || '')}" placeholder="例如：我的手机" />
       ${
         isEdit
           ? `<label class="check-row"><input type="checkbox" id="c-regen" /> 重新生成密码</label>`

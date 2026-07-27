@@ -62,6 +62,11 @@ function joinEndpoint(host, port) {
   return `${h}:${p}`;
 }
 
+function isValidMieruUsername(name) {
+  // mita/mieru 用户名：字母数字下划线短横线，避免中文显示名误当登录名
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(String(name || ''));
+}
+
 function ensureMieruDefaults(state) {
   if (!state.server) state.server = {};
   const s = state.server;
@@ -85,7 +90,12 @@ function ensureMieruDefaults(state) {
   }
   for (const c of state.clients) {
     if (!c.password) c.password = randomPassword(18);
-    if (!c.name) c.name = randomUsername();
+    // 中文/空格等不能当 mita 登录名：挪到 note，换合法 name
+    if (!c.name || !isValidMieruUsername(c.name)) {
+      const bad = c.name;
+      if (bad && !c.note) c.note = String(bad);
+      c.name = randomUsername();
+    }
     if (c.enabled === undefined) c.enabled = true;
   }
   return state;
@@ -234,6 +244,7 @@ function publicClient(c) {
     password: c.password,
     enabled: c.enabled !== false,
     note: c.note || '',
+    label: c.note || c.name,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
   };
@@ -390,6 +401,7 @@ module.exports = {
   DEFAULT_PROTOCOL,
   randomPassword,
   randomUsername,
+  isValidMieruUsername,
   normalizeProtocol,
   parseEndpoint,
   joinEndpoint,

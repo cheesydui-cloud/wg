@@ -1,19 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# WireGuard 配置面板一键安装（Debian/Ubuntu）
+# WireGuard 配置面板一键安装 / 更新（Debian/Ubuntu）
 # 用法：
 #   sudo bash install.sh
 #   sudo WG_PASSWORD='你的密码' bash install.sh
+#   sudo bash install.sh --update
 #
 # 默认登录用户名：admin
-# 未指定 WG_PASSWORD 时自动生成随机密码，并打印在终端
+# 未指定 WG_PASSWORD 且首次安装时自动生成随机密码
 
 APP_DIR="${APP_DIR:-/opt/wg-panel}"
 PANEL_PORT="${WG_PORT:-51821}"
 WG_PORT_UDP="${WG_UDP_PORT:-51820}"
 SERVICE_NAME="wg-panel"
 DEFAULT_USER="${WG_USERNAME:-admin}"
+UPDATE_MODE=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --update|-u) UPDATE_MODE=1 ;;
+    --help|-h)
+      echo "用法: sudo bash install.sh [--update]"
+      echo "  --update  更新代码，保留 data 与已有密码"
+      exit 0
+      ;;
+  esac
+done
 
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "请使用 root 运行：sudo bash install.sh"
@@ -46,6 +59,13 @@ if [[ ! -f "${SCRIPT_DIR}/package.json" ]]; then
   exit 1
 fi
 
+# 是否已有数据（更新模式自动识别）
+EXISTING_STATE="${APP_DIR}/data/state.json"
+if [[ -f "${EXISTING_STATE}" ]]; then
+  UPDATE_MODE=1
+  echo "    检测到已有数据，进入更新模式（保留 data 与登录密码）"
+fi
+
 if command -v rsync >/dev/null 2>&1; then
   rsync -a --delete \
     --exclude node_modules --exclude data --exclude .git \
@@ -56,7 +76,7 @@ else
   rm -rf "${APP_DIR}/node_modules" 2>/dev/null || true
 fi
 
-mkdir -p "${APP_DIR}/data"
+mkdir -p "${APP_DIR}/data" "${APP_DIR}/data/backups"
 cd "${APP_DIR}"
 echo "==> 安装 npm 依赖"
 npm install --omit=dev
@@ -69,36 +89,68 @@ EOF
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 sysctl --system >/dev/null 2>&1 || true
 
-# 生成随机密码（避免 tr|head 在 pipefail 下 SIGPIPE 中断安装）
-if [[ -z "${WG_PASSWORD:-}" ]]; then
-  WG_PASSWORD="$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-12)"
-  GEN_PASS=1
+ENV_FILE="/etc/default/${SERVICE_NAME}"
+GEN_PASS=0
+SHOW_CRED=0
+
+if [[ "${UPDATE_MODE}" -eq 1 && -f "${ENV_FILE}" ]]; then
+  # 更新：尽量保留已有环境变量，只刷新端口等可选覆盖
+  # shellcheck disable=SC1090
+  set -a
+  # 读取旧值
+  OLD_PASS=""
+  OLD_USER="${DEFAULT_USER}"
+  if grep -q '^WG_PASSWORD=' "${ENV_FILE}" 2>/dev/null; then
+    OLD_PASS="$(grep '^WG_PASSWORD=' "${ENV_FILE}" | head -1 | cut -d= -f2-)"
+  fi
+  if grep -q '^WG_USERNAME=' "${ENV_FILE}" 2>/dev/null; then
+    OLD_USER="$(grep '^WG_USERNAME=' "${ENV_FILE}" | head -1 | cut -d= -f2-)"
+  fi
+  set +a
+  WG_PASSWORD="${WG_PASSWORD:-$OLD_PASS}"
+  DEFAULT_USER="${WG_USERNAME:-$OLD_USER}"
+  if [[ -z "${WG_PASSWORD}" ]]; then
+    # 已有 state 时不必写入密码（账号已在 data 中）
+    WG_PASSWORD=""
+  fi
+  echo "    已保留原登录配置"
 else
-  GEN_PASS=0
+  if [[ -z "${WG_PASSWORD:-}" ]]; then
+    WG_PASSWORD="$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-12)"
+    GEN_PASS=1
+  fi
+  SHOW_CRED=1
 fi
 
-ENV_FILE="/etc/default/${SERVICE_NAME}"
-cat >"${ENV_FILE}" <<EOF
-WG_PORT=${PANEL_PORT}
-WG_HOST=0.0.0.0
-WG_DATA_DIR=${APP_DIR}/data
-WG_USERNAME=${DEFAULT_USER}
-WG_PASSWORD=${WG_PASSWORD}
-WG_ALLOW_APPLY=1
-EOF
+# 写 EnvironmentFile
+{
+  echo "WG_PORT=${PANEL_PORT}"
+  echo "WG_HOST=0.0.0.0"
+  echo "WG_DATA_DIR=${APP_DIR}/data"
+  echo "WG_USERNAME=${DEFAULT_USER}"
+  if [[ -n "${WG_PASSWORD}" ]]; then
+    echo "WG_PASSWORD=${WG_PASSWORD}"
+  fi
+  echo "WG_ALLOW_APPLY=1"
+  # 仅首次安装时提示改密
+  if [[ "${SHOW_CRED}" -eq 1 ]]; then
+    echo "WG_FORCE_PASSWORD_CHANGE=1"
+  fi
+} >"${ENV_FILE}"
 chmod 600 "${ENV_FILE}"
 
-# 把账号密码也写一份到 data，方便用户找回（权限仅 root）
-CRED_FILE="${APP_DIR}/data/initial-credentials.txt"
-cat >"${CRED_FILE}" <<EOF
+if [[ "${SHOW_CRED}" -eq 1 ]]; then
+  CRED_FILE="${APP_DIR}/data/initial-credentials.txt"
+  cat >"${CRED_FILE}" <<EOF
 username=${DEFAULT_USER}
 password=${WG_PASSWORD}
 created_at=$(date -Iseconds 2>/dev/null || date)
 panel_port=${PANEL_PORT}
 EOF
-chmod 600 "${CRED_FILE}"
+  chmod 600 "${CRED_FILE}"
+fi
 
-echo "==> 创建 systemd 服务"
+echo "==> 创建 / 更新 systemd 服务"
 cat >/etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]
 Description=WireGuard Config Panel
@@ -107,7 +159,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=${APP_DIR}
-EnvironmentFile=${ENV_FILE}
+EnvironmentFile=-${ENV_FILE}
 ExecStart=${NODE_BIN} ${APP_DIR}/server/index.js
 Restart=on-failure
 RestartSec=3
@@ -117,7 +169,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now ${SERVICE_NAME}
+systemctl enable ${SERVICE_NAME} >/dev/null 2>&1 || true
+systemctl restart ${SERVICE_NAME}
 
 sleep 1
 if ! systemctl is-active --quiet ${SERVICE_NAME}; then
@@ -132,16 +185,21 @@ if command -v ufw >/dev/null 2>&1; then
 fi
 
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+VER="$(node -p "require('${APP_DIR}/package.json').version" 2>/dev/null || echo '?')"
 echo ""
 echo "============================================"
-echo " 安装完成！"
-echo " 面板地址: http://${IP:-服务器IP}:${PANEL_PORT}"
-echo " 用户名:   ${DEFAULT_USER}"
-echo " 密  码:   ${WG_PASSWORD}"
-if [[ "${GEN_PASS}" -eq 1 ]]; then
-  echo " （随机密码，请立即保存；也可查看 ${CRED_FILE}）"
+if [[ "${UPDATE_MODE}" -eq 1 && "${SHOW_CRED}" -eq 0 ]]; then
+  echo " 更新完成！版本 v${VER}"
+  echo " 面板地址: http://${IP:-服务器IP}:${PANEL_PORT}"
+  echo " 登录账号保持不变（data 已保留）"
 else
-  echo " （来自 WG_PASSWORD 环境变量）"
+  echo " 安装完成！版本 v${VER}"
+  echo " 面板地址: http://${IP:-服务器IP}:${PANEL_PORT}"
+  echo " 用户名:   ${DEFAULT_USER}"
+  echo " 密  码:   ${WG_PASSWORD}"
+  if [[ "${GEN_PASS}" -eq 1 ]]; then
+    echo " （随机密码，请立即保存；也可查看 ${APP_DIR}/data/initial-credentials.txt）"
+  fi
 fi
 echo " 服务状态: systemctl status ${SERVICE_NAME}"
 echo " 查看日志: journalctl -u ${SERVICE_NAME} -f"

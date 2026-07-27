@@ -2,16 +2,18 @@
 
 面向新手的 **中文 WireGuard 服务端管理面板**。可安装在闲置服务器上，用网页管理接口与客户端，自动生成密钥、配置、二维码，并支持一键应用到系统。
 
-仓库地址：https://github.com/cheesydui-cloud/wg
+仓库地址：https://github.com/cheesydui-cloud/wg  
+当前版本：**v1.1.0**
 
 ## 功能
 
 - 首次引导：公网地址 → 密钥 → 网段 → 首个客户端
-- 服务器设置：端口、Endpoint、DNS、MTU、PostUp/PostDown（NAT 模板）
-- 客户端管理：增删改、自动分配 IP、启用/停用、PSK
-- 导出：客户端 `.conf`、二维码扫码、服务端配置下载
-- 应用配置：写入 `/etc/wireguard/*.conf` 并 `wg-quick` 启动/热重载
-- 密码登录、JSON 备份导入导出、深色/浅色主题
+- 服务器设置：端口、Endpoint、DNS、MTU、PostUp/PostDown（自动识别出口网卡）
+- 客户端管理：增删改、自动分配 IP、启用/停用、PSK、**在线/握手/流量**
+- 导出：客户端 `.conf`、二维码扫码、**批量导出**、服务端配置下载
+- 应用配置：预检 → 备份 → 写入 `/etc/wireguard` → `wg-quick` 启动/热重载
+- **未应用变更**提醒、一键填公网 IP、登录防爆破、会话持久化
+- 密码登录（默认用户名 `admin`）、JSON 备份导入导出、深色/浅色主题
 
 ## 环境要求
 
@@ -41,6 +43,18 @@ cd wg
 # 3. 一键安装（默认用户名 admin，自动生成随机密码）
 sudo bash install.sh
 ```
+
+### 更新到新版本（保留数据与密码）
+
+```bash
+cd wg
+git pull
+sudo bash install.sh
+# 或显式：
+# sudo bash install.sh --update
+```
+
+检测到 `/opt/wg-panel/data/state.json` 时会自动进入**更新模式**，不会重置登录密码。
 
 ### 指定登录密码安装
 

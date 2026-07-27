@@ -9,6 +9,9 @@ const state = {
   wizardDone: false,
   modal: null,
   _skipWizardOnce: false,
+  dirty: false,
+  lastAppliedAt: null,
+  preflight: null,
 };
 
 async function api(path, options = {}) {
@@ -56,7 +59,7 @@ function toast(msg, type = 'ok') {
   }
   const t = el(`<div class="toast ${type}">${esc(msg)}</div>`);
   wrap.appendChild(t);
-  setTimeout(() => t.remove(), 3200);
+  setTimeout(() => t.remove(), 3600);
 }
 
 function help(tip) {
@@ -79,6 +82,30 @@ function networkFromAddress(addr) {
 
 function val(id) {
   return document.getElementById(id)?.value?.trim() ?? '';
+}
+
+function dirtyBanner() {
+  if (!state.dirty) return '';
+  return `<div class="tip warn dirty-banner" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+    <div><strong>有未应用的配置变更</strong> · 修改已保存到面板，但尚未写入服务器 WireGuard</div>
+    <div class="btn-row">
+      <button class="btn btn-ghost btn-sm" id="banner-preflight">预检</button>
+      <button class="btn btn-success btn-sm" id="banner-apply">应用到服务器</button>
+    </div>
+  </div>`;
+}
+
+function bindDirtyBanner() {
+  document.getElementById('banner-apply')?.addEventListener('click', applyConfig);
+  document.getElementById('banner-preflight')?.addEventListener('click', showPreflight);
+}
+
+function forcePasswordBanner() {
+  if (!state.status?.forcePasswordChange) return '';
+  return `<div class="tip warn" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+    <div><strong>建议立即修改初始密码</strong> · 当前仍在使用安装时生成的密码</div>
+    <button class="btn btn-primary btn-sm" data-nav-jump="settings">去修改</button>
+  </div>`;
 }
 
 function renderBoot(msg = '正在加载…') {
@@ -180,22 +207,27 @@ function shell(content) {
     ['deploy', '部署指南', '🚀'],
     ['settings', '设置', '⚙️'],
   ];
+  const ver = state.status?.version ? `v${state.status.version}` : '';
   return `
     <div class="layout">
       <aside class="sidebar">
         <div class="brand">
           <div class="logo">WG</div>
-          <div><strong>WG 面板</strong><span>新手友好</span></div>
+          <div><strong>WG 面板</strong><span>${esc(ver)} · 新手友好</span></div>
         </div>
         ${nav.map(([id, label, icon]) => `
           <button class="nav-btn ${page === id ? 'active' : ''}" data-nav="${id}">
-            <span>${icon}</span><span class="nav-label">${label}</span>
+            <span>${icon}</span><span class="nav-label">${label}${id === 'clients' && state.dirty ? ' •' : ''}</span>
           </button>`).join('')}
         <div class="sidebar-footer">
           <button class="nav-btn" id="btn-logout"><span>🚪</span><span class="nav-label">退出登录</span></button>
         </div>
       </aside>
-      <main class="main">${content}</main>
+      <main class="main">
+        ${forcePasswordBanner()}
+        ${dirtyBanner()}
+        ${content}
+      </main>
     </div>
     <div id="modal-root"></div>`;
 }
@@ -204,10 +236,14 @@ function bindShell() {
   document.querySelectorAll('[data-nav]').forEach((btn) => {
     btn.onclick = () => { state.page = btn.dataset.nav; render(); };
   });
+  document.querySelectorAll('[data-nav-jump]').forEach((b) => {
+    b.onclick = () => { state.page = b.dataset.navJump; render(); };
+  });
   document.getElementById('btn-logout')?.addEventListener('click', async () => {
     await api('/api/logout', { method: 'POST' });
     await boot();
   });
+  bindDirtyBanner();
   if (state.modal) renderModal(state.modal);
 }
 
@@ -221,6 +257,12 @@ async function loadMainData() {
   state.wizardDone = serverRes.wizardDone;
   state.clients = clientsRes.clients;
   state.status = statusRes;
+  state.dirty = Boolean(statusRes.dirty ?? serverRes.dirty ?? clientsRes.dirty);
+  state.lastAppliedAt = statusRes.lastAppliedAt || serverRes.lastAppliedAt || null;
+}
+
+function onlineCount() {
+  return state.clients.filter((c) => c.online).length;
 }
 
 function renderDashboard() {
@@ -233,21 +275,19 @@ function renderDashboard() {
     <div class="page-header">
       <div>
         <h2>仪表盘</h2>
-        <p>一眼看清服务器状态，快速管理客户端</p>
+        <p>一眼看清服务器状态 · 上次应用：${esc(fmtTime(state.lastAppliedAt))}</p>
       </div>
       <div class="btn-row">
+        <button class="btn btn-ghost" id="dash-preflight">应用预检</button>
         <button class="btn btn-primary" id="dash-add">＋ 添加客户端</button>
         <button class="btn btn-success" id="dash-apply">应用到服务器</button>
       </div>
     </div>
     <div class="grid grid-4" style="margin-bottom:14px">
       <div class="card"><div class="stat-label">接口状态</div><div class="stat-value"><span class="badge ${up ? 'ok' : 'warn'}">${up ? '运行中' : '未启动'}</span></div></div>
-      <div class="card"><div class="stat-label">客户端数量</div><div class="stat-value">${state.clients.length}</div></div>
+      <div class="card"><div class="stat-label">客户端 / 在线</div><div class="stat-value">${state.clients.length} <span class="muted" style="font-size:0.9rem">/ ${onlineCount()} 在线</span></div></div>
       <div class="card"><div class="stat-label">监听端口</div><div class="stat-value">UDP ${esc(s.listenPort || 51820)}</div></div>
-      <div class="card"><div class="stat-label">系统工具</div><div class="stat-value" style="font-size:0.95rem">
-        <span class="badge ${tools.wg ? 'ok' : 'err'}">wg</span>
-        <span class="badge ${tools.wgQuick ? 'ok' : 'err'}">wg-quick</span>
-      </div></div>
+      <div class="card"><div class="stat-label">配置状态</div><div class="stat-value"><span class="badge ${state.dirty ? 'warn' : 'ok'}">${state.dirty ? '待应用' : '已同步'}</span></div></div>
     </div>
     <div class="grid grid-2">
       <div class="card">
@@ -256,9 +296,14 @@ function renderDashboard() {
           <div class="kv"><span>接口名</span><span class="mono">${esc(s.interfaceName || 'wg0')}</span></div>
           <div class="kv"><span>内网地址</span><span class="mono">${esc(s.address || '-')}</span></div>
           <div class="kv"><span>Endpoint</span><span class="mono">${esc(s.endpoint || '未设置')}</span></div>
+          <div class="kv"><span>系统工具</span><span>
+            <span class="badge ${tools.wg ? 'ok' : 'err'}">wg</span>
+            <span class="badge ${tools.wgQuick ? 'ok' : 'err'}">wg-quick</span>
+          </span></div>
           <div class="kv"><span>公钥</span><span class="mono" style="max-width:55%;word-break:break-all;text-align:right">${esc(s.publicKey || '-')}</span></div>
         </div>
         <div class="btn-row" style="margin-top:14px">
+          <button class="btn btn-ghost btn-sm" id="dash-fill-ip">一键填公网 IP</button>
           <button class="btn btn-ghost btn-sm" id="dash-server-conf">查看服务端配置</button>
           <button class="btn btn-ghost btn-sm" id="dash-dl-server">下载 wg 配置</button>
           <button class="btn btn-ghost btn-sm" data-nav-jump="server">修改设置</button>
@@ -267,25 +312,27 @@ function renderDashboard() {
       <div class="card">
         <h3>新手下一步</h3>
         <ol class="guide" style="margin:0;padding-left:1.1rem;color:var(--muted)">
-          <li>在「服务器」填好公网 IP/域名（Endpoint）</li>
-          <li>添加手机/电脑客户端，扫码或下载配置</li>
-          <li>点「应用到服务器」写入并启动 WireGuard</li>
+          <li>确认 Endpoint 为公网 IP:端口（可点「一键填公网 IP」）</li>
+          <li>添加客户端，手机扫码或下载 .conf</li>
+          <li>先「应用预检」，再点「应用到服务器」</li>
           <li>防火墙放行 UDP ${esc(s.listenPort || 51820)}</li>
         </ol>
-        <div class="tip" style="margin-top:12px;margin-bottom:0">若应用失败，请用 root 启动面板，或手动复制配置到 /etc/wireguard/</div>
+        <div class="tip" style="margin-top:12px;margin-bottom:0">应用前会自动备份旧配置。失败时面板会给出中文原因。</div>
       </div>
     </div>
     <div class="card" style="margin-top:14px">
       <div class="page-header" style="margin-bottom:8px">
-        <h3 style="margin:0">最近客户端</h3>
+        <h3 style="margin:0">客户端状态</h3>
         <button class="btn btn-ghost btn-sm" data-nav-jump="clients">查看全部</button>
       </div>
       ${state.clients.length ? `<div class="table-wrap"><table>
-        <thead><tr><th>名称</th><th>IP</th><th>状态</th><th>操作</th></tr></thead>
-        <tbody>${state.clients.slice(0,5).map(c => `<tr>
+        <thead><tr><th>名称</th><th>IP</th><th>在线</th><th>握手</th><th>流量</th><th>操作</th></tr></thead>
+        <tbody>${state.clients.slice(0, 8).map(c => `<tr>
           <td><strong>${esc(c.name)}</strong></td>
           <td class="mono">${esc(c.address)}</td>
-          <td><span class="badge ${c.enabled ? 'ok' : 'warn'}">${c.enabled ? '启用' : '停用'}</span></td>
+          <td><span class="badge ${c.online ? 'ok' : (c.enabled ? 'warn' : '')}">${c.online ? '在线' : (c.enabled ? '离线' : '停用')}</span></td>
+          <td class="small muted">${esc(c.latestHandshake || '-')}</td>
+          <td class="small muted">${esc(c.transfer || '-')}</td>
           <td><button class="btn btn-sm btn-primary" data-qr="${c.id}">二维码</button></td>
         </tr>`).join('')}</tbody></table></div>`
       : `<div class="empty"><div class="emoji">📭</div><div>还没有客户端，先添加第一个吧</div>
@@ -298,13 +345,12 @@ function bindDashboard() {
   document.getElementById('dash-add')?.addEventListener('click', add);
   document.getElementById('dash-add-2')?.addEventListener('click', add);
   document.getElementById('dash-apply')?.addEventListener('click', applyConfig);
+  document.getElementById('dash-preflight')?.addEventListener('click', showPreflight);
   document.getElementById('dash-server-conf')?.addEventListener('click', showServerConfig);
   document.getElementById('dash-dl-server')?.addEventListener('click', () => {
     window.location.href = '/api/server/config?format=download';
   });
-  document.querySelectorAll('[data-nav-jump]').forEach((b) => {
-    b.onclick = () => { state.page = b.dataset.navJump; render(); };
-  });
+  document.getElementById('dash-fill-ip')?.addEventListener('click', fillPublicIp);
   document.querySelectorAll('[data-qr]').forEach((b) => {
     b.onclick = () => showClientQr(b.dataset.qr);
   });
@@ -313,22 +359,26 @@ function bindDashboard() {
 function renderClients() {
   return `
     <div class="page-header">
-      <div><h2>客户端管理</h2><p>每个客户端一张配置。手机扫码，电脑下载 .conf 即可</p></div>
+      <div><h2>客户端管理</h2><p>在线状态来自 wg show 握手时间（约 3 分钟内视为在线）</p></div>
       <div class="btn-row">
+        <button class="btn btn-ghost" id="client-export-all">批量导出</button>
         <button class="btn btn-primary" id="client-add">＋ 添加客户端</button>
         <button class="btn btn-success" id="client-apply">应用到服务器</button>
       </div>
     </div>
     <div class="card">
       ${state.clients.length ? `<div class="table-wrap"><table>
-        <thead><tr><th>名称</th><th>内网 IP</th><th>AllowedIPs</th><th>PSK</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+        <thead><tr>
+          <th>名称</th><th>内网 IP</th><th>在线</th><th>握手</th><th>流量</th><th>AllowedIPs</th><th>状态</th><th>操作</th>
+        </tr></thead>
         <tbody>${state.clients.map(c => `<tr>
           <td><strong>${esc(c.name)}</strong>${c.note ? `<div class="small muted">${esc(c.note)}</div>` : ''}</td>
           <td class="mono">${esc(c.address)}</td>
+          <td><span class="badge ${c.online ? 'ok' : (c.enabled ? 'warn' : '')}">${c.online ? '在线' : (c.enabled ? '离线' : '停用')}</span></td>
+          <td class="small muted">${esc(c.latestHandshake || '-')}</td>
+          <td class="small muted">${esc(c.transfer || '-')}</td>
           <td class="mono small">${esc(c.allowedIPs)}</td>
-          <td>${c.hasPresharedKey ? '<span class="badge ok">有</span>' : '<span class="badge">无</span>'}</td>
           <td><label class="switch"><input type="checkbox" data-toggle="${c.id}" ${c.enabled ? 'checked' : ''} /><span></span></label></td>
-          <td class="small muted">${esc(fmtTime(c.createdAt))}</td>
           <td><div class="btn-row">
             <button class="btn btn-sm btn-primary" data-qr="${c.id}">二维码</button>
             <button class="btn btn-sm btn-ghost" data-cfg="${c.id}">配置</button>
@@ -347,6 +397,7 @@ function bindClients() {
   document.getElementById('client-add')?.addEventListener('click', () => openClientModal());
   document.getElementById('client-add-2')?.addEventListener('click', () => openClientModal());
   document.getElementById('client-apply')?.addEventListener('click', applyConfig);
+  document.getElementById('client-export-all')?.addEventListener('click', exportAllClients);
   document.querySelectorAll('[data-qr]').forEach((b) => (b.onclick = () => showClientQr(b.dataset.qr)));
   document.querySelectorAll('[data-cfg]').forEach((b) => (b.onclick = () => showClientConfig(b.dataset.cfg)));
   document.querySelectorAll('[data-dl]').forEach((b) => {
@@ -389,6 +440,7 @@ function renderServer() {
     <div class="page-header">
       <div><h2>服务器设置</h2><p>这些信息会写进服务端配置，并影响所有客户端</p></div>
       <div class="btn-row">
+        <button class="btn btn-ghost" id="srv-fill-ip">一键公网 IP</button>
         <button class="btn btn-ghost" id="srv-nat">填入 NAT 模板</button>
         <button class="btn btn-primary" id="srv-save">保存设置</button>
       </div>
@@ -397,35 +449,41 @@ function renderServer() {
       <div class="card">
         <h3>基本信息</h3>
         <div class="form-row">
-          <label>接口名 ${help('一般用 wg0，对应 /etc/wireguard/wg0.conf')}</label>
+          <label>接口名 ${help('一般用 wg0')}</label>
           <input class="field" id="s-interfaceName" value="${esc(s.interfaceName || 'wg0')}" />
         </div>
         <div class="inline-fields">
           <div class="form-row">
-            <label>监听端口 ${help('UDP 端口，默认 51820，需在防火墙放行')}</label>
+            <label>监听端口 ${help('UDP 端口，默认 51820')}</label>
             <input class="field" type="number" id="s-listenPort" value="${esc(s.listenPort || 51820)}" />
           </div>
           <div class="form-row">
-            <label>MTU ${help('多数网络 1420 即可')}</label>
+            <label>MTU</label>
             <input class="field" type="number" id="s-mtu" value="${esc(s.mtu ?? 1420)}" />
           </div>
         </div>
         <div class="form-row">
-          <label>服务器内网地址 ${help('例如 10.8.0.1/24')}</label>
+          <label>服务器内网地址</label>
           <input class="field mono" id="s-address" value="${esc(s.address || '10.8.0.1/24')}" />
         </div>
         <div class="form-row">
-          <label>Endpoint（公网地址） ${help('填 公网IP:端口 或 域名:端口')}</label>
-          <input class="field mono" id="s-endpoint" value="${esc(s.endpoint || '')}" placeholder="例如 203.0.113.10:51820" />
+          <label>Endpoint（公网地址） ${help('客户端连接地址：公网IP:端口')}</label>
+          <div style="display:flex;gap:8px">
+            <input class="field mono" id="s-endpoint" value="${esc(s.endpoint || '')}" placeholder="例如 203.0.113.10:51820" style="flex:1" />
+            <button class="btn btn-ghost" type="button" id="srv-fill-ip-2">探测</button>
+          </div>
         </div>
         <div class="form-row">
-          <label>客户端 DNS ${help('如 1.1.1.1')}</label>
+          <label>客户端 DNS</label>
           <input class="field mono" id="s-dns" value="${esc(s.dns || '')}" placeholder="1.1.1.1" />
         </div>
         <div class="form-row">
-          <label>配置文件路径 ${help('应用到服务器时写入的路径')}</label>
+          <label>配置文件路径</label>
           <input class="field mono" id="s-confPath" value="${esc(s.confPath || '/etc/wireguard/wg0.conf')}" />
         </div>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500" class="small">
+          <input type="checkbox" id="s-sync-port" checked /> 保存时自动同步 Endpoint 端口
+        </label>
       </div>
       <div class="card">
         <h3>密钥与 NAT</h3>
@@ -436,6 +494,7 @@ function renderServer() {
         <div class="btn-row" style="margin-bottom:14px">
           <button class="btn btn-ghost" id="srv-regen">重新生成服务器密钥</button>
           <button class="btn btn-ghost" id="srv-view-conf">预览服务端配置</button>
+          <button class="btn btn-ghost" id="srv-preflight">应用预检</button>
         </div>
         <div class="tip warn">重新生成服务器密钥后，所有客户端配置都会失效。</div>
         <div class="form-row">
@@ -443,15 +502,18 @@ function renderServer() {
           <textarea class="textarea mono" id="s-postUp">${esc(s.postUp || '')}</textarea>
         </div>
         <div class="form-row">
-          <label>PostDown ${help('接口关闭时清理规则')}</label>
+          <label>PostDown</label>
           <textarea class="textarea mono" id="s-postDown">${esc(s.postDown || '')}</textarea>
-          <div class="field-hint">模板里的 eth0 请改成真实出口网卡</div>
+          <div class="field-hint">点「填入 NAT 模板」会自动识别出口网卡</div>
         </div>
       </div>
     </div>`;
 }
 
 function bindServer() {
+  const fill = () => fillPublicIp(true);
+  document.getElementById('srv-fill-ip').onclick = fill;
+  document.getElementById('srv-fill-ip-2').onclick = fill;
   document.getElementById('srv-save').onclick = async () => {
     try {
       const body = {
@@ -464,10 +526,13 @@ function bindServer() {
         confPath: val('s-confPath'),
         postUp: val('s-postUp'),
         postDown: val('s-postDown'),
+        syncEndpointPort: document.getElementById('s-sync-port')?.checked,
       };
       const res = await api('/api/server', { method: 'PUT', body });
       state.server = res.server;
+      state.dirty = Boolean(res.dirty);
       toast('服务器设置已保存');
+      render();
     } catch (ex) { toast(ex.message, 'err'); }
   };
   document.getElementById('srv-nat').onclick = async () => {
@@ -483,11 +548,13 @@ function bindServer() {
     try {
       const res = await api('/api/server', { method: 'PUT', body: { regenerateKeys: true } });
       state.server = res.server;
+      state.dirty = true;
       toast('服务器密钥已更新', 'warn');
       render();
     } catch (ex) { toast(ex.message, 'err'); }
   };
   document.getElementById('srv-view-conf').onclick = showServerConfig;
+  document.getElementById('srv-preflight').onclick = showPreflight;
 }
 
 function renderDeploy() {
@@ -497,53 +564,52 @@ function renderDeploy() {
   return `
     <div class="page-header"><div><h2>部署指南</h2><p>按下面步骤即可在闲置服务器上跑通 VPN</p></div></div>
     <div class="grid">
-      <div class="card guide"><h3>1. 安装 WireGuard（Ubuntu / Debian）</h3>
-        <pre class="pre-box">sudo apt update
-sudo apt install -y wireguard wireguard-tools iptables</pre></div>
+      <div class="card guide"><h3>1. 安装 / 更新面板</h3>
+        <pre class="pre-box">git clone https://github.com/cheesydui-cloud/wg.git
+cd wg
+sudo bash install.sh
+# 更新（保留 data 与密码）：
+git pull && sudo bash install.sh</pre></div>
       <div class="card guide"><h3>2. 开启 IP 转发</h3>
         <pre class="pre-box">echo "net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/99-wireguard.conf
 sudo sysctl -p /etc/sysctl.d/99-wireguard.conf</pre></div>
       <div class="card guide"><h3>3. 放行防火墙端口</h3>
-        <p class="muted">面板端口 51821（TCP），WireGuard 端口 ${port}（UDP）</p>
         <pre class="pre-box">sudo ufw allow ${port}/udp
 sudo ufw allow 51821/tcp
 sudo ufw reload</pre></div>
       <div class="card guide"><h3>4. 在本面板完成配置</h3>
         <ol>
-          <li>填写 Endpoint：公网 IP 或域名 + 端口</li>
-          <li>确认 PostUp 里的 eth0 是真实出口网卡</li>
-          <li>添加客户端，手机扫码导入</li>
-          <li>点击「应用到服务器」</li>
-        </ol></div>
+          <li>一键填入公网 IP 作为 Endpoint</li>
+          <li>填入 NAT 模板（自动识别出口网卡）</li>
+          <li>添加客户端并扫码</li>
+          <li>应用预检 → 应用到服务器</li>
+        </ol>
+        <div class="btn-row" style="margin-top:10px">
+          <button class="btn btn-ghost" id="dep-preflight">应用预检</button>
+          <button class="btn btn-primary" id="dep-dl">下载服务端配置</button>
+          <button class="btn btn-success" id="dep-apply">尝试应用到服务器</button>
+        </div></div>
       <div class="card guide"><h3>5. 手动应用（可选）</h3>
         <pre class="pre-box">sudo cp ${esc(s.confPath || `/etc/wireguard/${iface}.conf`)} /etc/wireguard/${iface}.conf
 sudo chmod 600 /etc/wireguard/${iface}.conf
 sudo wg-quick up ${iface}
-sudo systemctl enable wg-quick@${iface}</pre>
-        <div class="btn-row" style="margin-top:10px">
-          <button class="btn btn-primary" id="dep-dl">下载服务端配置</button>
-          <button class="btn btn-success" id="dep-apply">尝试应用到服务器</button>
-        </div></div>
-      <div class="card guide"><h3>6. 客户端 App</h3>
-        <ul>
-          <li>iOS / Android：应用商店搜索 WireGuard</li>
-          <li>Windows / macOS：https://www.wireguard.com/install/</li>
-          <li>导入：扫二维码或导入 .conf 文件</li>
-        </ul></div>
+sudo systemctl enable wg-quick@${iface}</pre></div>
     </div>`;
 }
 
 function bindDeploy() {
   document.getElementById('dep-dl').onclick = () => { window.location.href = '/api/server/config?format=download'; };
   document.getElementById('dep-apply').onclick = applyConfig;
+  document.getElementById('dep-preflight').onclick = showPreflight;
 }
 
 function renderSettings() {
   return `
-    <div class="page-header"><div><h2>设置</h2><p>密码、备份与主题</p></div></div>
+    <div class="page-header"><div><h2>设置</h2><p>密码、备份与主题 · 面板 ${esc(state.status?.version ? 'v' + state.status.version : '')}</p></div></div>
     <div class="grid grid-2">
       <div class="card">
         <h3>修改登录账号</h3>
+        ${state.status?.forcePasswordChange ? '<div class="tip warn">检测到初始密码，请尽快修改</div>' : ''}
         <div class="form-row"><label>当前用户名</label><input class="field" id="pw-user" value="${esc(state.status?.username || 'admin')}" /></div>
         <div class="form-row"><label>当前密码</label><input class="field" type="password" id="pw-old" /></div>
         <div class="form-row"><label>新密码</label><input class="field" type="password" id="pw-new" minlength="6" /></div>
@@ -557,6 +623,7 @@ function renderSettings() {
           <label class="btn btn-ghost" style="cursor:pointer">导入备份
             <input type="file" id="imp-file" accept="application/json,.json" hidden />
           </label>
+          <button class="btn btn-ghost" id="bak-list">配置备份列表</button>
         </div>
         <div class="tip warn" style="margin-top:12px">导入会覆盖当前服务器与客户端数据，但不会改登录密码。</div>
       </div>
@@ -570,8 +637,9 @@ function renderSettings() {
       </div>
       <div class="card">
         <h3>关于</h3>
-        <p class="muted small">WG Panel — 面向新手的 WireGuard 服务端配置面板。</p>
-        <p class="muted small">密钥与配置保存在服务器本地 data 目录，不会上传第三方。</p>
+        <p class="muted small">WG Panel v${esc(state.status?.version || '1.1.0')} — 面向新手的 WireGuard 服务端配置面板。</p>
+        <p class="muted small">会话持久化、登录防爆破、应用预检、在线状态、配置备份回滚。</p>
+        <p class="muted small"><a href="https://github.com/cheesydui-cloud/wg" target="_blank" rel="noreferrer">GitHub 仓库</a></p>
       </div>
     </div>`;
 }
@@ -590,10 +658,15 @@ function bindSettings() {
       toast(res.message || '账号已更新');
       document.getElementById('pw-old').value = '';
       document.getElementById('pw-new').value = '';
-      if (state.status) state.status.username = res.username || val('pw-user') || 'admin';
+      if (state.status) {
+        state.status.username = res.username || val('pw-user') || 'admin';
+        state.status.forcePasswordChange = false;
+      }
+      render();
     } catch (ex) { toast(ex.message, 'err'); }
   };
   document.getElementById('exp-btn').onclick = () => { window.location.href = '/api/export'; };
+  document.getElementById('bak-list').onclick = showBackups;
   document.getElementById('imp-file').onchange = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -627,7 +700,10 @@ function renderWizard() {
     <div class="card" style="max-width:640px">
       ${step===1?`<h3>你的服务器公网地址</h3>
         <div class="form-row"><label>公网 IP 或域名</label>
-          <input class="field mono" id="w-host" placeholder="203.0.113.10" value="${esc((s.endpoint||'').split(':')[0]||'')}" /></div>
+          <div style="display:flex;gap:8px">
+            <input class="field mono" id="w-host" placeholder="203.0.113.10" value="${esc((s.endpoint||'').split(':')[0]||'')}" style="flex:1" />
+            <button class="btn btn-ghost" type="button" id="w-detect-ip">探测</button>
+          </div></div>
         <div class="form-row"><label>WireGuard 端口</label>
           <input class="field" type="number" id="w-port" value="${esc(s.listenPort||51820)}" /></div>`:''}
       ${step===2?`<h3>服务器密钥</h3>
@@ -641,7 +717,7 @@ function renderWizard() {
           <input class="field mono" id="w-dns" value="${esc(s.dns||'1.1.1.1')}" /></div>
         <div class="form-row"><label style="display:flex;align-items:center;gap:10px;font-weight:500">
           <label class="switch"><input type="checkbox" id="w-nat" checked /><span></span></label>
-          启用 NAT（让客户端能访问公网）</label></div>`:''}
+          启用 NAT（自动识别出口网卡）</label></div>`:''}
       ${step===4?`<h3>创建第一个客户端</h3>
         <div class="form-row"><label>名称</label><input class="field" id="w-cname" value="我的手机" /></div>
         <div class="form-row"><label>流量模式</label>
@@ -649,7 +725,7 @@ function renderWizard() {
             <option value="0.0.0.0/0, ::/0">全局代理（推荐）</option>
             <option value="NET_ONLY">仅访问 VPN 内网</option>
           </select></div>
-        <div class="tip">创建后可立即查看二维码。</div>`:''}
+        <div class="tip">创建后可扫码，并建议立刻「应用预检 → 应用到服务器」。</div>`:''}
       <div class="actions-end">
         ${step>1?'<button class="btn btn-ghost" id="w-prev">上一步</button>':''}
         ${step<4?'<button class="btn btn-primary" id="w-next">下一步</button>':'<button class="btn btn-success" id="w-finish">完成并创建</button>'}
@@ -660,6 +736,15 @@ function renderWizard() {
 
 function bindWizard() {
   bindShell();
+  document.getElementById('w-detect-ip')?.addEventListener('click', async () => {
+    try {
+      const res = await api('/api/system/public-ip');
+      if (res.ip) {
+        document.getElementById('w-host').value = res.ip;
+        toast('已填入公网 IP: ' + res.ip);
+      }
+    } catch (ex) { toast(ex.message, 'err'); }
+  });
   document.getElementById('w-prev')?.addEventListener('click', () => {
     state.wizardStep = Math.max(1, state.wizardStep - 1);
     render();
@@ -881,7 +966,7 @@ async function showServerConfig() {
     state.modal = {
       title: '服务端配置预览',
       body: `
-        <p class="muted small">路径：${esc(data.path || '')}</p>
+        <p class="muted small">路径：${esc(data.path || '')}${data.dirty ? ' · 有未应用变更' : ''}</p>
         <pre class="pre-box">${esc(data.config)}</pre>
         <div class="btn-row">
           <button class="btn btn-ghost" id="sc-copy">复制</button>
@@ -898,8 +983,92 @@ async function showServerConfig() {
   } catch (ex) { toast(ex.message, 'err'); }
 }
 
-async function applyConfig() {
-  if (!confirm('将配置写入服务器并启动/重载 WireGuard 接口，继续？')) return;
+async function showPreflight() {
+  try {
+    const pf = await api('/api/preflight');
+    state.preflight = pf;
+    state.modal = {
+      title: '应用预检',
+      body: `
+        <div class="tip ${pf.canApply ? 'ok' : 'warn'}">${pf.canApply ? '可以尝试应用到服务器' : '存在阻塞项，请先处理后再应用'}</div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>检查项</th><th>结果</th><th>说明</th></tr></thead>
+          <tbody>
+            ${(pf.checks || []).map(c => `<tr>
+              <td>${esc(c.title)}</td>
+              <td><span class="badge ${c.ok ? 'ok' : (c.warn ? 'warn' : 'err')}">${c.ok ? '通过' : (c.warn ? '警告' : '失败')}</span></td>
+              <td class="small muted">${esc(c.detail)}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table></div>
+        <p class="small muted" style="margin-top:10px">出口网卡：${esc(pf.egressIface || '-')} · 配置路径：${esc(pf.confPath || '-')}</p>
+        <div class="actions-end">
+          <button class="btn btn-ghost" id="pf-close">关闭</button>
+          <button class="btn btn-success" id="pf-apply" ${pf.canApply ? '' : 'disabled'}>仍然应用</button>
+        </div>`,
+      after() {
+        document.getElementById('pf-close').onclick = closeModal;
+        document.getElementById('pf-apply').onclick = () => { closeModal(); applyConfig(true); };
+      },
+    };
+    renderModal(state.modal);
+  } catch (ex) { toast(ex.message, 'err'); }
+}
+
+async function showBackups() {
+  try {
+    const data = await api('/api/backups');
+    const list = data.backups || [];
+    state.modal = {
+      title: '配置备份列表',
+      body: list.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>文件</th><th>时间</th><th>大小</th></tr></thead>
+        <tbody>${list.map(b => `<tr>
+          <td class="mono small">${esc(b.name)}</td>
+          <td class="small">${esc(fmtTime(b.mtime))}</td>
+          <td class="small">${esc(b.size)} B</td>
+        </tr>`).join('')}</tbody></table></div>
+        <p class="muted small">备份目录在服务器 data/backups，应用配置前会自动备份。</p>`
+        : '<div class="empty">暂无备份（应用配置后会自动生成）</div>',
+    };
+    renderModal(state.modal);
+  } catch (ex) { toast(ex.message, 'err'); }
+}
+
+async function fillPublicIp(intoServerField = false) {
+  try {
+    toast('正在探测公网 IP…', 'warn');
+    const res = await api('/api/system/fill-endpoint', { method: 'POST', body: {} });
+    if (intoServerField && document.getElementById('s-endpoint')) {
+      document.getElementById('s-endpoint').value = res.endpoint;
+    }
+    state.server = res.server || state.server;
+    state.dirty = Boolean(res.dirty);
+    toast('Endpoint 已设为 ' + res.endpoint);
+    if (!intoServerField) render();
+  } catch (ex) { toast(ex.message || '探测失败', 'err'); }
+}
+
+async function exportAllClients() {
+  try {
+    const data = await api('/api/clients/export/zip-json');
+    if (!data.files?.length) return toast('没有可导出的客户端', 'warn');
+    // 逐个触发下载（纯前端，无 zip 依赖）
+    for (const f of data.files) {
+      const blob = new Blob([f.content], { type: 'text/plain' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = f.name;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    toast(`已开始下载 ${data.files.length} 个配置文件`);
+  } catch (ex) { toast(ex.message, 'err'); }
+}
+
+async function applyConfig(skipConfirm = false) {
+  if (!skipConfirm && !confirm('将配置写入服务器并启动/重载 WireGuard 接口，继续？\n（应用前会自动备份旧配置）')) return;
   try {
     const res = await api('/api/apply', { method: 'POST' });
     toast(res.message || '已应用', res.ok === false ? 'err' : 'ok');
@@ -907,12 +1076,28 @@ async function applyConfig() {
   } catch (ex) {
     const msg = ex.data?.message || ex.message;
     toast(msg, 'err');
-    if (ex.data?.config) {
+    const pf = ex.data?.preflight;
+    if (pf?.checks) {
+      state.modal = {
+        title: '应用失败',
+        body: `
+          <div class="tip warn">${esc(msg)}</div>
+          <div class="table-wrap"><table>
+            <thead><tr><th>检查项</th><th>结果</th><th>说明</th></tr></thead>
+            <tbody>${pf.checks.map(c => `<tr>
+              <td>${esc(c.title)}</td>
+              <td><span class="badge ${c.ok ? 'ok' : (c.warn ? 'warn' : 'err')}">${c.ok ? '通过' : (c.warn ? '警告' : '失败')}</span></td>
+              <td class="small muted">${esc(c.detail)}</td>
+            </tr>`).join('')}</tbody>
+          </table></div>
+          ${ex.data?.config ? `<p class="muted small">也可手动下载配置安装：</p><a class="btn btn-primary" href="/api/server/config?format=download">下载配置文件</a>` : ''}`,
+      };
+      renderModal(state.modal);
+    } else if (ex.data?.config) {
       state.modal = {
         title: '应用失败 — 可手动安装',
         body: `
           <div class="tip warn">${esc(msg)}</div>
-          <p class="muted small">下面是生成的配置，可手动保存到服务器：</p>
           <pre class="pre-box">${esc(ex.data.config)}</pre>
           <a class="btn btn-primary" href="/api/server/config?format=download">下载配置文件</a>`,
       };

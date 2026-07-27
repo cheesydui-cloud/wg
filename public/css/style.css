@@ -333,6 +333,11 @@ tr:hover td { background: rgba(59, 130, 246, 0.04); }
 .kv span:first-child { color: var(--muted); }
 .actions-end { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 
+.dirty-banner { margin-bottom: 14px; }
+.main > .tip:first-child { margin-top: 0; }
+
+.nav-btn .nav-label { white-space: nowrap; }
+
 .guide ol { padding-left: 1.2rem; }
 .guide li { margin: 8px 0; }
 .guide code {

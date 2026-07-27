@@ -101,6 +101,58 @@ function normalizeClientAddress(address) {
   return `${ip}/32`;
 }
 
+function listSkippedPeers(state) {
+  const skipped = [];
+  for (const c of state.clients || []) {
+    if (c.enabled === false) continue;
+    if (!c.publicKey) {
+      skipped.push({ id: c.id, name: c.name, reason: '缺少公钥' });
+      continue;
+    }
+    if (!peerAllowedIps(c)) {
+      skipped.push({ id: c.id, name: c.name, reason: '缺少有效内网 IP' });
+    }
+  }
+  return skipped;
+}
+
+function countConfigPeers(state) {
+  let n = 0;
+  for (const c of state.clients || []) {
+    if (c.enabled === false) continue;
+    if (!c.publicKey) continue;
+    if (!peerAllowedIps(c)) continue;
+    n += 1;
+  }
+  return n;
+}
+
+function parseEndpoint(endpoint) {
+  const raw = String(endpoint || '').trim();
+  if (!raw) return { ok: false, host: '', port: null, message: 'Endpoint 为空' };
+  let host = raw;
+  let port = null;
+  const m6 = raw.match(/^\[([^\]]+)\]:(\d+)$/);
+  if (m6) {
+    host = m6[1];
+    port = Number(m6[2]);
+  } else {
+    const idx = raw.lastIndexOf(':');
+    if (idx > 0) {
+      const maybePort = Number(raw.slice(idx + 1));
+      if (!Number.isNaN(maybePort) && maybePort >= 1 && maybePort <= 65535) {
+        host = raw.slice(0, idx);
+        port = maybePort;
+      }
+    }
+  }
+  if (!host) return { ok: false, host: '', port: null, message: 'Endpoint 主机为空' };
+  if (port != null && (Number.isNaN(port) || port < 1 || port > 65535)) {
+    return { ok: false, host, port, message: 'Endpoint 端口无效' };
+  }
+  return { ok: true, host, port, message: '' };
+}
+
 function buildServerConfig(state) {
   const s = state.server;
   const lines = ['[Interface]'];
@@ -128,8 +180,14 @@ function buildServerConfig(state) {
   return lines.join('\n').trim() + '\n';
 }
 
-function buildClientConfig(state, client) {
+function buildClientConfig(state, client, opts = {}) {
   const s = state.server;
+  const requireEndpoint = opts.requireEndpoint !== false;
+  if (requireEndpoint && !String(s.endpoint || '').trim()) {
+    const err = new Error('请先填写客户端连接地址（Endpoint），否则手机无法连接');
+    err.code = 'NO_ENDPOINT';
+    throw err;
+  }
   const lines = ['[Interface]'];
   lines.push(`# ${sanitizeName(client.name)} — WireGuard 客户端配置`);
   lines.push(`PrivateKey = ${client.privateKey}`);
@@ -326,6 +384,75 @@ async function checkMasqueradeActive(egressIface) {
           ? '系统有 MASQUERADE，但出口网卡可能不一致'
           : '尚未生效（需应用配置并启动接口）',
     rules: lines.join('\n'),
+  };
+}
+
+/**
+ * syncconf 不会执行 PostUp：若配置了 NAT，主动补齐 iptables（幂等）
+ */
+async function ensureNatLive(interfaceName, postUp, egressIfaceHint) {
+  if (!hasNatTemplate(postUp || '')) {
+    return { ok: true, skipped: true, message: '配置中无 NAT，跳过' };
+  }
+  const iface = interfaceName || 'wg0';
+  let egress = egressIfaceHint;
+  if (!egress) {
+    const m = String(postUp || '').match(/-o\s+(\S+)\s+-j\s+MASQUERADE/i);
+    if (m) egress = m[1];
+  }
+  if (!egress) {
+    const d = await detectDefaultInterface();
+    egress = d.iface || 'eth0';
+  }
+
+  enableIpForwardPersistent();
+
+  const ensureRule = async (args) => {
+    const check = await runCmd('iptables', ['-C', ...args]);
+    if (check.ok) return { added: false };
+    const add = await runCmd('iptables', ['-A', ...args]);
+    return { added: add.ok, ok: add.ok, detail: add.stderr || add.stdout };
+  };
+
+  const r1 = await ensureRule(['FORWARD', '-i', iface, '-j', 'ACCEPT']);
+  const r2 = await ensureRule(['FORWARD', '-o', iface, '-j', 'ACCEPT']);
+  const r3 = await runCmd('iptables', [
+    '-t',
+    'nat',
+    '-C',
+    'POSTROUTING',
+    '-o',
+    egress,
+    '-j',
+    'MASQUERADE',
+  ]);
+  let natAdded = false;
+  if (!r3.ok) {
+    const add = await runCmd('iptables', [
+      '-t',
+      'nat',
+      '-A',
+      'POSTROUTING',
+      '-o',
+      egress,
+      '-j',
+      'MASQUERADE',
+    ]);
+    natAdded = add.ok;
+    if (!add.ok) {
+      return {
+        ok: false,
+        egress,
+        message: `补齐 NAT 失败: ${add.stderr || add.stdout}`,
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    egress,
+    message: `已确保转发/NAT（${iface} → ${egress}）`,
+    added: Boolean(r1.added || r2.added || natAdded),
   };
 }
 
@@ -814,16 +941,48 @@ async function applyConfig(state) {
     message = '配置已写入并启动接口';
   }
 
+  // syncconf 不跑 PostUp：主动补 NAT
+  let natEnsure = null;
+  if (action === 'syncconf' && hasNatTemplate(state.server.postUp || '')) {
+    natEnsure = await ensureNatLive(iface, state.server.postUp);
+    if (natEnsure.ok && natEnsure.added) {
+      message += `；已补齐 NAT（${natEnsure.egress}）`;
+    } else if (!natEnsure.ok) {
+      message += `；警告: ${natEnsure.message}`;
+    }
+  }
+
   state.lastAppliedHash = configHash(state);
   state.lastAppliedAt = new Date().toISOString();
 
+  const skipped = listSkippedPeers(state);
+  const expectedPeers = countConfigPeers(state);
+  const live = await getInterfaceStatus(iface);
+  const livePeers = live.peers?.length || 0;
+  const warnings = [];
+  if (skipped.length) {
+    warnings.push(
+      `以下客户端未写入服务端 peer：${skipped.map((s) => s.name || s.id).join('、')}`
+    );
+  }
+  if (expectedPeers === 0) {
+    warnings.push('当前没有启用的客户端 peer，手机将无法握手');
+  } else if (live.up && livePeers < expectedPeers) {
+    warnings.push(`服务端 peer ${livePeers}/${expectedPeers}，请确认已应用最新配置`);
+  }
+
   return {
     ok: true,
-    message,
+    message: warnings.length ? `${message}（注意: ${warnings[0]}）` : message,
     confPath,
     backupPath,
     action,
     preflight: pf,
+    natEnsure,
+    skippedPeers: skipped,
+    expectedPeers,
+    livePeers,
+    warnings,
   };
 }
 
@@ -851,6 +1010,261 @@ function listBackups() {
   }
 }
 
+/**
+ * 诊断：配置 + 运行状态，给出可执行建议
+ * report: 可选 agent lastReport（远程模式）
+ */
+async function diagnose(state, opts = {}) {
+  const mode = opts.mode || 'local';
+  const report = opts.report || null;
+  const agentOnline = Boolean(opts.agentOnline);
+  const items = [];
+  const s = state.server || {};
+  const clients = state.clients || [];
+
+  const push = (item) => {
+    items.push({
+      level: item.level || 'info', // ok | warn | error | info
+      id: item.id,
+      title: item.title,
+      detail: item.detail || '',
+      fix: item.fix || '',
+    });
+  };
+
+  // mode
+  push({
+    id: 'mode',
+    level: 'info',
+    title: '出口模式',
+    detail: mode === 'agent' ? '远程 Agent（配置下发到落地机）' : '本机（面板所在机器跑 WireGuard）',
+  });
+
+  if (mode === 'agent') {
+    push({
+      id: 'agent_online',
+      level: agentOnline ? 'ok' : 'error',
+      title: 'Agent 在线',
+      detail: agentOnline
+        ? `在线${opts.hostname ? ' · ' + opts.hostname : ''}${opts.agentVersion ? ' · v' + opts.agentVersion : ''}`
+        : '离线：远程落地/应用不会执行',
+      fix: agentOnline
+        ? ''
+        : '在落地机以 root 执行面板生成的安装命令；检查 WG_PANEL_URL 能否访问面板',
+    });
+  }
+
+  // endpoint
+  const ep = parseEndpoint(s.endpoint);
+  const listenPort = Number(s.listenPort) || 0;
+  if (!ep.ok || !s.endpoint) {
+    push({
+      id: 'endpoint',
+      level: 'error',
+      title: '客户端连接地址（Endpoint）',
+      detail: '未填写。手机扫码后无法主动连接',
+      fix: '在「出口服务器」填写 公网IP或入口IP:端口，例如 114.x.x.x:7901',
+    });
+  } else {
+    const portMismatch = ep.port != null && listenPort && ep.port !== listenPort;
+    push({
+      id: 'endpoint',
+      level: portMismatch ? 'warn' : 'ok',
+      title: '客户端连接地址（Endpoint）',
+      detail: portMismatch
+        ? `${s.endpoint}（端口 ${ep.port} ≠ 监听 ${listenPort}）`
+        : s.endpoint,
+      fix: portMismatch
+        ? `把 Endpoint 改成 ${ep.host}:${listenPort}，保存后重新扫码`
+        : '',
+    });
+  }
+
+  push({
+    id: 'listen_port',
+    level: listenPort ? 'ok' : 'error',
+    title: '监听端口',
+    detail: listenPort ? `UDP ${listenPort}` : '未设置',
+    fix: listenPort ? '确认商家/防火墙放行该 UDP 端口' : '设置监听端口',
+  });
+
+  push({
+    id: 'keys',
+    level: s.privateKey && s.publicKey ? 'ok' : 'error',
+    title: '服务器密钥',
+    detail: s.publicKey ? `公钥 ${String(s.publicKey).slice(0, 16)}…` : '缺少密钥',
+  });
+
+  const skipped = listSkippedPeers(state);
+  const enabled = clients.filter((c) => c.enabled !== false);
+  const peerCount = countConfigPeers(state);
+  push({
+    id: 'clients',
+    level: enabled.length === 0 ? 'warn' : skipped.length ? 'error' : 'ok',
+    title: '客户端',
+    detail:
+      enabled.length === 0
+        ? '还没有客户端'
+        : skipped.length
+          ? `${enabled.length} 个中有 ${skipped.length} 个无法写入 peer：${skipped.map((x) => x.name).join('、')}`
+          : `${enabled.length} 个启用 · 将写入 ${peerCount} 个 peer`,
+    fix:
+      enabled.length === 0
+        ? '在「客户端」页添加手机'
+        : skipped.length
+          ? '编辑客户端补全内网 IP 后重新应用'
+          : '',
+  });
+
+  // runtime from local or agent report
+  let ifaceStatus = { up: false, peers: [], raw: '' };
+  let forward = null;
+  let natActive = false;
+  let egressIface = '';
+  let exitPublicIp = null;
+
+  if (mode === 'local') {
+    ifaceStatus = await getInterfaceStatus(s.interfaceName || 'wg0');
+    forward = ipForwardEnabled();
+    const egress = await detectDefaultInterface();
+    egressIface = egress.iface || '';
+    const nat = await checkMasqueradeActive(egressIface);
+    natActive = nat.active;
+    const ip = await detectPublicIp();
+    if (ip.ok) exitPublicIp = ip.ip;
+  } else if (report) {
+    ifaceStatus = report.interface || ifaceStatus;
+    forward = report.forward;
+    natActive = Boolean(report.natActive);
+    egressIface = report.egressIface || '';
+    exitPublicIp = report.exitPublicIp || null;
+  }
+
+  push({
+    id: 'interface',
+    level: ifaceStatus.up ? 'ok' : mode === 'agent' && !agentOnline ? 'warn' : 'error',
+    title: 'WireGuard 接口',
+    detail: ifaceStatus.up
+      ? `${s.interfaceName || 'wg0'} 运行中 · live peer ${ifaceStatus.peers?.length || 0}`
+      : mode === 'agent' && !report
+        ? '尚无 Agent 上报（节点需在线）'
+        : '接口未启动',
+    fix: ifaceStatus.up ? '' : '点击「应用配置」或「一键落地」',
+  });
+
+  const natConfigured = hasNatTemplate(s.postUp || '');
+  push({
+    id: 'forward',
+    level: forward === true ? 'ok' : forward === false ? 'error' : 'warn',
+    title: 'IPv4 转发',
+    detail: forward === true ? '已开启' : forward === false ? '未开启' : '未知',
+    fix: forward === false ? '点击「一键落地」' : '',
+  });
+  push({
+    id: 'nat',
+    level: natActive ? 'ok' : natConfigured ? 'warn' : 'error',
+    title: 'NAT（MASQUERADE）',
+    detail: natActive
+      ? `已生效${egressIface ? ' · 出口 ' + egressIface : ''}`
+      : natConfigured
+        ? '已写入配置但未生效'
+        : '未配置',
+    fix: natActive ? '' : '点击「一键落地」；确认出口网卡名正确',
+  });
+
+  if (exitPublicIp) {
+    push({
+      id: 'egress_ip',
+      level: 'info',
+      title: '当前出网 IP（勿当 Endpoint）',
+      detail: exitPublicIp,
+      fix: '这是服务器访问外网时的 IP，不是手机应连接的入站地址',
+    });
+  }
+
+  // peer handshake analysis
+  const peerMap = new Map();
+  for (const p of ifaceStatus.peers || []) {
+    if (p.publicKey) peerMap.set(p.publicKey, p);
+  }
+  let onlineCount = 0;
+  let txOnly = 0;
+  let noHs = 0;
+  for (const c of enabled) {
+    const live = peerMap.get(c.publicKey);
+    if (live?.online) onlineCount += 1;
+    else if (live?.latestHandshake) noHs += 1; // has history but not recent
+    else noHs += 1;
+  }
+  // server-side: peers with transfer sent but no handshake often means client TX only visible if endpoint reaches
+  for (const p of ifaceStatus.peers || []) {
+    const rxZero =
+      !p.transferRx ||
+      /^0(\.0+)?\s*(B|byte)/i.test(String(p.transferRx)) ||
+      p.transferRx === '0 B';
+    const hasTx = p.transferTx && !/^0(\.0+)?\s*(B|byte)/i.test(String(p.transferTx));
+    if (!p.online && hasTx && rxZero) txOnly += 1;
+  }
+
+  push({
+    id: 'handshake',
+    level: onlineCount > 0 ? 'ok' : enabled.length === 0 ? 'info' : 'warn',
+    title: '握手状态',
+    detail:
+      enabled.length === 0
+        ? '无客户端'
+        : onlineCount > 0
+          ? `${onlineCount}/${enabled.length} 个客户端近 3 分钟有握手`
+          : `0/${enabled.length} 在线 · 手机打开隧道后若仍为 0，多半是 UDP 进不来或密钥不一致`,
+    fix:
+      onlineCount > 0
+        ? ''
+        : enabled.length
+          ? '1) 确认扫的是本面板「客户端」二维码 2) Endpoint 用外部连接 IP 3) 落地机 tcpdump -n udp port 端口 看有无包 4) 商家是否映射了 UDP'
+          : '先添加客户端并扫码',
+  });
+
+  if (txOnly > 0) {
+    push({
+      id: 'tx_only',
+      level: 'error',
+      title: '疑似仅发送无接收',
+      detail: `${txOnly} 个 peer 有发送无握手/无接收`,
+      fix: 'UDP 未到达或密钥错误：检查 Endpoint、监听端口、服务端是否包含该 peer、重新扫码',
+    });
+  }
+
+  const errors = items.filter((i) => i.level === 'error').length;
+  const warns = items.filter((i) => i.level === 'warn').length;
+  let summary = '配置看起来正常';
+  if (errors) summary = `发现 ${errors} 个必须处理的问题`;
+  else if (warns) summary = `有 ${warns} 个警告，建议处理`;
+  if (onlineCount > 0 && natActive && forward === true) {
+    summary = '隧道与落地条件正常，手机应可上网';
+  }
+
+  return {
+    ok: errors === 0,
+    summary,
+    mode,
+    items,
+    stats: {
+      clientCount: enabled.length,
+      peerCount,
+      onlineCount,
+      interfaceUp: Boolean(ifaceStatus.up),
+      forward,
+      natActive,
+      egressIface,
+      exitPublicIp,
+      endpoint: s.endpoint || '',
+      listenPort,
+      agentOnline: mode === 'agent' ? agentOnline : null,
+    },
+    raw: ifaceStatus.raw || '',
+  };
+}
+
 module.exports = {
   parseCidr,
   nextClientAddress,
@@ -874,11 +1288,17 @@ module.exports = {
   getExitStatus,
   setupExit,
   checkMasqueradeActive,
+  ensureNatLive,
   preflight,
   applyConfig,
   stopInterface,
   listBackups,
   backupConfigFile,
+  listSkippedPeers,
+  countConfigPeers,
+  parseEndpoint,
+  diagnose,
+  hasNatTemplate,
   generateKeyPair: cryptoWg.generateKeyPair,
   generatePresharedKey: cryptoWg.generatePresharedKey,
   derivePublicKey: cryptoWg.derivePublicKey,

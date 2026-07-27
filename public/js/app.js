@@ -12,6 +12,12 @@ const state = {
   dirty: false,
   lastAppliedAt: null,
   preflight: null,
+  mode: 'local',
+  primaryNode: null,
+  primaryNodeId: null,
+  diagnose: null,
+  exitOverview: null,
+  installCommand: null,
 };
 
 async function api(path, options = {}) {
@@ -59,14 +65,12 @@ function toast(msg, type = 'ok') {
   }
   const t = el(`<div class="toast ${type}">${esc(msg)}</div>`);
   wrap.appendChild(t);
-  setTimeout(() => t.remove(), 3200);
+  setTimeout(() => t.remove(), 3600);
 }
 
-/** HTTP 非安全上下文下 clipboard API 常不可用，用 textarea 回退 */
 async function copyText(text) {
   const value = String(text ?? '');
   if (!value) throw new Error('没有可复制的内容');
-  // 优先异步 clipboard（仅 https / localhost 可靠）
   if (navigator.clipboard && window.isSecureContext) {
     try {
       await navigator.clipboard.writeText(value);
@@ -90,7 +94,7 @@ async function copyText(text) {
     ok = false;
   }
   document.body.removeChild(ta);
-  if (!ok) throw new Error('复制失败，请手动长按/拖选文本复制');
+  if (!ok) throw new Error('复制失败，请手动选中文本复制');
   return true;
 }
 
@@ -100,7 +104,11 @@ function help(tip) {
 
 function fmtTime(iso) {
   if (!iso) return '-';
-  try { return new Date(iso).toLocaleString('zh-CN'); } catch { return iso; }
+  try {
+    return new Date(iso).toLocaleString('zh-CN');
+  } catch {
+    return iso;
+  }
 }
 
 function networkFromAddress(addr) {
@@ -116,6 +124,20 @@ function val(id) {
   return document.getElementById(id)?.value?.trim() ?? '';
 }
 
+function isAgentMode() {
+  return (state.mode || state.status?.mode) === 'agent';
+}
+
+function exitLabel() {
+  if (isAgentMode()) {
+    const n = state.primaryNode || state.status?.primaryNode;
+    const online = n?.online;
+    const name = n?.name || '落地机';
+    return `远程落地 · ${name}${online ? ' · 在线' : ' · 离线'}`;
+  }
+  return '本机出口（面板这台机器）';
+}
+
 function topAlerts() {
   const parts = [];
   if (state.status?.forcePasswordChange) {
@@ -124,12 +146,20 @@ function topAlerts() {
       <button class="btn btn-sm btn-primary" data-nav-jump="settings">去修改</button>
     </div>`);
   }
+  if (isAgentMode() && state.primaryNode && !state.primaryNode.online) {
+    parts.push(`<div class="alert warn">
+      <div><strong>落地 Agent 离线</strong> · 应用/落地不会执行，手机也无法真正连上出口</div>
+      <button class="btn btn-sm btn-primary" data-nav-jump="server">去安装/检查</button>
+    </div>`);
+  }
   if (state.dirty) {
     parts.push(`<div class="alert warn">
-      <div><strong>有未应用的更改</strong> · 已保存在面板，尚未写入服务器</div>
+      <div><strong>有未应用的更改</strong> · ${
+        isAgentMode() ? '需下发到落地机' : '需写入本机 WireGuard'
+      }</div>
       <div class="btn-row">
-        <button class="btn btn-sm btn-ghost" id="banner-preflight">预检</button>
-        <button class="btn btn-sm btn-success" id="banner-apply">应用</button>
+        <button class="btn btn-sm btn-ghost" id="banner-diagnose">诊断</button>
+        <button class="btn btn-sm btn-success" id="banner-apply">应用配置</button>
       </div>
     </div>`);
   }
@@ -137,10 +167,16 @@ function topAlerts() {
 }
 
 function bindTopAlerts() {
-  document.getElementById('banner-apply')?.addEventListener('click', applyConfig);
-  document.getElementById('banner-preflight')?.addEventListener('click', showPreflight);
+  document.getElementById('banner-apply')?.addEventListener('click', () => applyConfig(true));
+  document.getElementById('banner-diagnose')?.addEventListener('click', () => {
+    state.page = 'diagnose';
+    render();
+  });
   document.querySelectorAll('[data-nav-jump]').forEach((b) => {
-    b.onclick = () => { state.page = b.dataset.navJump; render(); };
+    b.onclick = () => {
+      state.page = b.dataset.navJump;
+      render();
+    };
   });
 }
 
@@ -160,111 +196,87 @@ function renderSetup() {
     <div class="auth-screen">
       <div class="auth-card">
         <div class="logo">WG</div>
-        <h1>创建管理员账号</h1>
-        <p class="sub">首次使用需要设置登录账号，默认用户名 admin</p>
-        <form id="setup-form">
-          <div class="form-row">
-            <label>用户名</label>
-            <input class="field" type="text" name="username" value="admin" required autocomplete="username" />
-          </div>
-          <div class="form-row">
-            <label>密码</label>
-            <input class="field" type="password" name="password" minlength="6" required placeholder="至少 6 位" autocomplete="new-password" />
-          </div>
-          <div class="form-row">
-            <label>确认密码</label>
-            <input class="field" type="password" name="password2" minlength="6" required placeholder="再输入一次" autocomplete="new-password" />
-          </div>
-          <button class="btn btn-primary" style="width:100%;margin-top:4px" type="submit">开始使用</button>
-          <p class="field-hint" id="setup-err" style="color:var(--danger)"></p>
-        </form>
+        <h1>初始化面板</h1>
+        <p class="muted">设置管理员账号。面板可单独部署，真正出口在落地机上。</p>
+        <label>用户名</label>
+        <input class="field" id="su-user" value="admin" />
+        <label>密码（至少 6 位）</label>
+        <input class="field" id="su-pass" type="password" placeholder="设置密码" />
+        <button class="btn btn-primary btn-block" id="su-go">完成初始化</button>
       </div>
     </div>`;
-  document.getElementById('setup-form').onsubmit = async (e) => {
-    e.preventDefault();
-    const fd = new FormData(e.target);
-    const username = fd.get('username') || 'admin';
-    const password = fd.get('password');
-    const password2 = fd.get('password2');
-    const err = document.getElementById('setup-err');
-    if (password !== password2) { err.textContent = '两次密码不一致'; return; }
+  document.getElementById('su-go').onclick = async () => {
     try {
-      await api('/api/setup', { method: 'POST', body: { username, password } });
+      await api('/api/setup', {
+        method: 'POST',
+        body: { username: val('su-user'), password: val('su-pass') },
+      });
       toast('初始化成功');
       await boot();
-    } catch (ex) { err.textContent = ex.message; }
+    } catch (e) {
+      toast(e.message, 'err');
+    }
   };
 }
 
 function renderLogin() {
-  const defaultUser = state.status?.defaultUsername || 'admin';
   app.innerHTML = `
     <div class="auth-screen">
       <div class="auth-card">
         <div class="logo">WG</div>
         <h1>登录</h1>
-        <p class="sub">WireGuard 配置面板</p>
-        <form id="login-form">
-          <div class="form-row">
-            <label>用户名</label>
-            <input class="field" type="text" name="username" value="${esc(defaultUser)}" required autocomplete="username" />
-          </div>
-          <div class="form-row">
-            <label>密码</label>
-            <input class="field" type="password" name="password" required placeholder="登录密码" autocomplete="current-password" />
-          </div>
-          <button class="btn btn-primary" style="width:100%;margin-top:4px" type="submit">登录</button>
-          <p class="field-hint" id="login-err" style="color:var(--danger)"></p>
-        </form>
+        <p class="muted">WireGuard 出口管理面板 v${esc(state.status?.version || '')}</p>
+        <label>用户名</label>
+        <input class="field" id="li-user" value="${esc(state.status?.defaultUsername || 'admin')}" />
+        <label>密码</label>
+        <input class="field" id="li-pass" type="password" placeholder="密码" />
+        <button class="btn btn-primary btn-block" id="li-go">登录</button>
       </div>
     </div>`;
-  document.getElementById('login-form').onsubmit = async (e) => {
-    e.preventDefault();
-    const fd = new FormData(e.target);
+  const go = async () => {
     try {
       await api('/api/login', {
         method: 'POST',
-        body: { username: fd.get('username') || 'admin', password: fd.get('password') },
+        body: { username: val('li-user'), password: val('li-pass') },
       });
       await boot();
-    } catch (ex) {
-      document.getElementById('login-err').textContent = ex.message;
+    } catch (e) {
+      toast(e.message, 'err');
     }
   };
+  document.getElementById('li-go').onclick = go;
+  document.getElementById('li-pass').onkeydown = (e) => e.key === 'Enter' && go();
 }
 
 function shell(content) {
-  const page = state.page;
   const nav = [
-    ['dashboard', '概览', '◉'],
-    ['clients', '客户端', '◎'],
-    ['server', '本机', '▣'],
-    ['nodes', '节点', '⬡'],
-    ['deploy', '部署', '➜'],
+    ['dashboard', '概览', '◈'],
+    ['server', '出口服务器', '◎'],
+    ['clients', '客户端', '◉'],
+    ['diagnose', '诊断', '✎'],
     ['settings', '设置', '⚙'],
   ];
-  const ver = state.status?.version ? `v${state.status.version}` : '';
   return `
     <div class="layout">
       <aside class="sidebar">
-        <div class="brand">
-          <div class="logo">WG</div>
-          <div>
-            <strong>WG Panel</strong>
-            <span>${esc(ver)}</span>
-          </div>
-        </div>
-        ${nav.map(([id, label, icon]) => `
-          <button class="nav-btn ${page === id ? 'active' : ''}" data-nav="${id}">
-            <span class="nav-ico">${icon}</span>
-            <span class="nav-label">${label}</span>
-            ${id === 'clients' && state.dirty ? '<span class="nav-dot" title="有未应用更改"></span>' : ''}
-          </button>`).join('')}
+        <div class="brand"><div class="logo sm">WG</div><div>
+          <div class="brand-title">WG 面板</div>
+          <div class="brand-sub">v${esc(state.status?.version || '')}</div>
+        </div></div>
+        <nav class="nav">
+          ${nav
+            .map(
+              ([id, label, ico]) => `
+            <button class="nav-btn ${state.page === id ? 'active' : ''}" data-nav="${id}">
+              <span class="nav-ico">${ico}</span>
+              <span class="nav-label">${label}</span>
+            </button>`
+            )
+            .join('')}
+        </nav>
         <div class="sidebar-footer">
-          <button class="nav-btn" id="btn-logout">
-            <span class="nav-ico">⎋</span>
-            <span class="nav-label">退出</span>
-          </button>
+          <div class="mode-pill ${isAgentMode() ? 'agent' : 'local'}">${esc(exitLabel())}</div>
+          <button class="btn btn-sm btn-ghost btn-block" id="btn-logout">退出登录</button>
         </div>
       </aside>
       <main class="main">
@@ -276,1583 +288,938 @@ function shell(content) {
 }
 
 function bindShell() {
-  document.querySelectorAll('[data-nav]').forEach((btn) => {
-    btn.onclick = () => { state.page = btn.dataset.nav; render(); };
+  bindTopAlerts();
+  document.querySelectorAll('[data-nav]').forEach((b) => {
+    b.onclick = () => {
+      state.page = b.dataset.nav;
+      render();
+    };
   });
   document.getElementById('btn-logout')?.addEventListener('click', async () => {
     await api('/api/logout', { method: 'POST' });
     await boot();
   });
-  bindTopAlerts();
-  if (state.modal) renderModal(state.modal);
 }
 
-async function loadMainData() {
-  const [serverRes, clientsRes, statusRes] = await Promise.all([
+async function refreshCore() {
+  const [status, server, clients, overview] = await Promise.all([
+    api('/api/status'),
     api('/api/server'),
     api('/api/clients'),
-    api('/api/status'),
+    api('/api/exit/overview').catch(() => null),
   ]);
-  state.server = serverRes.server;
-  state.wizardDone = serverRes.wizardDone;
-  state.clients = clientsRes.clients;
-  state.status = statusRes;
-  state.dirty = Boolean(statusRes.dirty ?? serverRes.dirty ?? clientsRes.dirty);
-  state.lastAppliedAt = statusRes.lastAppliedAt || serverRes.lastAppliedAt || null;
-  await loadNodes();
+  state.status = status;
+  state.mode = status.mode || 'local';
+  state.primaryNode = status.primaryNode || null;
+  state.primaryNodeId = status.primaryNodeId || null;
+  state.server = server.server;
+  state.wizardDone = server.wizardDone;
+  state.dirty = clients.dirty ?? status.dirty;
+  state.lastAppliedAt = status.lastAppliedAt;
+  state.clients = clients.clients || [];
+  state.exitOverview = overview;
 }
 
-function onlineCount() {
-  return state.clients.filter((c) => c.online).length;
-}
-
-function statusBadge(up) {
-  return `<span class="badge ${up ? 'ok' : 'warn'}">${up ? '运行中' : '未启动'}</span>`;
-}
-
-function clientStatusBadge(c) {
-  if (!c.enabled) return '<span class="badge muted">停用</span>';
-  if (c.online) return '<span class="badge ok">在线</span>';
-  return '<span class="badge warn">离线</span>';
-}
-
-function renderDashboard() {
+/* ========== 向导：强制选出口位置 ========== */
+function renderWizard() {
+  const step = state.wizardStep || 1;
   const s = state.server || {};
-  const st = state.status || {};
-  const iface = st.interface || {};
-  const tools = st.tools || {};
-  return `
+  app.innerHTML = shell(`
+    <div class="page-header">
+      <div>
+        <h2>新手引导</h2>
+        <p class="muted">先选对「出口在哪」，再填连接地址。面板可以和落地机分开。</p>
+      </div>
+      <button class="btn btn-ghost" id="wiz-skip">跳过</button>
+    </div>
+    <div class="wizard-steps">
+      <span class="${step === 1 ? 'on' : ''}">1 出口位置</span>
+      <span class="${step === 2 ? 'on' : ''}">2 连接地址</span>
+      <span class="${step === 3 ? 'on' : ''}">3 客户端</span>
+    </div>
+    <div class="card" id="wiz-body"></div>
+  `);
+  bindShell();
+
+  const body = document.getElementById('wiz-body');
+  if (step === 1) {
+    body.innerHTML = `
+      <h3>你的 WireGuard 出口在哪台机器上？</h3>
+      <p class="muted">手机连上后，上网 IP 就是<strong>出口机器</strong>的 IP。面板只负责管理。</p>
+      <div class="choice-grid">
+        <button class="choice-card" id="wiz-agent">
+          <strong>另一台落地机（推荐）</strong>
+          <span>面板单独部署；美国家宽 / CM / VPS 上装 Agent。适合 TK 直播、商家前置入口。</span>
+        </button>
+        <button class="choice-card" id="wiz-local">
+          <strong>就在面板这台机器</strong>
+          <span>面板和 WireGuard 同一台 VPS。简单场景用。</span>
+        </button>
+      </div>
+      <div class="field-hint" style="margin-top:12px">
+        你的场景（面板单独装、落地家宽只允许 WG）：请选 <strong>另一台落地机</strong>。
+      </div>`;
+    document.getElementById('wiz-agent').onclick = async () => {
+      try {
+        const res = await api('/api/mode', {
+          method: 'POST',
+          body: { mode: 'agent', template: 'cm', name: '落地出口' },
+        });
+        state.mode = 'agent';
+        state.primaryNode = res.primaryNode;
+        state.installCommand = res.installCommand;
+        if (res.server) state.server = res.server;
+        state.wizardStep = 2;
+        toast(res.message || '已选远程落地');
+        render();
+      } catch (e) {
+        toast(e.message, 'err');
+      }
+    };
+    document.getElementById('wiz-local').onclick = async () => {
+      try {
+        await api('/api/mode', { method: 'POST', body: { mode: 'local' } });
+        state.mode = 'local';
+        state.wizardStep = 2;
+        render();
+      } catch (e) {
+        toast(e.message, 'err');
+      }
+    };
+  } else if (step === 2) {
+    const agent = isAgentMode();
+    body.innerHTML = `
+      <h3>${agent ? '落地机连接参数' : '本机连接参数'}</h3>
+      ${
+        agent
+          ? `<div class="alert info">
+        <div>
+          <strong>在落地机（美国家宽/CM）上以 root 执行：</strong>
+          <pre class="code-block" id="wiz-cmd">${esc(
+            state.installCommand || '加载中…'
+          )}</pre>
+          <div class="btn-row" style="margin-top:8px">
+            <button class="btn btn-sm btn-primary" id="wiz-copy">复制安装命令</button>
+            <button class="btn btn-sm btn-ghost" id="wiz-refresh-cmd">刷新命令</button>
+          </div>
+          <p class="field-hint">Agent 上线后，左侧会显示「远程落地 · 在线」。</p>
+        </div>
+      </div>`
+          : ''
+      }
+      <div class="inline-fields">
+        <div>
+          <label>监听端口（UDP）${help(
+            agent
+              ? '商家可用端口例如 7900-7999，勿占 SSH。默认 7901'
+              : 'VPS 常用 51820'
+          )}</label>
+          <input class="field mono" id="w-port" value="${esc(s.listenPort || (agent ? 7901 : 51820))}" />
+        </div>
+        <div>
+          <label>客户端连接地址 Endpoint${help(
+            '手机要连的「入站」地址:端口。不是服务器出网 IP。商家前置入口请填外部连接 IP 或移动入口。'
+          )}</label>
+          <input class="field mono" id="w-ep" placeholder="${
+            agent ? '114.x.x.x:7901 或 211.x.x.x:7901' : '你的公网IP:51820'
+          }" value="${esc(s.endpoint || '')}" />
+        </div>
+      </div>
+      <p class="field-hint">
+        ${
+          agent
+            ? 'CM/前置入口：优先填「外部连接 IP:端口」，移动网不行再换「移动入口」。永远不要填探测出来的 107.x 之类出网 IP。'
+            : '普通 VPS 可点探测；有前置入口时请手填入站地址。'
+        }
+      </p>
+      ${
+        !agent
+          ? `<button class="btn btn-sm btn-ghost" id="w-detect">探测本机出网 IP（慎用）</button>`
+          : ''
+      }
+      <div class="btn-row" style="margin-top:16px">
+        <button class="btn btn-ghost" id="w-back">上一步</button>
+        <button class="btn btn-primary" id="w-next">下一步</button>
+      </div>`;
+    if (agent && !state.installCommand) {
+      api('/api/primary/install-command')
+        .then((r) => {
+          state.installCommand = r.installCommand;
+          const pre = document.getElementById('wiz-cmd');
+          if (pre) pre.textContent = r.installCommand;
+        })
+        .catch(() => {});
+    }
+    document.getElementById('wiz-copy')?.addEventListener('click', async () => {
+      try {
+        await copyText(state.installCommand || document.getElementById('wiz-cmd')?.textContent);
+        toast('已复制');
+      } catch (e) {
+        toast(e.message, 'err');
+      }
+    });
+    document.getElementById('wiz-refresh-cmd')?.addEventListener('click', async () => {
+      try {
+        const r = await api('/api/primary/install-command');
+        state.installCommand = r.installCommand;
+        document.getElementById('wiz-cmd').textContent = r.installCommand;
+        toast('已刷新');
+      } catch (e) {
+        toast(e.message, 'err');
+      }
+    });
+    document.getElementById('w-detect')?.addEventListener('click', async () => {
+      try {
+        const r = await api('/api/system/fill-endpoint', { method: 'POST', body: {} });
+        document.getElementById('w-ep').value = r.endpoint;
+        if (r.warning) toast(r.warning, 'warn');
+        else toast('已填入（请确认是入站地址）');
+      } catch (e) {
+        toast(e.message, 'err');
+      }
+    });
+    document.getElementById('w-back').onclick = () => {
+      state.wizardStep = 1;
+      render();
+    };
+    document.getElementById('w-next').onclick = async () => {
+      const port = Number(val('w-port')) || (agent ? 7901 : 51820);
+      let ep = val('w-ep');
+      if (!ep) {
+        toast('请填写 Endpoint（客户端连接地址）', 'err');
+        return;
+      }
+      if (!ep.includes(':')) ep = `${ep}:${port}`;
+      try {
+        await api('/api/server', {
+          method: 'PUT',
+          body: { listenPort: port, endpoint: ep, syncEndpointPort: true },
+        });
+        state.wizardStep = 3;
+        await refreshCore();
+        render();
+      } catch (e) {
+        toast(e.message, 'err');
+      }
+    };
+  } else {
+    body.innerHTML = `
+      <h3>添加第一个客户端</h3>
+      <p class="muted">添加后只在「客户端」页扫码。不要用别处的码。</p>
+      <label>名称</label>
+      <input class="field" id="w-name" value="手机" />
+      <div class="btn-row" style="margin-top:16px">
+        <button class="btn btn-ghost" id="w-back">上一步</button>
+        <button class="btn btn-primary" id="w-finish">创建并完成</button>
+      </div>`;
+    document.getElementById('w-back').onclick = () => {
+      state.wizardStep = 2;
+      render();
+    };
+    document.getElementById('w-finish').onclick = async () => {
+      try {
+        const c = await api('/api/clients', {
+          method: 'POST',
+          body: {
+            name: val('w-name') || '手机',
+            allowedIPs: '0.0.0.0/0, ::/0',
+            usePresharedKey: true,
+          },
+        });
+        await api('/api/server', { method: 'PUT', body: { wizardDone: true } });
+        state.wizardDone = true;
+        toast('已创建客户端，请一键落地后扫码');
+        state.page = 'clients';
+        await refreshCore();
+        render();
+        if (c.client?.id) showClientQr(c.client.id);
+      } catch (e) {
+        toast(e.message, 'err');
+      }
+    };
+  }
+
+  document.getElementById('wiz-skip').onclick = async () => {
+    await api('/api/server', { method: 'PUT', body: { wizardDone: true } });
+    state.wizardDone = true;
+    state.page = 'dashboard';
+    render();
+  };
+}
+
+/* ========== 概览 ========== */
+async function renderDashboard() {
+  await refreshCore().catch(() => {});
+  const s = state.server || {};
+  const online = state.clients.filter((c) => c.online).length;
+  const agent = isAgentMode();
+  const node = state.primaryNode;
+  app.innerHTML = shell(`
     <div class="page-header">
       <div>
         <h2>概览</h2>
-        <p>上次应用：${esc(fmtTime(state.lastAppliedAt))}</p>
+        <p class="muted">当前出口：<strong>${esc(exitLabel())}</strong></p>
       </div>
-      <div class="header-actions">
-        <button class="btn btn-ghost" id="dash-add">添加客户端</button>
+      <div class="btn-row">
+        <button class="btn btn-ghost" id="dash-diag">诊断</button>
         <button class="btn btn-primary" id="dash-exit">一键落地</button>
-        <button class="btn btn-success" id="dash-apply">应用到服务器</button>
+        <button class="btn btn-success" id="dash-apply">应用配置</button>
       </div>
     </div>
-
-    <div class="grid grid-4" style="margin-bottom:12px">
-      <div class="stat">
-        <div class="stat-label">接口</div>
-        <div class="stat-value">${statusBadge(iface.up)}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">客户端</div>
-        <div class="stat-value">${state.clients.length} <span class="sub">/ ${onlineCount()} 在线</span></div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">端口</div>
-        <div class="stat-value">UDP ${esc(s.listenPort || 51820)}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">配置</div>
-        <div class="stat-value"><span class="badge ${state.dirty ? 'warn' : 'ok'}">${state.dirty ? '待应用' : '已同步'}</span></div>
-      </div>
+    <div class="grid-4">
+      <div class="stat card"><div class="stat-label">模式</div><div class="stat-value">${
+        agent ? '远程落地' : '本机'
+      }</div></div>
+      <div class="stat card"><div class="stat-label">Endpoint</div><div class="stat-value mono small">${esc(
+        s.endpoint || '未填'
+      )}</div></div>
+      <div class="stat card"><div class="stat-label">客户端</div><div class="stat-value">${
+        state.clients.length
+      } <span class="muted small">在线 ${online}</span></div></div>
+      <div class="stat card"><div class="stat-label">${
+        agent ? 'Agent' : '接口'
+      }</div><div class="stat-value">${
+        agent ? (node?.online ? '在线' : '离线') : state.status?.interface?.up ? '运行中' : '未启动'
+      }</div></div>
     </div>
-
-    <div class="grid grid-2">
-      <div class="card">
-        <h3>服务器</h3>
-        <div class="kvs">
-          <div class="kv"><span>接口</span><span class="mono">${esc(s.interfaceName || 'wg0')}</span></div>
-          <div class="kv"><span>内网</span><span class="mono">${esc(s.address || '-')}</span></div>
-          <div class="kv"><span>Endpoint</span><span class="mono">${esc(s.endpoint || '未设置')}</span></div>
-          <div class="kv"><span>工具</span><span>
-            <span class="badge ${tools.wg ? 'ok' : 'err'}">wg</span>
-            <span class="badge ${tools.wgQuick ? 'ok' : 'err'}">wg-quick</span>
-          </span></div>
-        </div>
-        <div class="btn-row" style="margin-top:14px">
-          <button class="btn btn-sm btn-ghost" id="dash-preflight">预检</button>
-          <button class="btn btn-sm btn-ghost" data-nav-jump="server">设置</button>
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-head">
-          <h3>落地 / 网关</h3>
-          <button class="btn btn-sm btn-ghost" id="dash-exit-refresh">刷新</button>
-        </div>
-        <div id="exit-status-box" class="muted small">点击刷新查看转发、NAT、出口状态</div>
-        <div class="btn-row" style="margin-top:14px">
-          <button class="btn btn-sm btn-primary" id="dash-exit-2">一键落地</button>
-          <button class="btn btn-sm btn-ghost" id="dash-exit-status">查看详情</button>
-        </div>
-        <p class="field-hint" style="margin-top:10px">一键落地会：开转发、写 NAT、客户端改为全局代理，并应用配置</p>
-      </div>
+    <div class="card" style="margin-top:16px">
+      <h3>推荐流程（面板与落地分离）</h3>
+      <ol class="steps-ol">
+        <li>出口服务器：确认 Agent 在线、Endpoint 为<strong>落地机入站地址</strong></li>
+        <li>点 <strong>一键落地</strong>（只作用在当前出口，不会落到面板机）</li>
+        <li>客户端页添加设备 → <strong>只在这里扫码</strong></li>
+        <li>手机打开隧道 → 诊断页看握手 → 浏览器看 ifconfig.me 是否为美国家宽 IP</li>
+      </ol>
+      <p class="field-hint">面板机的出网 IP 与落地无关。一键落地/应用/二维码全部绑定「当前出口」。</p>
     </div>
-
-    <div class="card" style="margin-top:12px;padding:0;overflow:hidden">
-      <div class="card-head" style="padding:14px 16px 0">
-        <h3>客户端</h3>
-        <button class="btn btn-sm btn-ghost" data-nav-jump="clients">全部</button>
-      </div>
-      ${state.clients.length ? `
-        <div class="table-wrap" style="border:0;border-radius:0">
-          <table>
-            <thead>
-              <tr><th>名称</th><th>IP</th><th>状态</th><th>握手</th><th></th></tr>
-            </thead>
-            <tbody>
-              ${state.clients.slice(0, 6).map((c) => `
-                <tr>
-                  <td><span class="cell-name">${esc(c.name)}</span></td>
-                  <td class="mono">${esc(c.address)}</td>
-                  <td>${clientStatusBadge(c)}</td>
-                  <td class="small muted">${esc(c.latestHandshake || '-')}</td>
-                  <td><button class="btn btn-sm btn-ghost" data-qr="${c.id}">二维码</button></td>
-                </tr>`).join('')}
-            </tbody>
-          </table>
-        </div>` : `
-        <div class="empty">
-          <div class="empty-title">还没有客户端</div>
-          <p class="small muted">添加后可扫码导入手机</p>
-          <button class="btn btn-primary" style="margin-top:12px" id="dash-add-2">添加客户端</button>
-        </div>`}
-    </div>`;
-}
-
-function bindDashboard() {
-  const add = () => openClientModal();
-  document.getElementById('dash-add')?.addEventListener('click', add);
-  document.getElementById('dash-add-2')?.addEventListener('click', add);
-  document.getElementById('dash-apply')?.addEventListener('click', applyConfig);
-  document.getElementById('dash-preflight')?.addEventListener('click', showPreflight);
-  document.getElementById('dash-exit')?.addEventListener('click', () => setupExit(true));
-  document.getElementById('dash-exit-2')?.addEventListener('click', () => setupExit(true));
-  document.getElementById('dash-exit-refresh')?.addEventListener('click', () => loadExitStatusBox());
-  document.getElementById('dash-exit-status')?.addEventListener('click', showExitStatus);
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><h3>客户端</h3>
+        <button class="btn btn-sm btn-primary" id="dash-add">添加</button></div>
+      ${
+        state.clients.length
+          ? `<table><thead><tr><th>名称</th><th>IP</th><th>状态</th><th></th></tr></thead><tbody>
+        ${state.clients
+          .map(
+            (c) => `<tr>
+          <td>${esc(c.name)}</td>
+          <td class="mono">${esc(c.address)}</td>
+          <td>${c.online ? '<span class="badge ok">在线</span>' : '<span class="badge">离线</span>'}</td>
+          <td><button class="btn btn-sm btn-ghost" data-qr="${c.id}">二维码</button></td>
+        </tr>`
+          )
+          .join('')}
+      </tbody></table>`
+          : '<p class="muted">还没有客户端</p>'
+      }
+    </div>
+  `);
+  bindShell();
+  document.getElementById('dash-diag').onclick = () => {
+    state.page = 'diagnose';
+    render();
+  };
+  document.getElementById('dash-exit').onclick = () => setupExit(true);
+  document.getElementById('dash-apply').onclick = () => applyConfig(true);
+  document.getElementById('dash-add').onclick = () => openClientModal();
   document.querySelectorAll('[data-qr]').forEach((b) => {
     b.onclick = () => showClientQr(b.dataset.qr);
   });
-  loadExitStatusBox();
 }
 
-function renderClients() {
-  return `
+/* ========== 出口服务器 ========== */
+async function renderServer() {
+  await refreshCore().catch(() => {});
+  const s = state.server || {};
+  const agent = isAgentMode();
+  const node = state.primaryNode;
+  app.innerHTML = shell(`
+    <div class="page-header">
+      <div>
+        <h2>出口服务器</h2>
+        <p class="muted">这里配置的是<strong>真正跑 WireGuard 的那一台</strong>（${
+          agent ? '远程落地机' : '面板本机'
+        }）</p>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="srv-save">保存</button>
+        <button class="btn btn-success" id="srv-exit">一键落地</button>
+        <button class="btn btn-ghost" id="srv-apply">应用配置</button>
+      </div>
+    </div>
+
+    <div class="card mode-card">
+      <div class="card-head">
+        <h3>出口模式</h3>
+        <span class="badge ${agent ? 'ok' : ''}">${agent ? '远程 Agent' : '本机'}</span>
+      </div>
+      <p class="muted small">面板单独部署、美国家宽落地、商家只允许 WG：请用远程模式。</p>
+      <div class="btn-row">
+        <button class="btn btn-sm ${agent ? 'btn-primary' : 'btn-ghost'}" id="mode-agent">远程落地机</button>
+        <button class="btn btn-sm ${!agent ? 'btn-primary' : 'btn-ghost'}" id="mode-local">面板本机</button>
+      </div>
+      ${
+        agent
+          ? `<div class="agent-box">
+        <div class="kv"><span>状态</span><span>${
+          node?.online ? '<span class="badge ok">在线</span>' : '<span class="badge warn">离线</span>'
+        }</span></div>
+        <div class="kv"><span>主机</span><span class="mono">${esc(node?.hostname || '-')}</span></div>
+        <div class="kv"><span>Agent</span><span class="mono">${esc(node?.agentVersion || '-')}</span></div>
+        <div class="kv"><span>最近心跳</span><span>${esc(fmtTime(node?.lastSeenAt))}</span></div>
+        <label style="margin-top:10px">在落地机执行安装命令（root）</label>
+        <pre class="code-block" id="srv-cmd">${esc(state.installCommand || '点击下方加载…')}</pre>
+        <div class="btn-row">
+          <button class="btn btn-sm btn-primary" id="srv-copy">复制</button>
+          <button class="btn btn-sm btn-ghost" id="srv-load-cmd">加载/刷新命令</button>
+          <button class="btn btn-sm btn-ghost" id="srv-rotate">轮换 Token</button>
+        </div>
+      </div>`
+          : ''
+      }
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h3>连接参数</h3>
+      <div class="inline-fields">
+        <div>
+          <label>接口名</label>
+          <input class="field mono" id="s-iface" value="${esc(s.interfaceName || 'wg0')}" />
+        </div>
+        <div>
+          <label>监听端口 UDP</label>
+          <input class="field mono" id="s-port" value="${esc(s.listenPort || 7901)}" />
+        </div>
+        <div>
+          <label>隧道网段</label>
+          <input class="field mono" id="s-addr" value="${esc(s.address || '10.8.0.1/24')}" />
+        </div>
+        <div>
+          <label>MTU</label>
+          <input class="field mono" id="s-mtu" value="${esc(s.mtu ?? 1420)}" />
+        </div>
+      </div>
+      <label>客户端连接地址 Endpoint（入站）${help(
+        '手机连接的地址。填商家「外部连接 IP」或「移动入口」+ 端口。不是出网 IP，不是面板 IP。'
+      )}</label>
+      <input class="field mono" id="s-ep" placeholder="114.x.x.x:7901" value="${esc(s.endpoint || '')}" />
+      <p class="field-hint">
+        沪日 IX / 前置入口场景：优先 <code>外部连接IP:端口</code>，移动网再试 <code>移动入口:端口</code>。
+        可用端口段内选端口（如 7901），勿与 SSH 冲突。
+      </p>
+      <label>DNS（客户端）</label>
+      <input class="field mono" id="s-dns" value="${esc(s.dns || '1.1.1.1')}" />
+      <label class="check-row"><input type="checkbox" id="s-sync" checked /> 保存时同步 Endpoint 端口</label>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h3>NAT / 落地规则</h3>
+      <p class="field-hint">一键落地会自动写转发 + MASQUERADE。一般无需手改。</p>
+      <label>PostUp</label>
+      <textarea class="field mono" id="s-up" rows="2">${esc(s.postUp || '')}</textarea>
+      <label>PostDown</label>
+      <textarea class="field mono" id="s-down" rows="2">${esc(s.postDown || '')}</textarea>
+    </div>
+  `);
+  bindShell();
+
+  document.getElementById('mode-agent').onclick = async () => {
+    try {
+      const res = await api('/api/mode', {
+        method: 'POST',
+        body: { mode: 'agent', template: 'cm', name: '落地出口' },
+      });
+      state.installCommand = res.installCommand;
+      toast(res.message || '已切换远程');
+      render();
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  };
+  document.getElementById('mode-local').onclick = async () => {
+    if (!confirm('切换为本机出口？WireGuard 将跑在面板这台机器上。')) return;
+    try {
+      await api('/api/mode', { method: 'POST', body: { mode: 'local' } });
+      toast('已切换本机出口');
+      render();
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  };
+
+  const loadCmd = async () => {
+    try {
+      const r = await api('/api/primary/install-command');
+      state.installCommand = r.installCommand;
+      const pre = document.getElementById('srv-cmd');
+      if (pre) pre.textContent = r.installCommand;
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  };
+  document.getElementById('srv-load-cmd')?.addEventListener('click', loadCmd);
+  document.getElementById('srv-copy')?.addEventListener('click', async () => {
+    try {
+      if (!state.installCommand) await loadCmd();
+      await copyText(state.installCommand);
+      toast('已复制');
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  });
+  document.getElementById('srv-rotate')?.addEventListener('click', async () => {
+    if (!confirm('轮换 Token 后旧 Agent 会失效，需在落地机重装。继续？')) return;
+    try {
+      const r = await api('/api/primary/token', { method: 'POST', body: {} });
+      state.installCommand = r.installCommand;
+      document.getElementById('srv-cmd').textContent = r.installCommand;
+      toast('已轮换，请重新安装 Agent');
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  });
+  if (agent) loadCmd();
+
+  document.getElementById('srv-save').onclick = async () => {
+    try {
+      const port = Number(val('s-port')) || 7901;
+      let ep = val('s-ep');
+      const body = {
+        interfaceName: val('s-iface') || 'wg0',
+        listenPort: port,
+        address: val('s-addr') || '10.8.0.1/24',
+        endpoint: ep,
+        dns: val('s-dns'),
+        mtu: val('s-mtu') === '' ? null : Number(val('s-mtu')),
+        postUp: document.getElementById('s-up').value,
+        postDown: document.getElementById('s-down').value,
+        syncEndpointPort: document.getElementById('s-sync').checked,
+      };
+      const r = await api('/api/server', { method: 'PUT', body });
+      state.server = r.server;
+      state.dirty = r.dirty;
+      toast('已保存');
+      render();
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  };
+  document.getElementById('srv-exit').onclick = () => setupExit(true);
+  document.getElementById('srv-apply').onclick = () => applyConfig(true);
+}
+
+/* ========== 客户端 ========== */
+async function renderClients() {
+  await refreshCore().catch(() => {});
+  app.innerHTML = shell(`
     <div class="page-header">
       <div>
         <h2>客户端</h2>
-        <p>${state.clients.length} 个 · ${onlineCount()} 在线</p>
+        <p class="muted">全局面板<strong>只有这一处</strong>二维码。扫这里 = 连当前出口（${esc(
+          exitLabel()
+        )}）</p>
       </div>
-      <div class="header-actions">
-        <button class="btn btn-ghost" id="client-export-all">导出全部</button>
-        <button class="btn btn-primary" id="client-add">添加</button>
-        <button class="btn btn-success" id="client-apply">应用</button>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="c-add">添加客户端</button>
+        <button class="btn btn-success" id="c-apply">应用配置</button>
       </div>
     </div>
-    <div class="card" style="padding:0;overflow:hidden">
-      ${state.clients.length ? `
-        <div class="table-wrap" style="border:0;border-radius:0">
-          <table>
-            <thead>
-              <tr>
-                <th>名称</th>
-                <th>IP</th>
-                <th>状态</th>
-                <th>握手</th>
-                <th>流量</th>
-                <th>启用</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${state.clients.map((c) => `
-                <tr>
-                  <td>
-                    <span class="cell-name">${esc(c.name)}</span>
-                    ${c.note ? `<span class="cell-note">${esc(c.note)}</span>` : ''}
-                  </td>
-                  <td class="mono">${esc(c.address)}</td>
-                  <td>${clientStatusBadge(c)}</td>
-                  <td class="small muted">${esc(c.latestHandshake || '-')}</td>
-                  <td class="small muted">${esc(c.transfer || '-')}</td>
-                  <td>
-                    <label class="switch">
-                      <input type="checkbox" data-toggle="${c.id}" ${c.enabled ? 'checked' : ''} />
-                      <span></span>
-                    </label>
-                  </td>
-                  <td>
-                    <div class="ops">
-                      <button class="btn btn-sm btn-ghost" data-qr="${c.id}">二维码</button>
-                      <button class="btn btn-sm btn-ghost" data-dl="${c.id}">下载</button>
-                      <button class="btn btn-sm btn-ghost" data-edit="${c.id}">编辑</button>
-                      <button class="btn btn-sm btn-danger" data-del="${c.id}">删除</button>
-                    </div>
-                  </td>
-                </tr>`).join('')}
-            </tbody>
-          </table>
-        </div>` : `
-        <div class="empty">
-          <div class="empty-title">还没有客户端</div>
-          <p class="small muted">创建后生成二维码，用 WireGuard App 扫码导入</p>
-          <button class="btn btn-primary" style="margin-top:12px" id="client-add-2">添加客户端</button>
-        </div>`}
-    </div>`;
-}
-
-function bindClients() {
-  document.getElementById('client-add')?.addEventListener('click', () => openClientModal());
-  document.getElementById('client-add-2')?.addEventListener('click', () => openClientModal());
-  document.getElementById('client-apply')?.addEventListener('click', applyConfig);
-  document.getElementById('client-export-all')?.addEventListener('click', exportAllClients);
-  document.querySelectorAll('[data-qr]').forEach((b) => (b.onclick = () => showClientQr(b.dataset.qr)));
+    <div class="card">
+      ${
+        !state.server?.endpoint
+          ? `<div class="alert warn"><div>尚未填写 Endpoint，无法生成可用二维码。请先到「出口服务器」填写。</div>
+             <button class="btn btn-sm btn-primary" data-nav-jump="server">去填写</button></div>`
+          : ''
+      }
+      ${
+        state.clients.length
+          ? `<table>
+        <thead><tr><th>名称</th><th>地址</th><th>握手</th><th>传输</th><th></th></tr></thead>
+        <tbody>
+        ${state.clients
+          .map(
+            (c) => `<tr>
+          <td><strong>${esc(c.name)}</strong>${c.enabled === false ? ' <span class="badge">禁用</span>' : ''}</td>
+          <td class="mono">${esc(c.address)}</td>
+          <td>${
+            c.online
+              ? '<span class="badge ok">在线</span>'
+              : esc(c.latestHandshake || '无')
+          }</td>
+          <td class="mono small">${esc(c.transfer || '-')}</td>
+          <td class="btn-row">
+            <button class="btn btn-sm btn-primary" data-qr="${c.id}">二维码</button>
+            <button class="btn btn-sm btn-ghost" data-dl="${c.id}">下载</button>
+            <button class="btn btn-sm btn-ghost" data-edit="${c.id}">编辑</button>
+            <button class="btn btn-sm btn-danger" data-del="${c.id}">删除</button>
+          </td>
+        </tr>`
+          )
+          .join('')}
+        </tbody></table>`
+          : `<div class="empty">还没有客户端。<button class="btn btn-primary" id="c-add-2">添加第一个</button></div>`
+      }
+    </div>
+  `);
+  bindShell();
+  document.getElementById('c-add')?.addEventListener('click', () => openClientModal());
+  document.getElementById('c-add-2')?.addEventListener('click', () => openClientModal());
+  document.getElementById('c-apply')?.addEventListener('click', () => applyConfig(true));
+  document.querySelectorAll('[data-qr]').forEach((b) => {
+    b.onclick = () => showClientQr(b.dataset.qr);
+  });
   document.querySelectorAll('[data-dl]').forEach((b) => {
-    b.onclick = () => { window.location.href = `/api/clients/${b.dataset.dl}/config?format=download`; };
+    b.onclick = () => {
+      window.location.href = `/api/clients/${b.dataset.dl}/config?format=download`;
+    };
   });
   document.querySelectorAll('[data-edit]').forEach((b) => {
     b.onclick = () => {
       const c = state.clients.find((x) => x.id === b.dataset.edit);
-      if (c) openClientModal(c);
+      openClientModal(c);
     };
   });
   document.querySelectorAll('[data-del]').forEach((b) => {
     b.onclick = async () => {
-      const c = state.clients.find((x) => x.id === b.dataset.del);
-      if (!confirm(`删除客户端「${c?.name || ''}」？`)) return;
+      if (!confirm('删除该客户端？')) return;
       try {
         await api(`/api/clients/${b.dataset.del}`, { method: 'DELETE' });
         toast('已删除');
-        await refreshAndRender();
-      } catch (ex) { toast(ex.message, 'err'); }
-    };
-  });
-  document.querySelectorAll('[data-toggle]').forEach((inp) => {
-    inp.onchange = async () => {
-      try {
-        await api(`/api/clients/${inp.dataset.toggle}`, { method: 'PUT', body: { enabled: inp.checked } });
-        toast(inp.checked ? '已启用' : '已停用');
-        await refreshAndRender();
-      } catch (ex) {
-        toast(ex.message, 'err');
-        inp.checked = !inp.checked;
-      }
-    };
-  });
-}
-
-function renderServer() {
-  const s = state.server || {};
-  return `
-    <div class="page-header">
-      <div>
-        <h2>服务器</h2>
-        <p>接口与网络参数</p>
-      </div>
-      <div class="header-actions">
-        <button class="btn btn-ghost" id="srv-preflight">预检</button>
-        <button class="btn btn-primary" id="srv-save">保存</button>
-      </div>
-    </div>
-    <div class="grid grid-2">
-      <div class="card">
-        <h3>基本信息</h3>
-        <div class="form-row">
-          <label>接口名</label>
-          <input class="field" id="s-interfaceName" value="${esc(s.interfaceName || 'wg0')}" />
-        </div>
-        <div class="inline-fields">
-          <div class="form-row">
-            <label>监听端口 ${help('UDP，默认 51820')}</label>
-            <input class="field" type="number" id="s-listenPort" value="${esc(s.listenPort || 51820)}" />
-          </div>
-          <div class="form-row">
-            <label>MTU</label>
-            <input class="field" type="number" id="s-mtu" value="${esc(s.mtu ?? 1420)}" />
-          </div>
-        </div>
-        <div class="form-row">
-          <label>内网地址</label>
-          <input class="field mono" id="s-address" value="${esc(s.address || '10.8.0.1/24')}" />
-        </div>
-        <div class="form-row">
-          <label>Endpoint ${help('客户端连接地址：公网IP:端口')}</label>
-          <div class="field-with-btn">
-            <input class="field mono" id="s-endpoint" value="${esc(s.endpoint || '')}" placeholder="203.0.113.10:51820" />
-            <button class="btn btn-ghost" type="button" id="srv-fill-ip">探测</button>
-          </div>
-        </div>
-        <div class="form-row">
-          <label>DNS</label>
-          <input class="field mono" id="s-dns" value="${esc(s.dns || '')}" placeholder="1.1.1.1" />
-        </div>
-        <div class="form-row">
-          <label>配置路径</label>
-          <input class="field mono" id="s-confPath" value="${esc(s.confPath || '/etc/wireguard/wg0.conf')}" />
-        </div>
-        <label class="small muted" style="display:flex;align-items:center;gap:8px;font-weight:500">
-          <input type="checkbox" id="s-sync-port" checked /> 保存时同步 Endpoint 端口
-        </label>
-      </div>
-      <div class="card">
-        <h3>密钥与落地</h3>
-        <div class="form-row">
-          <label>服务器公钥</label>
-          <input class="field mono" readonly value="${esc(s.publicKey || '')}" />
-        </div>
-        <div class="btn-row" style="margin-bottom:12px">
-          <button class="btn btn-sm btn-primary" id="srv-exit">一键落地</button>
-          <button class="btn btn-sm btn-ghost" id="srv-exit-status">落地状态</button>
-          <button class="btn btn-sm btn-ghost" id="srv-nat">仅填 NAT</button>
-          <button class="btn btn-sm btn-ghost" id="srv-view-conf">预览配置</button>
-          <button class="btn btn-sm btn-ghost" id="srv-regen">重置密钥</button>
-        </div>
-        <div class="form-row">
-          <label>PostUp</label>
-          <textarea class="textarea mono" id="s-postUp">${esc(s.postUp || '')}</textarea>
-        </div>
-        <div class="form-row">
-          <label>PostDown</label>
-          <textarea class="textarea mono" id="s-postDown">${esc(s.postDown || '')}</textarea>
-          <div class="field-hint">「一键落地」= 开转发 + NAT + 客户端全局代理 + 应用。商家机器请手动确认 Endpoint，勿依赖探测。</div>
-        </div>
-      </div>
-    </div>`;
-}
-
-function bindServer() {
-  document.getElementById('srv-fill-ip').onclick = () => fillPublicIp(true);
-  document.getElementById('srv-save').onclick = async () => {
-    try {
-      const body = {
-        interfaceName: val('s-interfaceName'),
-        listenPort: Number(val('s-listenPort')) || 51820,
-        mtu: Number(val('s-mtu')) || null,
-        address: val('s-address'),
-        endpoint: val('s-endpoint'),
-        dns: val('s-dns'),
-        confPath: val('s-confPath'),
-        postUp: val('s-postUp'),
-        postDown: val('s-postDown'),
-        syncEndpointPort: document.getElementById('s-sync-port')?.checked,
-      };
-      const res = await api('/api/server', { method: 'PUT', body });
-      state.server = res.server;
-      state.dirty = Boolean(res.dirty);
-      toast('已保存');
-      render();
-    } catch (ex) { toast(ex.message, 'err'); }
-  };
-  document.getElementById('srv-nat').onclick = async () => {
-    try {
-      const res = await api('/api/server/nat-template', { method: 'POST' });
-      document.getElementById('s-postUp').value = res.postUp;
-      document.getElementById('s-postDown').value = res.postDown;
-      toast(res.tip || '已填入 NAT 模板');
-    } catch (ex) { toast(ex.message, 'err'); }
-  };
-  document.getElementById('srv-exit').onclick = () => setupExit(true);
-  document.getElementById('srv-exit-status').onclick = showExitStatus;
-  document.getElementById('srv-regen').onclick = async () => {
-    if (!confirm('重置服务器密钥后，所有客户端都需要重新导入。继续？')) return;
-    try {
-      const res = await api('/api/server', { method: 'PUT', body: { regenerateKeys: true } });
-      state.server = res.server;
-      state.dirty = true;
-      toast('密钥已更新', 'warn');
-      render();
-    } catch (ex) { toast(ex.message, 'err'); }
-  };
-  document.getElementById('srv-view-conf').onclick = showServerConfig;
-  document.getElementById('srv-preflight').onclick = showPreflight;
-}
-
-function renderNodes() {
-  const list = state.nodes || [];
-  return `
-    <div class="page-header">
-      <div>
-        <h2>节点 / Agent</h2>
-        <p>中心面板管理多台落地服务器。Agent 装在目标机上，由面板远程下发配置与落地。</p>
-      </div>
-      <div class="header-actions">
-        <button class="btn btn-ghost" id="nodes-refresh">刷新</button>
-        <button class="btn btn-primary" id="nodes-add">添加节点</button>
-      </div>
-    </div>
-    <div class="alert info">
-      <div>
-        <strong>用法</strong>：添加节点 → 复制安装命令 → 在落地服务器用 root 执行 → 节点在线后填 Endpoint/客户端 → 远程应用或一键落地。
-        本机 WG 仍在「本机」页管理。
-        <br/>有<strong>移动入口</strong>的机器：监听端口用商家范围（如 7901），Endpoint 填「外部连接 IP」或「移动入口 IP」+ 该端口，不要用探测到的出网 IP。
-      </div>
-    </div>
-    <div class="card" style="padding:0;overflow:hidden">
-      ${list.length ? `
-        <div class="table-wrap" style="border:0;border-radius:0">
-          <table>
-            <thead>
-              <tr>
-                <th>名称</th>
-                <th>状态</th>
-                <th>Endpoint</th>
-                <th>客户端</th>
-                <th>任务</th>
-                <th>上次在线</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${list.map((n) => `
-                <tr>
-                  <td>
-                    <span class="cell-name">${esc(n.name)}</span>
-                    ${n.hostname ? `<span class="cell-note">${esc(n.hostname)}</span>` : ''}
-                  </td>
-                  <td><span class="badge ${n.online ? 'ok' : 'warn'}">${n.online ? '在线' : '离线'}</span></td>
-                  <td class="mono small">${esc(n.endpoint || '-')}</td>
-                  <td>${n.clientCount || 0}</td>
-                  <td>${n.pendingJobs || 0}</td>
-                  <td class="small muted">${esc(fmtTime(n.lastSeenAt))}</td>
-                  <td>
-                    <div class="ops">
-                      <button class="btn btn-sm btn-ghost" data-node-open="${n.id}">管理</button>
-                      <button class="btn btn-sm btn-primary" data-node-exit="${n.id}">落地</button>
-                      <button class="btn btn-sm btn-success" data-node-apply="${n.id}">应用</button>
-                      <button class="btn btn-sm btn-danger" data-node-del="${n.id}">删除</button>
-                    </div>
-                  </td>
-                </tr>`).join('')}
-            </tbody>
-          </table>
-        </div>` : `
-        <div class="empty">
-          <div class="empty-title">还没有节点</div>
-          <p class="small muted">添加后生成安装命令，在商家 CM / VPS 上安装 Agent</p>
-          <button class="btn btn-primary" style="margin-top:12px" id="nodes-add-2">添加节点</button>
-        </div>`}
-    </div>`;
-}
-
-function bindNodes() {
-  const add = () => openAddNodeModal();
-  document.getElementById('nodes-add')?.addEventListener('click', add);
-  document.getElementById('nodes-add-2')?.addEventListener('click', add);
-  document.getElementById('nodes-refresh')?.addEventListener('click', async () => {
-    await loadNodes();
-    render();
-  });
-  document.querySelectorAll('[data-node-open]').forEach((b) => {
-    b.onclick = () => openNodeDetail(b.dataset.nodeOpen);
-  });
-  document.querySelectorAll('[data-node-apply]').forEach((b) => {
-    b.onclick = async () => {
-      try {
-        const res = await api(`/api/nodes/${b.dataset.nodeApply}/apply`, { method: 'POST' });
-        toast(res.message || '已下发应用任务');
-        await loadNodes();
         render();
-      } catch (ex) { toast(ex.message, 'err'); }
-    };
-  });
-  document.querySelectorAll('[data-node-exit]').forEach((b) => {
-    b.onclick = async () => {
-      if (!confirm('向该节点下发「一键落地」？\n将在目标机开启转发、NAT 并应用配置。')) return;
-      try {
-        const res = await api(`/api/nodes/${b.dataset.nodeExit}/exit`, { method: 'POST' });
-        toast(res.message || '已下发落地任务');
-        await loadNodes();
-        render();
-      } catch (ex) { toast(ex.message, 'err'); }
-    };
-  });
-  document.querySelectorAll('[data-node-del]').forEach((b) => {
-    b.onclick = async () => {
-      if (!confirm('删除该节点？目标机上的 Agent 不会自动卸载。')) return;
-      try {
-        await api(`/api/nodes/${b.dataset.nodeDel}`, { method: 'DELETE' });
-        toast('已删除');
-        await loadNodes();
-        render();
-      } catch (ex) { toast(ex.message, 'err'); }
+      } catch (e) {
+        toast(e.message, 'err');
+      }
     };
   });
 }
 
-function openAddNodeModal() {
-  state.modal = {
-    title: '添加节点',
-    body: `
-      <div class="form-row">
-        <label>名称</label>
-        <input class="field" id="n-name" placeholder="CM-落地-1" value="落地节点" />
-      </div>
-      <div class="form-row">
-        <label>备注</label>
-        <input class="field" id="n-note" placeholder="可选" />
-      </div>
-      <div class="form-row">
-        <label>面板访问地址 ${help('目标机能访问到的面板 URL，用于生成安装命令')}</label>
-        <input class="field mono" id="n-panel-url" placeholder="http://你的面板IP:51821" value="${esc(window.location.origin)}" />
-      </div>
-      <div class="actions-end">
-        <button class="btn btn-ghost" id="n-cancel">取消</button>
-        <button class="btn btn-primary" id="n-create">创建并生成安装命令</button>
-      </div>`,
-    after() {
-      document.getElementById('n-cancel').onclick = closeModal;
-      document.getElementById('n-create').onclick = async () => {
-        try {
-          const res = await api('/api/nodes', {
-            method: 'POST',
-            body: {
-              name: val('n-name'),
-              note: val('n-note'),
-              panelUrl: val('n-panel-url') || window.location.origin,
-            },
-          });
-          await loadNodes();
-          showInstallCommand(res);
-        } catch (ex) { toast(ex.message, 'err'); }
-      };
-    },
-  };
-  renderModal(state.modal);
-}
-
-function showInstallCommand(res) {
-  const cmd = res.installCommand || '';
-  const token = res.token || '';
-  state.modal = {
-    title: `安装 Agent — ${res.node?.name || ''}`,
-    body: `
-      <div class="alert ok" style="margin-bottom:12px">
-        <div>节点已创建。请在<strong>落地服务器</strong>上以 root 执行下面命令。</div>
-      </div>
-      <label class="small muted">安装命令（可点选后 Ctrl/Cmd+C）</label>
-      <textarea class="textarea mono" id="install-cmd" readonly rows="4" style="margin-top:6px">${esc(cmd)}</textarea>
-      <label class="small muted" style="display:block;margin-top:12px">Token（请妥善保存）</label>
-      <textarea class="textarea mono" id="install-token" readonly rows="2" style="margin-top:6px">${esc(token)}</textarea>
-      <div class="btn-row" style="margin-top:12px">
-        <button class="btn btn-primary" id="copy-install">复制安装命令</button>
-        <button class="btn btn-ghost" id="copy-token">复制 Token</button>
-        <button class="btn btn-ghost" id="install-done">完成</button>
-      </div>
-      <p class="field-hint" style="margin-top:12px">若按钮无效：点一下文本框 → Ctrl+A 全选 → Ctrl+C 复制。安装成功后节点变为「在线」。</p>`,
-    after() {
-      const selectAll = (id) => {
-        const box = document.getElementById(id);
-        if (!box) return;
-        box.focus();
-        box.select();
-      };
-      document.getElementById('install-cmd')?.addEventListener('focus', () => selectAll('install-cmd'));
-      document.getElementById('install-token')?.addEventListener('focus', () => selectAll('install-token'));
-      document.getElementById('copy-install').onclick = async () => {
-        try {
-          await copyText(cmd);
-          toast('安装命令已复制');
-        } catch (ex) {
-          selectAll('install-cmd');
-          toast(ex.message || '请手动复制', 'warn');
-        }
-      };
-      document.getElementById('copy-token').onclick = async () => {
-        try {
-          await copyText(token);
-          toast('Token 已复制');
-        } catch (ex) {
-          selectAll('install-token');
-          toast(ex.message || '请手动复制', 'warn');
-        }
-      };
-      document.getElementById('install-done').onclick = async () => {
-        closeModal();
-        state.page = 'nodes';
-        await loadNodes();
-        render();
-      };
-    },
-  };
-  renderModal(state.modal);
-}
-
-async function openNodeDetail(id) {
-  try {
-    const data = await api(`/api/nodes/${id}`);
-    const n = data.node;
-    const s = data.server || {};
-    const clients = data.clients || [];
-    state.modal = {
-      title: `节点 · ${n.name}`,
-      body: `
-        <div class="alert ${n.online ? 'ok' : 'warn'}" style="margin-bottom:12px">
-          <div>${n.online ? 'Agent 在线' : 'Agent 离线 — 请确认目标机服务与网络'} · ${esc(n.hostname || '')}</div>
-        </div>
-        <div class="inline-fields">
-          <div class="form-row">
-            <label>监听端口</label>
-            <input class="field" type="number" id="nd-port" value="${esc(s.listenPort || 51820)}" />
-          </div>
-          <div class="form-row">
-            <label>内网地址</label>
-            <input class="field mono" id="nd-address" value="${esc(s.address || '10.8.0.1/24')}" />
-          </div>
-        </div>
-        <div class="form-row">
-          <label>Endpoint ${help('客户端连接地址。有移动入口的机器：优先 外部连接IP:端口；移动用户可试 移动入口IP:同一端口。端口须在商家可用范围（如 7901），勿用探测出口 IP。')}</label>
-          <input class="field mono" id="nd-endpoint" value="${esc(s.endpoint || '')}" placeholder="114.111.176.37:7901 或 211.x.x.x:7901" />
-        </div>
-        <p class="field-hint">示例：外部连接 <code>114.111.176.37:7901</code>；移动入口 <code>211.136.162.184:7901</code>（端口与监听一致，SSH 7900 勿占用）</p>
-        <div class="form-row">
-          <label>DNS</label>
-          <input class="field mono" id="nd-dns" value="${esc(s.dns || '1.1.1.1')}" />
-        </div>
-        <div class="btn-row" style="margin-bottom:12px">
-          <button class="btn btn-sm btn-primary" id="nd-save">保存配置</button>
-          <button class="btn btn-sm btn-success" id="nd-apply">远程应用</button>
-          <button class="btn btn-sm btn-primary" id="nd-exit">远程落地</button>
-          <button class="btn btn-sm btn-ghost" id="nd-token">轮换 Token / 安装命令</button>
-        </div>
-        <h3 style="margin:8px 0;font-size:14px">客户端 (${clients.length})</h3>
-        <div class="btn-row" style="margin-bottom:8px">
-          <button class="btn btn-sm btn-ghost" id="nd-add-client">添加客户端</button>
-        </div>
-        ${clients.length ? `
-          <div class="table-wrap"><table style="min-width:0">
-            <thead><tr><th>名称</th><th>IP</th><th>状态</th><th></th></tr></thead>
-            <tbody>
-              ${clients.map((c) => `
-                <tr>
-                  <td>${esc(c.name)}</td>
-                  <td class="mono small">${esc(c.address)}</td>
-                  <td><span class="badge ${c.online ? 'ok' : 'muted'}">${c.online ? '在线' : '-'}</span></td>
-                  <td class="ops">
-                    <button class="btn btn-sm btn-ghost" data-nd-qr="${c.id}">二维码</button>
-                    <button class="btn btn-sm btn-danger" data-nd-cdel="${c.id}">删</button>
-                  </td>
-                </tr>`).join('')}
-            </tbody>
-          </table></div>` : '<p class="muted small">暂无客户端</p>'}
-        <div class="actions-end">
-          <button class="btn btn-ghost" id="nd-close">关闭</button>
-        </div>`,
-      after() {
-        document.getElementById('nd-close').onclick = closeModal;
-        document.getElementById('nd-save').onclick = async () => {
-          try {
-            await api(`/api/nodes/${id}`, {
-              method: 'PUT',
-              body: {
-                server: {
-                  listenPort: Number(val('nd-port')) || 51820,
-                  address: val('nd-address'),
-                  endpoint: val('nd-endpoint'),
-                  dns: val('nd-dns'),
-                  syncEndpointPort: true,
-                },
-              },
-            });
-            // sync endpoint port
-            const port = Number(val('nd-port')) || 51820;
-            let ep = val('nd-endpoint');
-            if (ep && ep.includes(':')) {
-              const host = ep.split(':')[0];
-              ep = `${host}:${port}`;
-              await api(`/api/nodes/${id}`, { method: 'PUT', body: { server: { endpoint: ep, listenPort: port } } });
-            }
-            toast('已保存');
-            openNodeDetail(id);
-          } catch (ex) { toast(ex.message, 'err'); }
-        };
-        document.getElementById('nd-apply').onclick = async () => {
-          try {
-            const res = await api(`/api/nodes/${id}/apply`, { method: 'POST' });
-            toast(res.message || '已下发');
-          } catch (ex) { toast(ex.message, 'err'); }
-        };
-        document.getElementById('nd-exit').onclick = async () => {
-          if (!confirm('远程一键落地到该节点？')) return;
-          try {
-            const res = await api(`/api/nodes/${id}/exit`, { method: 'POST' });
-            toast(res.message || '已下发落地');
-          } catch (ex) { toast(ex.message, 'err'); }
-        };
-        document.getElementById('nd-token').onclick = async () => {
-          try {
-            const res = await api(`/api/nodes/${id}/token`, {
-              method: 'POST',
-              body: { panelUrl: window.location.origin },
-            });
-            showInstallCommand({ ...res, node: n, installCommand: res.installCommand, token: res.token });
-          } catch (ex) { toast(ex.message, 'err'); }
-        };
-        document.getElementById('nd-add-client').onclick = async () => {
-          const name = prompt('客户端名称', '手机');
-          if (!name) return;
-          try {
-            await api(`/api/nodes/${id}/clients`, {
-              method: 'POST',
-              body: { name, allowedIPs: '0.0.0.0/0, ::/0', usePresharedKey: true },
-            });
-            toast('已添加');
-            openNodeDetail(id);
-          } catch (ex) { toast(ex.message, 'err'); }
-        };
-        document.querySelectorAll('[data-nd-qr]').forEach((b) => {
-          b.onclick = async () => {
-            try {
-              const data = await api(`/api/nodes/${id}/clients/${b.dataset.ndQr}/config?format=qr`);
-              state.modal = {
-                title: data.name,
-                body: `
-                  <div class="qr-wrap"><img src="${data.qr}" alt="QR" />
-                  <p class="muted small">请确认 Endpoint 已指向该节点</p></div>
-                  <pre class="pre-box">${esc(data.config)}</pre>
-                  <div class="actions-end"><button class="btn btn-ghost" id="qr-back">返回</button></div>`,
-                after() {
-                  document.getElementById('qr-back').onclick = () => openNodeDetail(id);
-                },
-              };
-              renderModal(state.modal);
-            } catch (ex) { toast(ex.message, 'err'); }
-          };
-        });
-        document.querySelectorAll('[data-nd-cdel]').forEach((b) => {
-          b.onclick = async () => {
-            if (!confirm('删除该客户端？')) return;
-            try {
-              await api(`/api/nodes/${id}/clients/${b.dataset.ndCdel}`, { method: 'DELETE' });
-              openNodeDetail(id);
-            } catch (ex) { toast(ex.message, 'err'); }
-          };
-        });
-      },
-    };
-    renderModal(state.modal);
-  } catch (ex) {
-    toast(ex.message, 'err');
-  }
-}
-
-async function loadNodes() {
-  try {
-    const res = await api('/api/nodes');
-    state.nodes = res.nodes || [];
-  } catch {
-    state.nodes = state.nodes || [];
-  }
-}
-
-function renderDeploy() {
-  const s = state.server || {};
-  const port = s.listenPort || 51820;
-  const iface = s.interfaceName || 'wg0';
-  return `
-    <div class="page-header">
-      <div>
-        <h2>部署</h2>
-        <p>常用命令与检查</p>
-      </div>
-      <div class="header-actions">
-        <button class="btn btn-ghost" id="dep-preflight">预检</button>
-        <button class="btn btn-success" id="dep-apply">应用</button>
-      </div>
-    </div>
-    <div class="grid">
-      <div class="card guide">
-        <h3>远程节点（Agent）</h3>
-        <p class="muted small">在落地服务器执行面板「节点」页生成的安装命令：</p>
-        <pre class="pre-box">curl -fsSL "http://面板IP:51821/install-agent.sh" | sudo env \\
-  WG_PANEL_URL="http://面板IP:51821" \\
-  WG_AGENT_TOKEN="节点token" \\
-  bash</pre>
-        <button class="btn btn-sm btn-primary" data-nav-jump="nodes" style="margin-top:8px">打开节点页</button>
-      </div>
-      <div class="card guide">
-        <h3>更新面板</h3>
-        <pre class="pre-box">cd ~/wg && git pull && sudo bash install.sh</pre>
-      </div>
-      <div class="card guide">
-        <h3>防火墙</h3>
-        <pre class="pre-box">sudo ufw allow ${port}/udp
-sudo ufw allow 51821/tcp
-sudo ufw reload</pre>
-      </div>
-      <div class="card guide">
-        <h3>手动启动接口</h3>
-        <pre class="pre-box">sudo wg-quick up ${iface}
-sudo systemctl enable wg-quick@${iface}
-sudo wg show</pre>
-      </div>
-      <div class="card guide">
-        <h3>建议流程</h3>
-        <ol>
-          <li>填好 Endpoint 与 NAT</li>
-          <li>添加客户端并扫码</li>
-          <li>预检 → 应用到服务器</li>
-        </ol>
-        <div class="btn-row" style="margin-top:12px">
-          <button class="btn btn-sm btn-ghost" id="dep-dl">下载服务端配置</button>
-        </div>
-      </div>
-    </div>`;
-}
-
-function bindDeploy() {
-  document.getElementById('dep-dl').onclick = () => {
-    window.location.href = '/api/server/config?format=download';
-  };
-  document.getElementById('dep-apply').onclick = applyConfig;
-  document.getElementById('dep-preflight').onclick = showPreflight;
-}
-
-function renderSettings() {
-  return `
-    <div class="page-header">
-      <div>
-        <h2>设置</h2>
-        <p>账号、备份与外观</p>
-      </div>
-    </div>
-    <div class="grid grid-2">
-      <div class="card">
-        <h3>登录账号</h3>
-        ${state.status?.forcePasswordChange ? '<div class="alert warn" style="margin-bottom:12px"><div>建议尽快修改初始密码</div></div>' : ''}
-        <div class="form-row">
-          <label>用户名</label>
-          <input class="field" id="pw-user" value="${esc(state.status?.username || 'admin')}" />
-        </div>
-        <div class="form-row">
-          <label>当前密码</label>
-          <input class="field" type="password" id="pw-old" />
-        </div>
-        <div class="form-row">
-          <label>新密码</label>
-          <input class="field" type="password" id="pw-new" minlength="6" />
-        </div>
-        <button class="btn btn-primary" id="pw-save">更新</button>
-      </div>
-      <div class="card">
-        <h3>备份</h3>
-        <p class="muted small" style="margin-top:0">导出含密钥，请妥善保管。</p>
-        <div class="btn-row">
-          <button class="btn btn-ghost" id="exp-btn">导出 JSON</button>
-          <label class="btn btn-ghost" style="cursor:pointer">
-            导入
-            <input type="file" id="imp-file" accept="application/json,.json" hidden />
-          </label>
-          <button class="btn btn-ghost" id="bak-list">备份列表</button>
-        </div>
-      </div>
-      <div class="card">
-        <h3>主题</h3>
-        <div class="btn-row">
-          <button class="btn btn-ghost" data-theme-set="auto">跟随系统</button>
-          <button class="btn btn-ghost" data-theme-set="dark">深色</button>
-          <button class="btn btn-ghost" data-theme-set="light">浅色</button>
-        </div>
-      </div>
-      <div class="card">
-        <h3>关于</h3>
-        <p class="muted small" style="margin:0">WG Panel ${esc(state.status?.version ? 'v' + state.status.version : '')}</p>
-        <p class="muted small"><a href="https://github.com/cheesydui-cloud/wg" target="_blank" rel="noreferrer">GitHub</a></p>
-      </div>
-    </div>`;
-}
-
-function bindSettings() {
-  document.getElementById('pw-save').onclick = async () => {
-    try {
-      const res = await api('/api/password', {
-        method: 'POST',
-        body: {
-          currentPassword: val('pw-old'),
-          newPassword: val('pw-new'),
-          newUsername: val('pw-user') || 'admin',
-        },
-      });
-      toast(res.message || '已更新');
-      document.getElementById('pw-old').value = '';
-      document.getElementById('pw-new').value = '';
-      if (state.status) {
-        state.status.username = res.username || val('pw-user') || 'admin';
-        state.status.forcePasswordChange = false;
-      }
-      render();
-    } catch (ex) { toast(ex.message, 'err'); }
-  };
-  document.getElementById('exp-btn').onclick = () => { window.location.href = '/api/export'; };
-  document.getElementById('bak-list').onclick = showBackups;
-  document.getElementById('imp-file').onchange = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!confirm('导入将覆盖当前配置，继续？')) return;
-    try {
-      const json = JSON.parse(await file.text());
-      const res = await api('/api/import', { method: 'POST', body: json });
-      toast(res.message || '导入成功');
-      await refreshAndRender();
-    } catch (ex) { toast(ex.message || '导入失败', 'err'); }
-  };
-  document.querySelectorAll('[data-theme-set]').forEach((b) => {
-    b.onclick = () => {
-      const t = b.dataset.themeSet;
-      if (t === 'auto') document.documentElement.removeAttribute('data-theme');
-      else document.documentElement.setAttribute('data-theme', t);
-      localStorage.setItem('wg-theme', t);
-      toast('主题已切换');
-    };
-  });
-}
-
-function renderWizard() {
-  const step = state.wizardStep;
-  const s = state.server || {};
-  return shell(`
-    <div class="page-header">
-      <div>
-        <h2>新手引导</h2>
-        <p>4 步完成基础配置</p>
-      </div>
-    </div>
-    <div class="steps">
-      ${[1, 2, 3, 4].map((n) => `
-        <span class="step-pill ${step === n ? 'active' : ''} ${step > n ? 'done' : ''}">
-          ${n}. ${['公网', '密钥', '网段', '客户端'][n - 1]}
-        </span>`).join('')}
-    </div>
-    <div class="card" style="max-width:520px">
-      ${step === 1 ? `
-        <h3>公网地址</h3>
-        <div class="form-row">
-          <label>IP 或域名</label>
-          <div class="field-with-btn">
-            <input class="field mono" id="w-host" placeholder="203.0.113.10" value="${esc((s.endpoint || '').split(':')[0] || '')}" />
-            <button class="btn btn-ghost" type="button" id="w-detect-ip">探测</button>
-          </div>
-        </div>
-        <div class="form-row">
-          <label>端口</label>
-          <input class="field" type="number" id="w-port" value="${esc(s.listenPort || 51820)}" />
-        </div>` : ''}
-      ${step === 2 ? `
-        <h3>服务器密钥</h3>
-        <div class="form-row">
-          <label>公钥</label>
-          <input class="field mono" readonly value="${esc(s.publicKey || '保存后生成')}" />
-        </div>
-        <p class="muted small">密钥仅保存在服务器 data 目录</p>` : ''}
-      ${step === 3 ? `
-        <h3>内网网段</h3>
-        <div class="form-row">
-          <label>服务器地址</label>
-          <input class="field mono" id="w-address" value="${esc(s.address || '10.8.0.1/24')}" />
-        </div>
-        <div class="form-row">
-          <label>DNS</label>
-          <input class="field mono" id="w-dns" value="${esc(s.dns || '1.1.1.1')}" />
-        </div>
-        <label class="small" style="display:flex;align-items:center;gap:10px;font-weight:500">
-          <label class="switch"><input type="checkbox" id="w-nat" checked /><span></span></label>
-          启用 NAT
-        </label>` : ''}
-      ${step === 4 ? `
-        <h3>第一个客户端</h3>
-        <div class="form-row">
-          <label>名称</label>
-          <input class="field" id="w-cname" value="我的手机" />
-        </div>
-        <div class="form-row">
-          <label>流量模式</label>
-          <select class="select" id="w-allowed">
-            <option value="0.0.0.0/0, ::/0">全局代理</option>
-            <option value="NET_ONLY">仅内网</option>
-          </select>
-        </div>` : ''}
-      <div class="actions-end">
-        ${step > 1 ? '<button class="btn btn-ghost" id="w-prev">上一步</button>' : ''}
-        ${step < 4
-          ? '<button class="btn btn-primary" id="w-next">下一步</button>'
-          : '<button class="btn btn-success" id="w-finish">完成</button>'}
-        <button class="btn btn-ghost" id="w-skip">跳过</button>
-      </div>
-    </div>`);
-}
-
-function bindWizard() {
-  bindShell();
-  document.getElementById('w-detect-ip')?.addEventListener('click', async () => {
-    try {
-      const res = await api('/api/system/public-ip');
-      if (res.ip) {
-        document.getElementById('w-host').value = res.ip;
-        toast('已填入 ' + res.ip);
-      }
-    } catch (ex) { toast(ex.message, 'err'); }
-  });
-  document.getElementById('w-prev')?.addEventListener('click', () => {
-    state.wizardStep = Math.max(1, state.wizardStep - 1);
-    render();
-  });
-  document.getElementById('w-skip')?.addEventListener('click', async () => {
-    await api('/api/server', { method: 'PUT', body: { wizardDone: true } });
-    state.wizardDone = true;
-    state._skipWizardOnce = true;
-    state.page = 'dashboard';
-    await refreshAndRender();
-  });
-  document.getElementById('w-next')?.addEventListener('click', async () => {
-    try {
-      if (state.wizardStep === 1) {
-        const host = val('w-host');
-        const port = Number(val('w-port')) || 51820;
-        if (!host) return toast('请填写公网 IP 或域名', 'warn');
-        const res = await api('/api/server', {
-          method: 'PUT',
-          body: { endpoint: `${host}:${port}`, listenPort: port },
-        });
-        state.server = res.server;
-      }
-      if (state.wizardStep === 2) {
-        const res = await api('/api/server', { method: 'PUT', body: {} });
-        state.server = res.server;
-      }
-      if (state.wizardStep === 3) {
-        const address = val('w-address') || '10.8.0.1/24';
-        const dns = val('w-dns') || '1.1.1.1';
-        let res = await api('/api/server', { method: 'PUT', body: { address, dns } });
-        if (document.getElementById('w-nat')?.checked) {
-          const nat = await api('/api/server/nat-template', { method: 'POST' });
-          res = await api('/api/server', {
-            method: 'PUT',
-            body: { postUp: nat.postUp, postDown: nat.postDown },
-          });
-        }
-        state.server = res.server;
-      }
-      state.wizardStep += 1;
-      render();
-    } catch (ex) { toast(ex.message, 'err'); }
-  });
-  document.getElementById('w-finish')?.addEventListener('click', async () => {
-    try {
-      const name = val('w-cname') || '我的手机';
-      let allowedIPs = document.getElementById('w-allowed')?.value || '0.0.0.0/0, ::/0';
-      if (allowedIPs === 'NET_ONLY') {
-        allowedIPs = networkFromAddress(state.server?.address || '10.8.0.1/24');
-      }
-      const created = await api('/api/clients', {
-        method: 'POST',
-        body: { name, allowedIPs, usePresharedKey: true },
-      });
-      await api('/api/server', { method: 'PUT', body: { wizardDone: true } });
-      state.wizardDone = true;
-      state._skipWizardOnce = true;
-      state.page = 'clients';
-      await refreshAndRender();
-      toast('已创建客户端');
-      if (created.client?.id) showClientQr(created.client.id);
-    } catch (ex) { toast(ex.message, 'err'); }
-  });
-}
-
-function openClientModal(client = null) {
+function openClientModal(client) {
   const isEdit = Boolean(client);
-  const net = networkFromAddress(state.server?.address || '10.8.0.1/24');
-  state.modal = {
-    title: isEdit ? `编辑 ${client.name}` : '添加客户端',
+  openModal({
+    title: isEdit ? '编辑客户端' : '添加客户端',
     body: `
-      <div class="form-row">
-        <label>名称</label>
-        <input class="field" id="c-name" value="${esc(client?.name || '')}" placeholder="我的手机" />
-      </div>
-      <div class="form-row">
-        <label>内网 IP ${help('留空自动分配')}</label>
-        <input class="field mono" id="c-address" value="${esc(client?.address || '')}" placeholder="自动分配" />
-      </div>
-      <div class="form-row">
-        <label>AllowedIPs</label>
-        <select class="select" id="c-allowed-preset">
-          <option value="0.0.0.0/0, ::/0">全局代理</option>
-          <option value="${esc(net)}">仅内网 ${esc(net)}</option>
-          <option value="custom">自定义</option>
-        </select>
-      </div>
-      <div class="form-row" id="c-allowed-wrap" style="display:none">
-        <label>自定义</label>
-        <input class="field mono" id="c-allowed" value="${esc(client?.allowedIPs || '')}" />
-      </div>
-      <div class="inline-fields">
-        <div class="form-row">
-          <label>Keepalive</label>
-          <input class="field" type="number" id="c-ka" value="${esc(client?.persistentKeepalive ?? 25)}" />
-        </div>
-        <div class="form-row">
-          <label>备注</label>
-          <input class="field" id="c-note" value="${esc(client?.note || '')}" />
-        </div>
-      </div>
-      ${isEdit ? `
-        <div class="btn-row" style="margin-bottom:8px">
-          <button class="btn btn-sm btn-ghost" id="c-regen">重置密钥</button>
-          <button class="btn btn-sm btn-ghost" id="c-psk">重置 PSK</button>
-        </div>` : `
-        <label class="small" style="display:flex;align-items:center;gap:10px;font-weight:500;margin-bottom:8px">
-          <label class="switch"><input type="checkbox" id="c-psk-on" checked /><span></span></label>
-          使用 PSK
-        </label>`}
-      <div class="actions-end">
-        <button class="btn btn-ghost" id="c-cancel">取消</button>
-        <button class="btn btn-primary" id="c-save">${isEdit ? '保存' : '创建'}</button>
-      </div>`,
-    after() {
-      const preset = document.getElementById('c-allowed-preset');
-      const wrap = document.getElementById('c-allowed-wrap');
-      const allowed = document.getElementById('c-allowed');
-      const applyPreset = () => {
-        if (preset.value === 'custom') wrap.style.display = '';
-        else {
-          wrap.style.display = 'none';
-          allowed.value = preset.value;
-        }
-      };
-      if (client?.allowedIPs) {
-        if (client.allowedIPs === '0.0.0.0/0, ::/0' || client.allowedIPs === '0.0.0.0/0') {
-          preset.value = '0.0.0.0/0, ::/0';
-        } else if (client.allowedIPs === net) {
-          preset.value = net;
-        } else {
-          preset.value = 'custom';
-          allowed.value = client.allowedIPs;
-        }
+      <label>名称</label>
+      <input class="field" id="c-name" value="${esc(client?.name || '')}" placeholder="手机" />
+      <label>内网 IP（可留空自动分配）</label>
+      <input class="field mono" id="c-addr" value="${esc(client?.address || '')}" />
+      <label>AllowedIPs</label>
+      <select class="field" id="c-preset">
+        <option value="0.0.0.0/0, ::/0">全局代理（上网走落地 IP）</option>
+        <option value="custom">自定义</option>
+      </select>
+      <input class="field mono" id="c-allowed" value="${esc(
+        client?.allowedIPs || '0.0.0.0/0, ::/0'
+      )}" style="margin-top:8px" />
+      <label>备注</label>
+      <input class="field" id="c-note" value="${esc(client?.note || '')}" />
+    `,
+    actions: `
+      <button class="btn btn-ghost" data-close>取消</button>
+      <button class="btn btn-primary" id="c-save">${isEdit ? '保存' : '创建'}</button>
+    `,
+  });
+  document.getElementById('c-save').onclick = async () => {
+    const body = {
+      name: val('c-name') || '客户端',
+      address: val('c-addr'),
+      allowedIPs: val('c-allowed') || '0.0.0.0/0, ::/0',
+      note: val('c-note'),
+      usePresharedKey: true,
+    };
+    try {
+      if (isEdit) {
+        await api(`/api/clients/${client.id}`, { method: 'PUT', body });
+        toast('已保存');
+        closeModal();
+        render();
+      } else {
+        const r = await api('/api/clients', { method: 'POST', body });
+        toast('已创建');
+        closeModal();
+        await refreshCore();
+        state.page = 'clients';
+        render();
+        if (r.client?.id) showClientQr(r.client.id);
       }
-      applyPreset();
-      preset.onchange = applyPreset;
-      document.getElementById('c-cancel').onclick = closeModal;
-      document.getElementById('c-save').onclick = async () => {
-        const name = val('c-name') || (isEdit ? client.name : '客户端');
-        const allowedIPs = preset.value === 'custom' ? val('c-allowed') : preset.value;
-        const body = {
-          name,
-          address: val('c-address'),
-          allowedIPs,
-          persistentKeepalive: Number(val('c-ka')) || 0,
-          note: val('c-note'),
-        };
-        try {
-          if (isEdit) {
-            await api(`/api/clients/${client.id}`, { method: 'PUT', body });
-            toast('已保存');
-            closeModal();
-            await refreshAndRender();
-          } else {
-            body.usePresharedKey = document.getElementById('c-psk-on')?.checked !== false;
-            const res = await api('/api/clients', { method: 'POST', body });
-            toast('已创建');
-            closeModal();
-            await refreshAndRender();
-            if (res.client?.id) showClientQr(res.client.id);
-          }
-        } catch (ex) { toast(ex.message, 'err'); }
-      };
-      document.getElementById('c-regen')?.addEventListener('click', async () => {
-        if (!confirm('重置密钥后需重新导入配置，继续？')) return;
-        await api(`/api/clients/${client.id}`, { method: 'PUT', body: { regenerateKeys: true } });
-        toast('密钥已更新', 'warn');
-        await refreshAndRender();
-        openClientModal(state.clients.find((x) => x.id === client.id));
-      });
-      document.getElementById('c-psk')?.addEventListener('click', async () => {
-        await api(`/api/clients/${client.id}`, { method: 'PUT', body: { regeneratePsk: true } });
-        toast('PSK 已更新', 'warn');
-      });
-    },
+    } catch (e) {
+      toast(e.message, 'err');
+    }
   };
-  renderModal(state.modal);
-}
-
-function closeModal() {
-  state.modal = null;
-  const root = document.getElementById('modal-root');
-  if (root) root.innerHTML = '';
-}
-
-function renderModal(modal) {
-  const root = document.getElementById('modal-root');
-  if (!root || !modal) return;
-  root.innerHTML = `
-    <div class="modal-backdrop" id="modal-bg">
-      <div class="modal">
-        <div class="modal-header">
-          <h3>${esc(modal.title)}</h3>
-          <button class="btn btn-sm btn-ghost" id="modal-x">关闭</button>
-        </div>
-        ${modal.body}
-      </div>
-    </div>`;
-  document.getElementById('modal-x').onclick = closeModal;
-  document.getElementById('modal-bg').onclick = (e) => {
-    if (e.target.id === 'modal-bg') closeModal();
-  };
-  modal.after?.();
 }
 
 async function showClientQr(id) {
   try {
     const data = await api(`/api/clients/${id}/config?format=qr`);
-    state.modal = {
-      title: data.name,
+    openModal({
+      title: `客户端 · ${data.name || ''}`,
       body: `
-        <div class="qr-wrap">
-          <img src="${data.qr}" alt="QR" />
-          <p class="muted small">WireGuard App 扫码添加</p>
-        </div>
-        <div class="btn-row" style="justify-content:center">
+        <div class="qr-wrap"><img src="${data.qr}" alt="qr" /></div>
+        <p class="muted center">WireGuard 官方 App 扫码 · Endpoint: <code>${esc(
+          data.endpoint || state.server?.endpoint || ''
+        )}</code></p>
+        <p class="field-hint center">${esc(
+          data.tip || '打开隧道后到「诊断」查看是否握手；ifconfig.me 应显示落地机出口 IP'
+        )}</p>
+        <div class="btn-row center">
           <button class="btn btn-ghost" id="qr-copy">复制配置</button>
           <a class="btn btn-primary" href="/api/clients/${id}/config?format=download">下载</a>
         </div>
-        <pre class="pre-box" style="margin-top:12px">${esc(data.config)}</pre>`,
-      after() {
-        document.getElementById('qr-copy').onclick = async () => {
-          try {
-            await copyText(data.config);
-            toast('已复制');
-          } catch (ex) {
-            toast(ex.message || '请手动复制', 'warn');
-          }
-        };
-      },
-    };
-    renderModal(state.modal);
-  } catch (ex) { toast(ex.message, 'err'); }
-}
-
-async function showServerConfig() {
-  try {
-    const data = await api('/api/server/config');
-    state.modal = {
-      title: '服务端配置',
-      body: `
-        <p class="muted small" style="margin-top:0">${esc(data.path || '')}</p>
-        <pre class="pre-box">${esc(data.config)}</pre>
-        <div class="btn-row">
-          <button class="btn btn-ghost" id="sc-copy">复制</button>
-          <a class="btn btn-primary" href="/api/server/config?format=download">下载</a>
-        </div>`,
-      after() {
-        document.getElementById('sc-copy').onclick = async () => {
-          try {
-            await copyText(data.config);
-            toast('已复制');
-          } catch (ex) {
-            toast(ex.message || '请手动复制', 'warn');
-          }
-        };
-      },
-    };
-    renderModal(state.modal);
-  } catch (ex) { toast(ex.message, 'err'); }
-}
-
-async function showPreflight() {
-  try {
-    const pf = await api('/api/preflight');
-    state.preflight = pf;
-    state.modal = {
-      title: '应用预检',
-      body: `
-        <div class="alert ${pf.canApply ? 'ok' : 'warn'}" style="margin-bottom:12px">
-          <div>${pf.canApply ? '可以应用到服务器' : '存在需要处理的问题'}</div>
-        </div>
-        <div class="table-wrap">
-          <table style="min-width:0">
-            <thead><tr><th>项目</th><th>结果</th><th>说明</th></tr></thead>
-            <tbody>
-              ${(pf.checks || []).map((c) => `
-                <tr>
-                  <td>${esc(c.title)}</td>
-                  <td><span class="badge ${c.ok ? 'ok' : c.warn ? 'warn' : 'err'}">${c.ok ? '通过' : c.warn ? '警告' : '失败'}</span></td>
-                  <td class="small muted">${esc(c.detail)}</td>
-                </tr>`).join('')}
-            </tbody>
-          </table>
-        </div>
-        <div class="actions-end">
-          <button class="btn btn-ghost" id="pf-close">关闭</button>
-          <button class="btn btn-success" id="pf-apply" ${pf.canApply ? '' : 'disabled'}>应用</button>
-        </div>`,
-      after() {
-        document.getElementById('pf-close').onclick = closeModal;
-        document.getElementById('pf-apply').onclick = () => {
-          closeModal();
-          applyConfig(true);
-        };
-      },
-    };
-    renderModal(state.modal);
-  } catch (ex) { toast(ex.message, 'err'); }
-}
-
-async function showBackups() {
-  try {
-    const data = await api('/api/backups');
-    const list = data.backups || [];
-    state.modal = {
-      title: '配置备份',
-      body: list.length
-        ? `<div class="table-wrap"><table style="min-width:0">
-            <thead><tr><th>文件</th><th>时间</th></tr></thead>
-            <tbody>${list.map((b) => `
-              <tr>
-                <td class="mono small">${esc(b.name)}</td>
-                <td class="small muted">${esc(fmtTime(b.mtime))}</td>
-              </tr>`).join('')}</tbody>
-          </table></div>
-          <p class="muted small">应用配置前会自动备份到 data/backups</p>`
-        : '<div class="empty"><div class="empty-title">暂无备份</div></div>',
-    };
-    renderModal(state.modal);
-  } catch (ex) { toast(ex.message, 'err'); }
-}
-
-async function fillPublicIp(intoServerField = false) {
-  try {
-    toast('正在探测…', 'warn');
-    const res = await api('/api/system/fill-endpoint', { method: 'POST', body: {} });
-    if (intoServerField && document.getElementById('s-endpoint')) {
-      document.getElementById('s-endpoint').value = res.endpoint;
+        <pre class="code-block" style="margin-top:12px;max-height:200px;overflow:auto">${esc(
+          data.config
+        )}</pre>
+      `,
+      actions: `<button class="btn btn-primary" data-close>关闭</button>`,
+    });
+    document.getElementById('qr-copy')?.addEventListener('click', async () => {
+      try {
+        await copyText(data.config);
+        toast('已复制');
+      } catch (e) {
+        toast(e.message, 'err');
+      }
+    });
+  } catch (e) {
+    toast(e.data?.error || e.message, 'err');
+    if (e.data?.code === 'NO_ENDPOINT') {
+      state.page = 'server';
+      render();
     }
-    state.server = res.server || state.server;
-    state.dirty = Boolean(res.dirty);
-    toast('Endpoint：' + res.endpoint + '（有入口前置的机器请人工核对）', 'warn');
-    if (!intoServerField) render();
-  } catch (ex) {
-    toast(ex.message || '探测失败', 'err');
   }
 }
 
-function exitStatusHtml(st) {
-  if (!st) return '<span class="muted">暂无数据</span>';
-  const row = (label, ok, text) =>
-    `<div class="kv"><span>${label}</span><span><span class="badge ${ok ? 'ok' : 'warn'}">${ok ? '正常' : '待处理'}</span> ${esc(text || '')}</span></div>`;
-  return `
-    <div class="alert ${st.ready ? 'ok' : 'warn'}" style="margin-bottom:12px">
-      <div><strong>${st.ready ? '落地条件已就绪' : '落地尚未完全就绪'}</strong>
-      ${st.exitPublicIp ? ` · 出口 IP ${esc(st.exitPublicIp)}` : ''}</div>
+/* ========== 诊断 ========== */
+async function renderDiagnose() {
+  app.innerHTML = shell(`
+    <div class="page-header">
+      <div>
+        <h2>诊断</h2>
+        <p class="muted">检查为何连不上 / 只有发送没有接收 / 握手了上不了网</p>
+      </div>
+      <button class="btn btn-primary" id="d-refresh">重新诊断</button>
     </div>
-    <div class="kvs">
-      ${row('IPv4 转发', st.forward === true, st.forward === true ? '已开启' : st.forward === false ? '未开启' : '无法检测')}
-      ${row('NAT 配置', st.natConfigured, st.natConfigured ? `PostUp 已含 MASQUERADE` : '未配置')}
-      ${row('NAT 生效', st.natActive, st.natDetail || '')}
-      ${row('接口', st.interfaceUp, st.interfaceName || 'wg0')}
-      ${row('出口网卡', Boolean(st.egressIface), st.egressIface || '-')}
-      ${row('Endpoint', Boolean(st.endpoint), st.endpoint || '未设置')}
-      ${row('全局代理客户端', true, `${st.fullTunnelClients || 0} / ${st.clientCount || 0}`)}
-    </div>
-    ${(st.tips || []).length ? `<ul class="small muted" style="margin:12px 0 0;padding-left:1.1rem">${st.tips.map((t) => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}`;
+    <div class="card" id="d-box"><p class="muted">诊断中…</p></div>
+  `);
+  bindShell();
+  const run = async () => {
+    const box = document.getElementById('d-box');
+    try {
+      const d = await api('/api/diagnose');
+      state.diagnose = d;
+      box.innerHTML = `
+        <div class="diag-summary ${d.ok ? 'ok' : 'bad'}">
+          <strong>${esc(d.summary)}</strong>
+          <span class="muted">模式: ${d.mode === 'agent' ? '远程落地' : '本机'}</span>
+        </div>
+        <div class="diag-list">
+          ${(d.items || [])
+            .map(
+              (it) => `
+            <div class="diag-item level-${esc(it.level)}">
+              <div class="diag-title">
+                <span class="diag-dot"></span>
+                <strong>${esc(it.title)}</strong>
+              </div>
+              <div class="diag-detail">${esc(it.detail)}</div>
+              ${it.fix ? `<div class="diag-fix">→ ${esc(it.fix)}</div>` : ''}
+            </div>`
+            )
+            .join('')}
+        </div>
+        ${
+          d.raw
+            ? `<details style="margin-top:16px"><summary class="muted">原始 wg show</summary>
+               <pre class="code-block">${esc(d.raw)}</pre></details>`
+            : ''
+        }
+        <div class="btn-row" style="margin-top:16px">
+          <button class="btn btn-primary" id="d-exit">一键落地</button>
+          <button class="btn btn-success" id="d-apply">应用配置</button>
+          <button class="btn btn-ghost" data-nav-jump="clients">去扫码</button>
+        </div>
+      `;
+      document.getElementById('d-exit').onclick = () => setupExit(true);
+      document.getElementById('d-apply').onclick = () => applyConfig(true);
+      bindTopAlerts();
+    } catch (e) {
+      box.innerHTML = `<p class="danger">${esc(e.message)}</p>`;
+    }
+  };
+  document.getElementById('d-refresh').onclick = run;
+  await run();
 }
 
-async function loadExitStatusBox() {
-  const box = document.getElementById('exit-status-box');
-  if (!box) return;
-  try {
-    const st = await api('/api/exit/status');
-    state.exitStatus = st;
-    box.innerHTML = `
-      <div class="kvs" style="margin:0">
-        <div class="kv"><span>状态</span><span class="badge ${st.ready ? 'ok' : 'warn'}">${st.ready ? '就绪' : '未就绪'}</span></div>
-        <div class="kv"><span>转发</span><span>${st.forward === true ? '开' : st.forward === false ? '关' : '?'}</span></div>
-        <div class="kv"><span>NAT</span><span>${st.natActive ? '已生效' : st.natConfigured ? '已配置未生效' : '未配置'}</span></div>
-        <div class="kv"><span>出口网卡</span><span class="mono">${esc(st.egressIface || '-')}</span></div>
-        <div class="kv"><span>出口 IP</span><span class="mono">${esc(st.exitPublicIp || '未知')}</span></div>
-      </div>`;
-  } catch (ex) {
-    box.innerHTML = `<span class="muted">${esc(ex.message)}</span>`;
+/* ========== 设置 ========== */
+async function renderSettings() {
+  app.innerHTML = shell(`
+    <div class="page-header"><div><h2>设置</h2></div></div>
+    <div class="card">
+      <h3>修改密码</h3>
+      <label>当前密码</label><input class="field" type="password" id="pw-old" />
+      <label>新密码</label><input class="field" type="password" id="pw-new" />
+      <button class="btn btn-primary" id="pw-save" style="margin-top:10px">更新密码</button>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h3>出口模式说明</h3>
+      <p class="muted">当前：<strong>${esc(exitLabel())}</strong></p>
+      <p class="field-hint">
+        美国家宽 / 商家前置入口 / 面板单独部署 → 使用「远程落地机」。
+        所有一键落地、应用、二维码都只针对当前出口，不会再误操作到面板机。
+      </p>
+      <button class="btn btn-sm btn-ghost" data-nav-jump="server">管理出口服务器</button>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h3>备份</h3>
+      <div class="btn-row">
+        <a class="btn btn-ghost" href="/api/export">导出 JSON</a>
+      </div>
+    </div>
+  `);
+  bindShell();
+  document.getElementById('pw-save').onclick = async () => {
+    try {
+      await api('/api/password', {
+        method: 'POST',
+        body: { currentPassword: val('pw-old'), newPassword: val('pw-new') },
+      });
+      toast('密码已更新');
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  };
+}
+
+/* ========== 动作 ========== */
+async function applyConfig(confirmFirst = false) {
+  if (confirmFirst) {
+    const msg = isAgentMode()
+      ? '将配置下发到【落地机】（不是面板机）。继续？'
+      : '将配置应用到【面板本机】WireGuard。继续？';
+    if (!confirm(msg)) return;
   }
-}
-
-async function showExitStatus() {
   try {
-    const st = await api('/api/exit/status');
-    state.exitStatus = st;
-    state.modal = {
-      title: '落地状态',
-      body: `
-        ${exitStatusHtml(st)}
-        <div class="actions-end">
-          <button class="btn btn-ghost" id="ex-close">关闭</button>
-          <button class="btn btn-primary" id="ex-setup">一键落地</button>
-        </div>`,
-      after() {
-        document.getElementById('ex-close').onclick = closeModal;
-        document.getElementById('ex-setup').onclick = () => {
-          closeModal();
-          setupExit(true);
-        };
-      },
-    };
-    renderModal(state.modal);
-  } catch (ex) {
-    toast(ex.message, 'err');
+    toast(isAgentMode() ? '正在下发到落地机…' : '正在应用…', 'warn');
+    const res = await api('/api/apply', { method: 'POST', body: {} });
+    toast(res.message || (res.ok ? '完成' : '失败'), res.ok ? 'ok' : 'err');
+    if (res.pending) {
+      openModal({
+        title: '已下发任务',
+        body: `<p>${esc(res.message)}</p>
+          <p class="field-hint">Agent 约 10 秒内拉取执行。可到「诊断」刷新查看接口/握手。</p>`,
+        actions: `<button class="btn btn-primary" data-close>好的</button>
+          <button class="btn btn-ghost" id="go-diag">打开诊断</button>`,
+      });
+      document.getElementById('go-diag')?.addEventListener('click', () => {
+        closeModal();
+        state.page = 'diagnose';
+        render();
+      });
+    }
+    await refreshCore();
+    render();
+  } catch (e) {
+    toast(e.data?.error || e.message, 'err');
   }
 }
 
 async function setupExit(apply = true) {
-  const msg = apply
-    ? '将开启转发、配置 NAT、把客户端改为全局代理，并立即应用到服务器。\n\n已有客户端需重新扫码/导入。继续？'
-    : '将写入落地规则（不立即应用）。继续？';
+  const msg = isAgentMode()
+    ? '在【落地机】开启转发 + NAT + 全局代理并应用。不会改面板机网络。继续？'
+    : '在【面板本机】开启转发 + NAT 并应用。继续？';
   if (!confirm(msg)) return;
   try {
     toast('正在配置落地…', 'warn');
     const res = await api('/api/exit/setup', {
       method: 'POST',
-      body: {
-        apply: apply !== false,
-        fullTunnelClients: true,
-      },
+      body: { apply, fullTunnelClients: true },
     });
-    if (res.server) state.server = res.server;
-    state.dirty = Boolean(res.dirty);
-    state.exitStatus = res.status || null;
-    toast(res.message || (res.ok ? '落地完成' : '落地未完全成功'), res.ok ? 'ok' : 'err');
-
-    state.modal = {
-      title: res.ok ? '落地完成' : '落地结果',
+    toast(res.message || '完成', res.ok ? 'ok' : 'err');
+    openModal({
+      title: res.ok ? '落地任务已处理' : '落地结果',
       body: `
-        <div class="alert ${res.ok ? 'ok' : 'warn'}" style="margin-bottom:12px">
-          <div>${esc(res.message || '')}</div>
+        <p>${esc(res.message || '')}</p>
+        ${
+          res.pending
+            ? '<p class="field-hint">远程任务排队中，请等 Agent 在线并执行，然后打开「诊断」。</p>'
+            : ''
+        }
+        <p class="field-hint">然后：客户端扫码 → 打开隧道 → 诊断看握手 → ifconfig.me 应是<strong>落地机</strong>出口 IP（美国家宽），不是面板 IP。</p>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="ex-clients">去客户端扫码</button>
+          <button class="btn btn-ghost" id="ex-diag">打开诊断</button>
         </div>
-        <div class="table-wrap"><table style="min-width:0">
-          <thead><tr><th>步骤</th><th>结果</th><th>说明</th></tr></thead>
-          <tbody>
-            ${(res.steps || []).map((s) => `
-              <tr>
-                <td>${esc(s.title)}</td>
-                <td><span class="badge ${s.ok ? 'ok' : s.skipped ? 'muted' : 'err'}">${s.ok ? '完成' : s.skipped ? '跳过' : '失败'}</span></td>
-                <td class="small muted">${esc(s.detail || '')}</td>
-              </tr>`).join('')}
-          </tbody>
-        </table></div>
-        ${res.status ? `<div style="margin-top:12px">${exitStatusHtml(res.status)}</div>` : ''}
-        <p class="small muted" style="margin-top:12px">手机请删除旧隧道后重新扫码。连上后访问 ifconfig.me，应显示服务器出口 IP。</p>
-        <div class="actions-end">
-          <button class="btn btn-primary" id="ex-done">知道了</button>
-        </div>`,
-      after() {
-        document.getElementById('ex-done').onclick = async () => {
-          closeModal();
-          await refreshAndRender();
-        };
-      },
-    };
-    renderModal(state.modal);
-  } catch (ex) {
-    toast(ex.data?.message || ex.message || '落地失败', 'err');
+      `,
+      actions: `<button class="btn btn-ghost" data-close>关闭</button>`,
+    });
+    document.getElementById('ex-clients')?.addEventListener('click', () => {
+      closeModal();
+      state.page = 'clients';
+      render();
+    });
+    document.getElementById('ex-diag')?.addEventListener('click', () => {
+      closeModal();
+      state.page = 'diagnose';
+      render();
+    });
+    await refreshCore();
+  } catch (e) {
+    toast(e.data?.error || e.message, 'err');
   }
 }
 
-async function exportAllClients() {
-  try {
-    const data = await api('/api/clients/export/zip-json');
-    if (!data.files?.length) return toast('没有可导出的客户端', 'warn');
-    for (const f of data.files) {
-      const blob = new Blob([f.content], { type: 'text/plain' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = f.name;
-      a.click();
-      URL.revokeObjectURL(a.href);
-      await new Promise((r) => setTimeout(r, 120));
-    }
-    toast(`已下载 ${data.files.length} 个配置`);
-  } catch (ex) { toast(ex.message, 'err'); }
+/* ========== Modal ========== */
+function openModal({ title, body, actions }) {
+  const root = document.getElementById('modal-root') || document.body;
+  const wrap = el(`
+    <div class="modal-backdrop">
+      <div class="modal">
+        <div class="modal-head"><h3>${esc(title || '')}</h3>
+          <button class="btn btn-sm btn-ghost" data-close>✕</button></div>
+        <div class="modal-body">${body || ''}</div>
+        <div class="modal-foot">${actions || '<button class="btn btn-primary" data-close>关闭</button>'}</div>
+      </div>
+    </div>`);
+  root.innerHTML = '';
+  root.appendChild(wrap);
+  wrap.querySelectorAll('[data-close]').forEach((b) => {
+    b.onclick = closeModal;
+  });
+  wrap.addEventListener('click', (e) => {
+    if (e.target === wrap) closeModal();
+  });
 }
 
-async function applyConfig(skipConfirm = false) {
-  if (!skipConfirm && !confirm('写入服务器并启动/重载 WireGuard？')) return;
-  try {
-    const res = await api('/api/apply', { method: 'POST' });
-    toast(res.message || '已应用', res.ok === false ? 'err' : 'ok');
-    await refreshAndRender();
-  } catch (ex) {
-    const msg = ex.data?.message || ex.message;
-    toast(msg, 'err');
-    const pf = ex.data?.preflight;
-    if (pf?.checks) {
-      state.modal = {
-        title: '应用失败',
-        body: `
-          <div class="alert warn"><div>${esc(msg)}</div></div>
-          <div class="table-wrap"><table style="min-width:0">
-            <thead><tr><th>项目</th><th>结果</th><th>说明</th></tr></thead>
-            <tbody>${pf.checks.map((c) => `
-              <tr>
-                <td>${esc(c.title)}</td>
-                <td><span class="badge ${c.ok ? 'ok' : c.warn ? 'warn' : 'err'}">${c.ok ? '通过' : c.warn ? '警告' : '失败'}</span></td>
-                <td class="small muted">${esc(c.detail)}</td>
-              </tr>`).join('')}</tbody>
-          </table></div>
-          ${ex.data?.config ? '<div class="btn-row" style="margin-top:12px"><a class="btn btn-primary" href="/api/server/config?format=download">下载配置</a></div>' : ''}`,
-      };
-      renderModal(state.modal);
-    } else if (ex.data?.config) {
-      state.modal = {
-        title: '应用失败',
-        body: `
-          <div class="alert warn"><div>${esc(msg)}</div></div>
-          <pre class="pre-box">${esc(ex.data.config)}</pre>
-          <a class="btn btn-primary" href="/api/server/config?format=download">下载配置</a>`,
-      };
-      renderModal(state.modal);
-    }
-  }
+function closeModal() {
+  const root = document.getElementById('modal-root');
+  if (root) root.innerHTML = '';
 }
 
-async function refreshAndRender() {
-  await loadMainData();
-  render();
-}
-
-function render() {
+/* ========== Router ========== */
+async function render() {
+  if (!state.status?.loggedIn) return;
   if (!state.wizardDone && !state._skipWizardOnce) {
-    app.innerHTML = renderWizard();
-    bindWizard();
-    return;
+    return renderWizard();
   }
-  let content = '';
-  if (state.page === 'dashboard') content = renderDashboard();
-  else if (state.page === 'clients') content = renderClients();
-  else if (state.page === 'server') content = renderServer();
-  else if (state.page === 'nodes') content = renderNodes();
-  else if (state.page === 'deploy') content = renderDeploy();
-  else if (state.page === 'settings') content = renderSettings();
-  else content = renderDashboard();
-  app.innerHTML = shell(content);
-  bindShell();
-  if (state.page === 'dashboard') bindDashboard();
-  if (state.page === 'clients') bindClients();
-  if (state.page === 'server') bindServer();
-  if (state.page === 'nodes') bindNodes();
-  if (state.page === 'deploy') bindDeploy();
-  if (state.page === 'settings') bindSettings();
+  if (state.page === 'dashboard') return renderDashboard();
+  if (state.page === 'server') return renderServer();
+  if (state.page === 'clients') return renderClients();
+  if (state.page === 'diagnose') return renderDiagnose();
+  if (state.page === 'settings') return renderSettings();
+  return renderDashboard();
 }
 
 async function boot() {
-  const theme = localStorage.getItem('wg-theme');
-  if (theme && theme !== 'auto') document.documentElement.setAttribute('data-theme', theme);
   renderBoot();
   try {
     const status = await api('/api/status');
     state.status = status;
-    if (status.needSetup) { renderSetup(); return; }
-    if (!status.loggedIn) { renderLogin(); return; }
-    await loadMainData();
-    if (!state.wizardDone) {
-      state.wizardStep = 1;
-      state._skipWizardOnce = false;
-    } else {
-      state._skipWizardOnce = true;
-    }
-    state.page = 'dashboard';
-    render();
-  } catch (ex) {
-    renderBoot('无法连接面板：' + ex.message);
+    if (status.needSetup) return renderSetup();
+    if (!status.loggedIn) return renderLogin();
+    state.mode = status.mode || 'local';
+    state.primaryNode = status.primaryNode;
+    state.wizardDone = status.wizardDone;
+    await refreshCore();
+    await render();
+  } catch (e) {
+    renderBoot('加载失败: ' + e.message);
   }
 }
 

@@ -41,6 +41,10 @@ if (!state.passwordHash && PASSWORD) {
 }
 
 function persist() {
+  // agent 模式：统一 server/clients 同步到主节点
+  if (state.mode === 'agent') {
+    nodes.syncPrimaryFromState(state);
+  }
   saveState(state);
 }
 
@@ -50,6 +54,42 @@ function clientIp(req) {
     req.socket?.remoteAddress ||
     ''
   );
+}
+
+function healClientIps(list, serverAddress) {
+  let healed = 0;
+  for (const c of list || []) {
+    if (c.enabled === false) continue;
+    if (wg.isValidClientAddress(c.address)) continue;
+    try {
+      c.address = wg.nextClientAddress(
+        serverAddress,
+        (list || []).filter((x) => x.id !== c.id)
+      );
+      c.updatedAt = new Date().toISOString();
+      healed += 1;
+    } catch {
+      /* leave for apply to report */
+    }
+  }
+  return healed;
+}
+
+function markDirtyUnified() {
+  if (state.mode === 'agent') {
+    const node = nodes.getPrimaryNode(state);
+    if (node) nodes.markNodeDirty(node);
+  }
+}
+
+function publicModeInfo() {
+  const primary = nodes.getPrimaryNode(state);
+  return {
+    mode: state.mode || 'local',
+    primaryNodeId: state.primaryNodeId || null,
+    primaryNode: primary ? nodes.publicNode(primary) : null,
+    showAdvancedNodes: Boolean(state.settings?.showAdvancedNodes),
+  };
 }
 
 function publicServer(s) {
@@ -119,8 +159,25 @@ app.get('/api/status', async (req, res) => {
   const token = req.cookies?.wg_session;
   const loggedIn = auth.isAuthed(token);
   let iface = { up: false, peers: [] };
-  if (loggedIn && state.server.interfaceName) {
-    iface = await wg.getInterfaceStatus(state.server.interfaceName);
+  const modeInfo = publicModeInfo();
+  if (loggedIn) {
+    if (state.mode === 'agent') {
+      const primary = nodes.getPrimaryNode(state);
+      const report = primary?.lastReport?.interface;
+      if (report) iface = report;
+      else if (primary?.lastReport) iface = primary.lastReport.interface || iface;
+    } else if (state.server.interfaceName) {
+      iface = await wg.getInterfaceStatus(state.server.interfaceName);
+    }
+  }
+  let dirty = false;
+  if (loggedIn) {
+    if (state.mode === 'agent') {
+      const primary = nodes.getPrimaryNode(state);
+      dirty = primary ? nodes.isNodeDirty(primary) : false;
+    } else {
+      dirty = wg.isDirty(state);
+    }
   }
   res.json({
     needSetup: auth.needsSetup(state),
@@ -129,12 +186,16 @@ app.get('/api/status', async (req, res) => {
     defaultUsername: auth.DEFAULT_USERNAME,
     username: loggedIn ? state.username || auth.DEFAULT_USERNAME : undefined,
     forcePasswordChange: loggedIn ? Boolean(state.forcePasswordChange) : false,
-    dirty: loggedIn ? wg.isDirty(state) : false,
+    dirty,
     lastAppliedAt: loggedIn ? state.lastAppliedAt : undefined,
     tools,
     interface: loggedIn ? iface : undefined,
     clientCount: state.clients.length,
     version: require(path.join(ROOT, 'package.json')).version,
+    mode: modeInfo.mode,
+    primaryNodeId: modeInfo.primaryNodeId,
+    primaryNode: loggedIn ? modeInfo.primaryNode : undefined,
+    showAdvancedNodes: modeInfo.showAdvancedNodes,
     server: loggedIn
       ? {
           interfaceName: state.server.interfaceName,
@@ -262,7 +323,10 @@ app.put('/api/server', (req, res) => {
   for (const f of fields) {
     if (body[f] !== undefined) s[f] = body[f];
   }
-  if (body.listenPort !== undefined) s.listenPort = Number(body.listenPort) || 51820;
+  if (body.listenPort !== undefined) {
+    const fallback = state.mode === 'agent' ? 7901 : 51820;
+    s.listenPort = Number(body.listenPort) || fallback;
+  }
   if (body.mtu !== undefined) s.mtu = body.mtu === '' || body.mtu === null ? null : Number(body.mtu);
 
   // 端口变更时，若 endpoint 只有 host 或端口不一致，可自动同步
@@ -285,11 +349,15 @@ app.put('/api/server', (req, res) => {
 
   wg.ensureServerKeys(state);
   if (body.wizardDone !== undefined) state.wizardDone = Boolean(body.wizardDone);
+  markDirtyUnified();
   persist();
   res.json({
     server: publicServer(state.server),
     wizardDone: state.wizardDone,
-    dirty: wg.isDirty(state),
+    dirty: state.mode === 'agent'
+      ? Boolean(nodes.getPrimaryNode(state) && nodes.isNodeDirty(nodes.getPrimaryNode(state)))
+      : wg.isDirty(state),
+    mode: state.mode,
   });
 });
 
@@ -322,35 +390,69 @@ app.get('/api/exit/status', async (req, res) => {
 });
 
 /**
- * 一键落地：
- * - 开启 IPv4 转发（运行时 + sysctl.d 持久化）
- * - 自动识别出口网卡并写入 NAT PostUp/PostDown
- * - 默认把客户端 AllowedIPs 设为全局代理
- * - apply=true 时立即写入系统并启动/重载接口
+ * 一键落地（统一）：
+ * - local：本机 setupExit + apply
+ * - agent：同步到主节点并下发 exit job
  */
 app.post('/api/exit/setup', async (req, res) => {
   try {
     const body = req.body || {};
-    // 应用前先修客户端空 IP
-    for (const c of state.clients || []) {
-      if (c.enabled === false) continue;
-      if (wg.isValidClientAddress(c.address)) continue;
-      c.address = wg.nextClientAddress(
-        state.server.address,
-        state.clients.filter((x) => x.id !== c.id)
-      );
-      c.updatedAt = new Date().toISOString();
+    healClientIps(state.clients, state.server.address);
+
+    // 客户端全局代理
+    if (body.fullTunnelClients !== false) {
+      for (const c of state.clients || []) {
+        c.allowedIPs = '0.0.0.0/0, ::/0';
+        if (!c.persistentKeepalive) c.persistentKeepalive = 25;
+        c.updatedAt = new Date().toISOString();
+      }
+    }
+
+    if (state.mode === 'agent') {
+      const node = nodes.getPrimaryNode(state);
+      if (!node) {
+        return res.status(400).json({
+          ok: false,
+          error: '当前为远程出口模式，但还没有落地节点。请先在向导或出口页安装 Agent',
+        });
+      }
+      nodes.syncPrimaryFromState(state);
+      // 预写 NAT 模板到 state（agent 会按目标机网卡重写并回传）
+      if (!state.server.postUp || !/MASQUERADE/i.test(state.server.postUp)) {
+        const iface = state.server.interfaceName || 'wg0';
+        state.server.postUp = wg.defaultPostUp(iface, body.egressIface || 'eth0');
+        state.server.postDown = wg.defaultPostDown(iface, body.egressIface || 'eth0');
+        node.server.postUp = state.server.postUp;
+        node.server.postDown = state.server.postDown;
+      }
+      nodes.markNodeDirty(node);
+      const job = nodes.enqueueJob(node, 'exit', { fullTunnel: true });
+      persist();
+      return res.json({
+        ok: true,
+        mode: 'agent',
+        job,
+        applied: false,
+        pending: true,
+        message: node.lastSeenAt
+          ? '已向落地节点下发「一键落地」，请等待 Agent 执行（约 10 秒）'
+          : '任务已创建，但 Agent 尚未上线，请先在落地机安装 Agent',
+        server: publicServer(state.server),
+        node: nodes.publicNode(node),
+        dirty: true,
+      });
     }
 
     const result = await wg.setupExit(state, {
       apply: body.apply !== false,
-      fullTunnelClients: body.fullTunnelClients !== false,
+      fullTunnelClients: false, // 已在上面处理
       egressIface: body.egressIface || undefined,
     });
     persist();
     const iface = await wg.getInterfaceStatus(state.server.interfaceName);
     res.status(result.ok && (result.applied || body.apply === false) ? 200 : 500).json({
       ...result,
+      mode: 'local',
       server: publicServer(state.server),
       interface: iface,
       dirty: wg.isDirty(state),
@@ -378,22 +480,58 @@ app.get('/api/server/config', (req, res) => {
 // ---------- Clients ----------
 
 app.get('/api/clients', async (req, res) => {
-  const iface = await wg.getInterfaceStatus(state.server.interfaceName);
+  let iface = { up: false, peers: [] };
+  if (state.mode === 'agent') {
+    const primary = nodes.getPrimaryNode(state);
+    iface = primary?.lastReport?.interface || iface;
+    // 合并节点上客户端的 live 字段
+    if (primary?.clients) {
+      const liveMap = new Map(primary.clients.map((c) => [c.id, c]));
+      for (const c of state.clients) {
+        const live = liveMap.get(c.id);
+        if (live) {
+          c._online = live._online;
+          c._latestHandshake = live._latestHandshake;
+          c._transfer = live._transfer;
+        }
+      }
+    }
+  } else {
+    iface = await wg.getInterfaceStatus(state.server.interfaceName);
+  }
   const map = peerMapFromStatus(iface);
+  const dirty =
+    state.mode === 'agent'
+      ? Boolean(nodes.getPrimaryNode(state) && nodes.isNodeDirty(nodes.getPrimaryNode(state)))
+      : wg.isDirty(state);
   res.json({
-    clients: state.clients.map((c) => publicClient(c, map.get(c.publicKey))),
-    dirty: wg.isDirty(state),
-    interfaceUp: iface.up,
+    clients: state.clients.map((c) => {
+      const live = map.get(c.publicKey);
+      const pub = publicClient(c, live);
+      if (!live && c._online) {
+        pub.online = Boolean(c._online);
+        pub.latestHandshake = c._latestHandshake || '';
+        pub.transfer = c._transfer || '';
+      }
+      return pub;
+    }),
+    dirty,
+    interfaceUp: Boolean(iface.up),
+    mode: state.mode,
   });
 });
 
 app.get('/api/clients/export/zip-json', (req, res) => {
   wg.ensureServerKeys(state);
-  const files = state.clients.map((c) => ({
-    name: `${wg.sanitizeName(c.name)}.conf`,
-    content: wg.buildClientConfig(state, c),
-  }));
-  res.json({ files, count: files.length });
+  try {
+    const files = state.clients.map((c) => ({
+      name: `${wg.sanitizeName(c.name)}.conf`,
+      content: wg.buildClientConfig(state, c),
+    }));
+    res.json({ files, count: files.length });
+  } catch (err) {
+    res.status(400).json({ error: err.message, code: err.code });
+  }
 });
 
 app.post('/api/clients', (req, res) => {
@@ -437,8 +575,13 @@ app.post('/api/clients', (req, res) => {
   };
   state.clients.push(client);
   state.wizardDone = true;
+  markDirtyUnified();
   persist();
-  res.status(201).json({ client: publicClient(client), dirty: wg.isDirty(state) });
+  res.status(201).json({
+    client: publicClient(client),
+    dirty: true,
+    mode: state.mode,
+  });
 });
 
 app.put('/api/clients/:id', (req, res) => {
@@ -494,23 +637,30 @@ app.put('/api/clients/:id', (req, res) => {
   if (body.regeneratePsk) c.presharedKey = wg.generatePresharedKey();
   if (body.removePsk) c.presharedKey = '';
   c.updatedAt = new Date().toISOString();
+  markDirtyUnified();
   persist();
-  res.json({ client: publicClient(c), dirty: wg.isDirty(state) });
+  res.json({ client: publicClient(c), dirty: true });
 });
 
 app.delete('/api/clients/:id', (req, res) => {
   const idx = state.clients.findIndex((x) => x.id === req.params.id);
   if (idx < 0) return res.status(404).json({ error: '客户端不存在' });
   const [removed] = state.clients.splice(idx, 1);
+  markDirtyUnified();
   persist();
-  res.json({ ok: true, removed: publicClient(removed), dirty: wg.isDirty(state) });
+  res.json({ ok: true, removed: publicClient(removed), dirty: true });
 });
 
 app.get('/api/clients/:id/config', async (req, res) => {
   const c = state.clients.find((x) => x.id === req.params.id);
   if (!c) return res.status(404).json({ error: '客户端不存在' });
   if (!state.server.publicKey) wg.ensureServerKeys(state);
-  const config = wg.buildClientConfig(state, c);
+  let config;
+  try {
+    config = wg.buildClientConfig(state, c);
+  } catch (err) {
+    return res.status(400).json({ error: err.message, code: err.code || 'CONFIG' });
+  }
   const format = req.query.format || 'text';
   if (format === 'download') {
     res.setHeader('Content-Type', 'application/octet-stream');
@@ -527,12 +677,22 @@ app.get('/api/clients/:id/config', async (req, res) => {
         margin: 1,
         width: 280,
       });
-      return res.json({ config, qr: dataUrl, name: c.name });
+      return res.json({
+        config,
+        qr: dataUrl,
+        name: c.name,
+        endpoint: state.server.endpoint,
+        mode: state.mode,
+        tip:
+          state.mode === 'agent'
+            ? '请确认手机连的是落地机 Endpoint，不是面板 IP'
+            : '扫码后打开隧道，到「诊断」页查看是否握手',
+      });
     } catch (err) {
       return res.status(500).json({ error: '二维码生成失败: ' + err.message, config });
     }
   }
-  res.json({ config, name: c.name });
+  res.json({ config, name: c.name, endpoint: state.server.endpoint });
 });
 
 // ---------- System / apply ----------
@@ -545,32 +705,42 @@ app.get('/api/preflight', async (req, res) => {
 
 app.post('/api/apply', async (req, res) => {
   wg.ensureServerKeys(state);
-  // 应用前自动修复缺少内网 IP 的客户端，避免生成 AllowedIPs= 空行
-  let healed = 0;
-  for (const c of state.clients || []) {
-    if (c.enabled === false) continue;
-    if (wg.isValidClientAddress(c.address)) continue;
-    try {
-      c.address = wg.nextClientAddress(
-        state.server.address,
-        state.clients.filter((x) => x.id !== c.id)
-      );
-      c.updatedAt = new Date().toISOString();
-      healed += 1;
-    } catch (err) {
+  const healed = healClientIps(state.clients, state.server.address);
+  if (healed) persist();
+
+  // 远程模式：下发到主节点
+  if (state.mode === 'agent') {
+    const node = nodes.getPrimaryNode(state);
+    if (!node) {
       return res.status(400).json({
-        error: `客户端「${c.name || c.id}」缺少内网 IP：${err.message}`,
-        needFixClients: true,
+        ok: false,
+        error: '远程出口模式但没有主节点，请先安装 Agent',
       });
     }
+    nodes.syncPrimaryFromState(state);
+    nodes.markNodeDirty(node);
+    const job = nodes.enqueueJob(node, 'apply', {});
+    persist();
+    return res.json({
+      ok: true,
+      mode: 'agent',
+      pending: true,
+      job,
+      healedClients: healed,
+      message: node.lastSeenAt
+        ? '已向落地节点下发「应用配置」，等待 Agent 执行'
+        : '任务已创建，但 Agent 尚未上线',
+      node: nodes.publicNode(node),
+      dirty: true,
+    });
   }
-  if (healed) persist();
 
   const result = await wg.applyConfig(state);
   if (result.ok) persist();
   const iface = await wg.getInterfaceStatus(state.server.interfaceName);
   res.status(result.ok ? 200 : 500).json({
     ...result,
+    mode: 'local',
     healedClients: healed,
     interface: iface,
     dirty: wg.isDirty(state),
@@ -607,18 +777,215 @@ app.get('/api/system/egress', async (req, res) => {
 app.post('/api/system/fill-endpoint', async (req, res) => {
   const port = state.server.listenPort || 51820;
   let host = (req.body && req.body.host) || '';
+  let source = 'manual';
   if (!host) {
+    // agent 模式禁止自动用面板出网 IP 当 Endpoint
+    if (state.mode === 'agent' && !req.body?.force) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          '远程出口模式请手动填写落地机的入站地址（外部连接 IP 或移动入口），不要使用面板出网 IP',
+        tip: '例如 114.x.x.x:7901 或 211.x.x.x:7901',
+      });
+    }
     const ip = await wg.detectPublicIp();
     if (!ip.ok) return res.status(500).json(ip);
     host = ip.ip;
+    source = ip.source || 'detect';
   }
   state.server.endpoint = `${host}:${port}`;
+  markDirtyUnified();
   persist();
   res.json({
     ok: true,
     endpoint: state.server.endpoint,
+    source,
+    warning:
+      source !== 'manual'
+        ? '探测到的是「出网 IP」，入口前置/CM 机器请改成商家给的外部连接或移动入口 IP'
+        : undefined,
     server: publicServer(state.server),
-    dirty: wg.isDirty(state),
+    dirty: true,
+  });
+});
+
+// ---------- 模式 / 诊断 / 统一出口 ----------
+
+app.get('/api/mode', (req, res) => {
+  res.json(publicModeInfo());
+});
+
+/**
+ * 切换出口模式
+ * body: { mode: 'local'|'agent', template?: 'cm'|'vps', name?: string, panelUrl?: string }
+ */
+app.post('/api/mode', (req, res) => {
+  const body = req.body || {};
+  const mode = body.mode === 'agent' ? 'agent' : 'local';
+
+  if (mode === 'local') {
+    state.mode = 'local';
+    // 保留 primaryNodeId 以便再切回，但不强制清除节点数据
+    persist();
+    return res.json({
+      ok: true,
+      ...publicModeInfo(),
+      message: '已切换为本机出口：WireGuard 跑在面板这台机器上',
+    });
+  }
+
+  const { node, token, created } = nodes.ensurePrimaryNode(state, {
+    name: body.name || '落地出口',
+    template: body.template || 'cm',
+  });
+  // CM 模板默认端口
+  if (body.template === 'cm' || (!body.template && created)) {
+    if (!node.server.listenPort || node.server.listenPort === 51820) {
+      node.server.listenPort = 7901;
+    }
+    if (!state.server.listenPort || state.server.listenPort === 51820) {
+      state.server.listenPort = 7901;
+    }
+  }
+  if (body.template === 'vps' && created) {
+    node.server.listenPort = 51820;
+    state.server.listenPort = 51820;
+  }
+  // 同步密钥：优先已有 state
+  wg.ensureServerKeys(state);
+  node.server = { ...node.server, ...state.server };
+  node.clients = state.clients;
+  const base = body.panelUrl || panelBaseUrl(req);
+  const installCmd =
+    token || node.tokenPlain
+      ? nodes.installCommand({
+          panelUrl: base,
+          token: token || node.tokenPlain,
+          name: node.name,
+        })
+      : null;
+  persist();
+  res.json({
+    ok: true,
+    ...publicModeInfo(),
+    created,
+    token: token || (created ? node.tokenPlain : undefined),
+    installCommand: installCmd,
+    panelUrl: base,
+    server: publicServer(state.server),
+    message: created
+      ? '已创建远程出口，请在落地机执行安装命令'
+      : '已切换为远程出口模式',
+  });
+});
+
+app.get('/api/exit/overview', async (req, res) => {
+  const modeInfo = publicModeInfo();
+  let exitStatus = null;
+  let agent = null;
+  if (state.mode === 'local') {
+    try {
+      exitStatus = await wg.getExitStatus(state);
+    } catch (err) {
+      exitStatus = { ok: false, error: err.message };
+    }
+  } else {
+    const node = nodes.getPrimaryNode(state);
+    agent = node ? nodes.publicNode(node) : null;
+    const report = node?.lastReport || null;
+    exitStatus = {
+      ok: true,
+      mode: 'agent',
+      ready: Boolean(
+        agent?.online &&
+          state.server?.endpoint &&
+          report?.interface?.up &&
+          report?.forward &&
+          report?.natActive
+      ),
+      forward: report?.forward ?? null,
+      natActive: report?.natActive ?? null,
+      interfaceUp: Boolean(report?.interface?.up),
+      endpoint: state.server?.endpoint || '',
+      egressIface: report?.egressIface || '',
+      exitPublicIp: report?.exitPublicIp || null,
+      tips: [
+        !agent ? '请先安装落地 Agent' : null,
+        agent && !agent.online ? 'Agent 离线' : null,
+        !state.server?.endpoint ? '请填写 Endpoint' : null,
+        report && !report.interface?.up ? '接口未启动，请一键落地/应用' : null,
+        report && !report.natActive ? 'NAT 未生效，请一键落地' : null,
+      ].filter(Boolean),
+    };
+  }
+  res.json({
+    ...modeInfo,
+    server: publicServer(state.server),
+    clientCount: state.clients.length,
+    dirty:
+      state.mode === 'agent'
+        ? Boolean(modeInfo.primaryNode?.dirty)
+        : wg.isDirty(state),
+    lastAppliedAt: state.lastAppliedAt,
+    exitStatus,
+  });
+});
+
+app.get('/api/diagnose', async (req, res) => {
+  try {
+    const primary = nodes.getPrimaryNode(state);
+    const result = await wg.diagnose(state, {
+      mode: state.mode || 'local',
+      report: primary?.lastReport || null,
+      agentOnline: primary ? nodes.isNodeOnline(primary) : false,
+      hostname: primary?.hostname,
+      agentVersion: primary?.agentVersion,
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/primary/install-command', (req, res) => {
+  if (state.mode !== 'agent') {
+    return res.status(400).json({ error: '当前不是远程出口模式' });
+  }
+  const node = nodes.getPrimaryNode(state);
+  if (!node) return res.status(404).json({ error: '没有主节点' });
+  if (!node.tokenPlain) {
+    return res.status(400).json({
+      error: 'Token 不可见，请轮换 Token 后重新安装',
+      needRotate: true,
+    });
+  }
+  const base = req.query.panelUrl || panelBaseUrl(req);
+  res.json({
+    installCommand: nodes.installCommand({
+      panelUrl: base,
+      token: node.tokenPlain,
+      name: node.name,
+    }),
+    token: node.tokenPlain,
+    panelUrl: base,
+    node: nodes.publicNode(node, { includeToken: true }),
+  });
+});
+
+app.post('/api/primary/token', (req, res) => {
+  if (state.mode !== 'agent') {
+    return res.status(400).json({ error: '当前不是远程出口模式' });
+  }
+  const node = nodes.getPrimaryNode(state);
+  if (!node) return res.status(404).json({ error: '没有主节点' });
+  const token = nodes.rotateNodeToken(node);
+  const base = req.body?.panelUrl || panelBaseUrl(req);
+  persist();
+  res.json({
+    ok: true,
+    token,
+    installCommand: nodes.installCommand({ panelUrl: base, token, name: node.name }),
+    tip: '旧 Token 已失效，请在落地机重新执行安装命令',
   });
 });
 
@@ -754,7 +1121,7 @@ app.put('/api/nodes/:id', (req, res) => {
       if (body.server[f] !== undefined) node.server[f] = body.server[f];
     }
     if (body.server.listenPort !== undefined) {
-      node.server.listenPort = Number(body.server.listenPort) || 51820;
+      node.server.listenPort = Number(body.server.listenPort) || 7901;
     }
     if (body.server.mtu !== undefined) {
       node.server.mtu =
@@ -946,17 +1313,19 @@ app.post('/api/agent/heartbeat', (req, res) => {
     meta: req.body?.meta,
     status: req.body?.status,
   });
-  const pending = nodes.getPendingJobs(node, 5);
-  for (const j of pending) {
-    if (!j.startedAt) {
-      j.startedAt = new Date().toISOString();
-      j.status = 'running';
-    }
+  // 主节点：把 live 客户端状态与 postUp 同步回统一 state
+  if (state.mode === 'agent' && state.primaryNodeId === node.id) {
+    nodes.syncStateFromPrimary(state, node);
   }
+  const pending = nodes.getPendingJobs(node, 5);
+  nodes.leaseJobs(node, pending);
+  // 告诉 agent 当前期望的接口名
+  const ifaceName = node.server?.interfaceName || 'wg0';
   persist();
   res.json({
     ok: true,
     nodeId: node.id,
+    interfaceName: ifaceName,
     jobs: pending.map((j) => ({ id: j.id, type: j.type, payload: j.payload || {} })),
   });
 });
@@ -964,6 +1333,10 @@ app.post('/api/agent/heartbeat', (req, res) => {
 app.get('/api/agent/bundle', (req, res) => {
   const node = agentAuth(req, res);
   if (!node) return;
+  // 确保主节点用最新统一配置
+  if (state.mode === 'agent' && state.primaryNodeId === node.id) {
+    nodes.syncPrimaryFromState(state);
+  }
   const bundle = nodes.buildAgentBundle(node, wg);
   persist();
   res.json(bundle);
@@ -982,9 +1355,32 @@ app.post('/api/agent/job-result', (req, res) => {
   const { jobId, ok, message, detail } = req.body || {};
   const job = nodes.completeJob(node, jobId, { ok, message, detail });
   if (!job) return res.status(404).json({ error: '任务不存在' });
+
+  // exit：回写 NAT 到 node + 统一 state，避免二次 apply 冲掉
+  if (ok && job.type === 'exit' && detail) {
+    const iface = node.server?.interfaceName || 'wg0';
+    const egress = detail.egress || detail.egressIface || 'eth0';
+    if (detail.postUp) {
+      node.server.postUp = detail.postUp;
+      node.server.postDown = detail.postDown || node.server.postDown;
+    } else if (!node.server.postUp || !/MASQUERADE/i.test(node.server.postUp)) {
+      node.server.postUp = wg.defaultPostUp(iface, egress);
+      node.server.postDown = wg.defaultPostDown(iface, egress);
+    }
+    if (state.mode === 'agent' && state.primaryNodeId === node.id) {
+      state.server.postUp = node.server.postUp;
+      state.server.postDown = node.server.postDown;
+    }
+  }
+
   if (ok && (job.type === 'apply' || job.type === 'exit')) {
     const hash = detail?.configHash || nodes.configHashForNode(node, wg);
     nodes.markNodeClean(node, hash);
+    if (state.mode === 'agent' && state.primaryNodeId === node.id) {
+      state.lastAppliedHash = hash;
+      state.lastAppliedAt = node.lastAppliedAt;
+      nodes.syncStateFromPrimary(state, node);
+    }
   }
   persist();
   res.json({ ok: true, job });

@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 /**
- * WG Panel Edge Agent
+ * WG Panel Edge Agent v1.4.0
  * 连接中心面板，拉取任务：应用配置 / 一键落地 / 上报状态
  *
  * 环境变量：
- *   WG_PANEL_URL     面板地址，如 http://1.2.3.4:51821
- *   WG_AGENT_TOKEN   节点 token
- *   WG_AGENT_NAME    可选显示名
+ *   WG_PANEL_URL       面板地址，如 http://1.2.3.4:51821
+ *   WG_AGENT_TOKEN     节点 token
+ *   WG_AGENT_NAME      可选显示名
  *   WG_AGENT_INTERVAL  轮询秒数，默认 10
+ *   WG_IFACE           可选，默认从 bundle/上次配置读取，回退 wg0
  */
 const fs = require('fs');
 const path = require('path');
@@ -18,21 +19,44 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';
 const INTERVAL = Math.max(5, Number(process.env.WG_AGENT_INTERVAL || 10));
 const DATA_DIR = process.env.WG_AGENT_DATA || '/var/lib/wg-agent';
 const CONF_FALLBACK = '/etc/wireguard/wg0.conf';
+const STATE_FILE = path.join(DATA_DIR, 'agent-state.json');
 
 if (!PANEL_URL || !TOKEN) {
   console.error('[wg-agent] 需要环境变量 WG_PANEL_URL 与 WG_AGENT_TOKEN');
   process.exit(1);
 }
 
+let cachedIface = process.env.WG_IFACE || 'wg0';
+
 function ensureDir(d) {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+}
+
+function loadLocalState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    }
+  } catch {
+    /* ignore */
+  }
+  return {};
+}
+
+function saveLocalState(obj) {
+  try {
+    ensureDir(DATA_DIR);
+    fs.writeFileSync(STATE_FILE, JSON.stringify(obj, null, 2), { mode: 0o600 });
+  } catch {
+    /* ignore */
+  }
 }
 
 function request(method, urlPath, body) {
@@ -107,22 +131,48 @@ async function run(bin, args, timeout = 20000) {
   }
 }
 
+function parseHandshakeToMs(text) {
+  if (!text) return null;
+  const t = text.toLowerCase();
+  if (t.includes('now')) return 0;
+  let ms = 0;
+  const day = t.match(/(\d+)\s*day/);
+  const hour = t.match(/(\d+)\s*hour/);
+  const min = t.match(/(\d+)\s*minute/);
+  const sec = t.match(/(\d+)\s*second/);
+  if (day) ms += Number(day[1]) * 86400000;
+  if (hour) ms += Number(hour[1]) * 3600000;
+  if (min) ms += Number(min[1]) * 60000;
+  if (sec) ms += Number(sec[1]) * 1000;
+  if (!day && !hour && !min && !sec) return null;
+  return ms;
+}
+
 function parseWgShow(raw) {
   const peers = [];
   let current = null;
   let ifaceUp = false;
+  let listeningPort = null;
+  let publicKey = '';
   for (const line of String(raw || '').split('\n')) {
     if (line.startsWith('interface:')) {
       ifaceUp = true;
       continue;
     }
+    const lp = line.match(/listening port:\s*(\d+)/i);
+    if (lp) listeningPort = Number(lp[1]);
+    const pk = line.match(/public key:\s*(.+)/i);
+    if (pk && !current) publicKey = pk[1].trim();
     if (line.startsWith('peer:')) {
       if (current) peers.push(current);
       current = {
-        publicKey: line.replace('peer:', '').trim(),
+        publicKey: line.replace(/^peer:\s*/i, '').trim(),
         online: false,
         latestHandshake: '',
+        handshakeAgeMs: null,
         transfer: '',
+        transferRx: '',
+        transferTx: '',
         endpoint: '',
       };
       continue;
@@ -132,21 +182,31 @@ function parseWgShow(raw) {
     if (t.startsWith('endpoint:')) current.endpoint = t.slice(9).trim();
     if (t.startsWith('latest handshake:')) {
       current.latestHandshake = t.slice(17).trim();
-      // rough: if handshake text exists and not "never", treat online if seconds-like recent — panel already has logic; here mark if not empty
-      current.online = !/never/i.test(current.latestHandshake);
+      current.handshakeAgeMs = parseHandshakeToMs(current.latestHandshake);
+      current.online =
+        current.handshakeAgeMs !== null && current.handshakeAgeMs <= 3 * 60 * 1000;
     }
-    if (t.startsWith('transfer:')) current.transfer = t.slice(9).trim();
+    if (t.startsWith('transfer:')) {
+      current.transfer = t.slice(9).trim();
+      const m = current.transfer.match(
+        /([\d.]+\s*\w+)\s*received,\s*([\d.]+\s*\w+)\s*sent/i
+      );
+      if (m) {
+        current.transferRx = m[1].trim();
+        current.transferTx = m[2].trim();
+      }
+    }
   }
   if (current) peers.push(current);
-  return { up: ifaceUp, peers };
+  return { up: ifaceUp, peers, listeningPort, publicKey };
 }
 
 async function getInterfaceStatus(name) {
   const r = await run('wg', ['show', name]);
   if (!r.ok && /Unable to access|No such device|does not exist/i.test(r.stderr + r.stdout)) {
-    return { up: false, peers: [], raw: r.stderr || r.stdout };
+    return { up: false, peers: [], raw: r.stderr || r.stdout, listeningPort: null };
   }
-  if (!r.ok) return { up: false, peers: [], raw: r.stderr || r.stdout };
+  if (!r.ok) return { up: false, peers: [], raw: r.stderr || r.stdout, listeningPort: null };
   const parsed = parseWgShow(r.stdout);
   return { ...parsed, raw: r.stdout };
 }
@@ -213,7 +273,6 @@ function rewriteConfigPost(config, postUp, postDown) {
     }
     out.push(line);
   }
-  // insert after PrivateKey if missing
   if (!sawUp || !sawDown) {
     const idx = out.findIndex((l) => /^PrivateKey\s*=/.test(l));
     const insertAt = idx >= 0 ? idx + 1 : 1;
@@ -225,16 +284,83 @@ function rewriteConfigPost(config, postUp, postDown) {
   return out.join('\n');
 }
 
+async function ensureIptables(iface, egress) {
+  enableForward();
+  const ensure = async (args) => {
+    const c = await run('iptables', ['-C', ...args]);
+    if (!c.ok) await run('iptables', ['-A', ...args]);
+  };
+  await ensure(['FORWARD', '-i', iface, '-j', 'ACCEPT']);
+  await ensure(['FORWARD', '-o', iface, '-j', 'ACCEPT']);
+  const natC = await run('iptables', [
+    '-t',
+    'nat',
+    '-C',
+    'POSTROUTING',
+    '-o',
+    egress,
+    '-j',
+    'MASQUERADE',
+  ]);
+  if (!natC.ok) {
+    await run('iptables', [
+      '-t',
+      'nat',
+      '-A',
+      'POSTROUTING',
+      '-o',
+      egress,
+      '-j',
+      'MASQUERADE',
+    ]);
+  }
+}
+
+async function detectPublicIp() {
+  const urls = ['https://api.ipify.org', 'https://ifconfig.me/ip', 'https://icanhazip.com'];
+  for (const url of urls) {
+    try {
+      const r = await new Promise((resolve, reject) => {
+        const lib = url.startsWith('https') ? https : http;
+        const req = lib.get(url, { timeout: 4000 }, (res) => {
+          let d = '';
+          res.on('data', (c) => {
+            d += c;
+            if (d.length > 64) req.destroy();
+          });
+          res.on('end', () => resolve(d.trim()));
+        });
+        req.on('error', reject);
+        req.on('timeout', () => {
+          req.destroy();
+          reject(new Error('timeout'));
+        });
+      });
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(r)) return r;
+    } catch {
+      /* next */
+    }
+  }
+  return null;
+}
+
 async function applyConfigBundle(bundle, { forceExit = false } = {}) {
-  const iface = bundle.server?.interfaceName || 'wg0';
+  const iface = bundle.server?.interfaceName || cachedIface || 'wg0';
+  cachedIface = iface;
+  const local = loadLocalState();
+  local.interfaceName = iface;
+  saveLocalState(local);
+
   let confPath = bundle.server?.confPath || CONF_FALLBACK;
   let config = bundle.config;
   let egress = await detectEgress();
+  let postUp = bundle.server?.postUp || '';
+  let postDown = bundle.server?.postDown || '';
 
   if (forceExit) {
     enableForward();
-    const postUp = defaultPostUp(iface, egress);
-    const postDown = defaultPostDown(iface, egress);
+    postUp = defaultPostUp(iface, egress);
+    postDown = defaultPostDown(iface, egress);
     config = rewriteConfigPost(config, postUp, postDown);
   }
 
@@ -249,10 +375,11 @@ async function applyConfigBundle(bundle, { forceExit = false } = {}) {
   fs.writeFileSync(confPath, config, { mode: 0o600 });
   fs.writeFileSync(path.join(DATA_DIR, `${iface}.conf`), config, { mode: 0o600 });
 
-  // up or sync
   const show = await run('wg', ['show', iface]);
-  const isUp = show.ok && !/Unable to access|No such device|does not exist/i.test(show.stderr + show.stdout);
+  const isUp =
+    show.ok && !/Unable to access|No such device|does not exist/i.test(show.stderr + show.stdout);
 
+  let action = '';
   if (isUp) {
     const strip = await run('wg-quick', ['strip', iface]);
     if (strip.ok) {
@@ -260,7 +387,6 @@ async function applyConfigBundle(bundle, { forceExit = false } = {}) {
       fs.writeFileSync(stripped, strip.stdout + '\n', { mode: 0o600 });
       const sync = await run('wg', ['syncconf', iface, stripped]);
       if (!sync.ok) {
-        // fallback restart
         await run('wg-quick', ['down', iface]);
         const up = await run('wg-quick', ['up', iface], 30000);
         if (!up.ok) {
@@ -268,64 +394,97 @@ async function applyConfigBundle(bundle, { forceExit = false } = {}) {
             ok: false,
             message: `热重载失败且重启失败: ${sync.stderr || up.stderr}`,
             egress,
+            postUp,
+            postDown,
           };
         }
-        return { ok: true, message: `已重启 ${iface}`, egress, confPath };
+        action = 'restart';
+      } else {
+        action = 'syncconf';
+        // syncconf 不跑 PostUp
+        if (forceExit || /MASQUERADE/i.test(postUp || config)) {
+          await ensureIptables(iface, egress);
+        }
       }
-      // re-run PostUp is not done by syncconf — if forceExit, try ensure forward + iptables quickly
-      if (forceExit) {
-        enableForward();
-        await run('iptables', ['-C', 'FORWARD', '-i', iface, '-j', 'ACCEPT']).then(async (c) => {
-          if (!c.ok) await run('iptables', ['-A', 'FORWARD', '-i', iface, '-j', 'ACCEPT']);
-        });
-        await run('iptables', ['-C', 'FORWARD', '-o', iface, '-j', 'ACCEPT']).then(async (c) => {
-          if (!c.ok) await run('iptables', ['-A', 'FORWARD', '-o', iface, '-j', 'ACCEPT']);
-        });
-        await run('iptables', [
-          '-t',
-          'nat',
-          '-C',
-          'POSTROUTING',
-          '-o',
+    } else {
+      await run('wg-quick', ['down', iface]);
+      const up = await run('wg-quick', ['up', iface], 30000);
+      if (!up.ok) {
+        return {
+          ok: false,
+          message: `重启失败: ${up.stderr || up.stdout}`,
           egress,
-          '-j',
-          'MASQUERADE',
-        ]).then(async (c) => {
-          if (!c.ok) {
-            await run('iptables', [
-              '-t',
-              'nat',
-              '-A',
-              'POSTROUTING',
-              '-o',
-              egress,
-              '-j',
-              'MASQUERADE',
-            ]);
-          }
-        });
+          postUp,
+          postDown,
+        };
       }
-      return { ok: true, message: `已热重载 ${iface}`, egress, confPath };
+      action = 'restart';
     }
-    await run('wg-quick', ['down', iface]);
+  } else {
+    const up = await run('wg-quick', ['up', iface], 30000);
+    if (!up.ok) {
+      return {
+        ok: false,
+        message: `wg-quick up 失败: ${up.stderr || up.stdout}`,
+        egress,
+        confPath,
+        postUp,
+        postDown,
+      };
+    }
+    action = 'up';
   }
 
-  const up = await run('wg-quick', ['up', iface], 30000);
-  if (!up.ok) {
+  // 校验
+  const live = await getInterfaceStatus(iface);
+  const expected = Number(bundle.expectedPeers || 0);
+  const livePeers = live.peers?.length || 0;
+  const warnings = [];
+  if (!live.up) {
     return {
       ok: false,
-      message: `wg-quick up 失败: ${up.stderr || up.stdout}`,
+      message: '配置已写入但接口未运行',
       egress,
       confPath,
-      config,
+      postUp,
+      postDown,
+      action,
     };
   }
-  return { ok: true, message: `已启动 ${iface}`, egress, confPath };
+  if (expected > 0 && livePeers < expected) {
+    warnings.push(`peer ${livePeers}/${expected}`);
+  }
+  if (Array.isArray(bundle.skippedClients) && bundle.skippedClients.length) {
+    warnings.push(`跳过客户端: ${bundle.skippedClients.join(',')}`);
+  }
+
+  return {
+    ok: true,
+    message:
+      (action === 'syncconf'
+        ? `已热重载 ${iface}`
+        : action === 'restart'
+          ? `已重启 ${iface}`
+          : `已启动 ${iface}`) + (warnings.length ? `（${warnings.join('; ')}）` : ''),
+    egress,
+    egressIface: egress,
+    confPath,
+    postUp,
+    postDown,
+    action,
+    livePeers,
+    expectedPeers: expected,
+    warnings,
+  };
 }
 
-async function collectStatus() {
-  const iface = process.env.WG_IFACE || 'wg0';
-  const ifaceStatus = await getInterfaceStatus(iface);
+async function collectStatus(ifaceName) {
+  const iface = ifaceName || cachedIface || process.env.WG_IFACE || 'wg0';
+  const local = loadLocalState();
+  if (local.interfaceName) cachedIface = local.interfaceName;
+  const useIface = local.interfaceName || iface;
+
+  const ifaceStatus = await getInterfaceStatus(useIface);
   let forward = null;
   try {
     forward = fs.readFileSync('/proc/sys/net/ipv4/ip_forward', 'utf8').trim() === '1';
@@ -337,11 +496,26 @@ async function collectStatus() {
   const nat = await run('iptables', ['-t', 'nat', '-S', 'POSTROUTING']);
   if (nat.ok) natActive = /MASQUERADE|SNAT/i.test(nat.stdout);
 
+  // 出网 IP 探测不要太勤：约 5 分钟一次
+  let exitPublicIp = local.exitPublicIp || null;
+  const lastProbe = local.exitIpAt || 0;
+  if (Date.now() - lastProbe > 5 * 60 * 1000) {
+    const ip = await detectPublicIp();
+    if (ip) {
+      exitPublicIp = ip;
+      local.exitPublicIp = ip;
+      local.exitIpAt = Date.now();
+      saveLocalState(local);
+    }
+  }
+
   return {
     interface: ifaceStatus,
+    interfaceName: useIface,
     forward,
     egressIface: egress,
     natActive,
+    exitPublicIp,
     hostname: os.hostname(),
     time: new Date().toISOString(),
   };
@@ -350,17 +524,26 @@ async function collectStatus() {
 async function handleJob(job) {
   console.log(`[wg-agent] 执行任务 ${job.type} (${job.id})`);
   if (job.type === 'apply' || job.type === 'exit') {
-    // fetch full bundle
     const bundle = await request('GET', '/api/agent/bundle');
+    if (bundle.server?.interfaceName) {
+      cachedIface = bundle.server.interfaceName;
+    }
     const result = await applyConfigBundle(bundle, { forceExit: job.type === 'exit' });
     return {
       ok: result.ok,
       message: result.message,
       detail: {
         egress: result.egress,
+        egressIface: result.egressIface || result.egress,
         confPath: result.confPath,
         configHash: bundle.configHash,
         exit: job.type === 'exit',
+        postUp: result.postUp || '',
+        postDown: result.postDown || '',
+        action: result.action,
+        livePeers: result.livePeers,
+        expectedPeers: result.expectedPeers,
+        warnings: result.warnings || [],
       },
     };
   }
@@ -380,10 +563,17 @@ async function tick() {
       arch: process.arch,
       node: process.version,
       uptime: os.uptime(),
+      iface: status.interfaceName,
     },
     status,
   };
   const res = await request('POST', '/api/agent/heartbeat', body);
+  if (res.interfaceName) {
+    cachedIface = res.interfaceName;
+    const local = loadLocalState();
+    local.interfaceName = res.interfaceName;
+    saveLocalState(local);
+  }
   const jobs = res.jobs || [];
   for (const job of jobs) {
     let result;
@@ -399,7 +589,9 @@ async function tick() {
         message: result.message,
         detail: result.detail || null,
       });
-      console.log(`[wg-agent] 任务结果 ${job.id}: ${result.ok ? 'ok' : 'fail'} ${result.message}`);
+      console.log(
+        `[wg-agent] 任务结果 ${job.id}: ${result.ok ? 'ok' : 'fail'} ${result.message}`
+      );
     } catch (err) {
       console.error('[wg-agent] 上报任务结果失败:', err.message);
     }
@@ -408,11 +600,13 @@ async function tick() {
 
 async function main() {
   ensureDir(DATA_DIR);
+  const local = loadLocalState();
+  if (local.interfaceName) cachedIface = local.interfaceName;
+
   console.log(`[wg-agent] v${VERSION}`);
   console.log(`[wg-agent] 面板: ${PANEL_URL}`);
   console.log(`[wg-agent] 轮询: ${INTERVAL}s`);
 
-  // register / first hello
   try {
     await request('POST', '/api/agent/hello', {
       hostname: os.hostname(),

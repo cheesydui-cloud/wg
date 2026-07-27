@@ -269,26 +269,54 @@ function renderLogin() {
         <div class="logo">M</div>
         <h1>登录</h1>
         <p class="muted">mieru 出口管理 v${esc(state.status?.version || '')}</p>
-        <label>用户名</label>
-        <input class="field" id="li-user" value="${esc(state.status?.defaultUsername || 'admin')}" />
-        <label>密码</label>
-        <input class="field" id="li-pass" type="password" />
-        <button class="btn btn-primary btn-block" id="li-go">登录</button>
+        <form id="li-form" autocomplete="on">
+          <label for="li-user">用户名</label>
+          <input class="field" id="li-user" name="username" type="text" autocomplete="username"
+            autocapitalize="off" spellcheck="false"
+            value="${esc(state.status?.defaultUsername || 'admin')}" />
+          <label for="li-pass">密码</label>
+          <div class="field-with-btn">
+            <input class="field" id="li-pass" name="password" type="text" inputmode="text"
+              autocomplete="current-password" autocapitalize="off" spellcheck="false"
+              placeholder="点这里输入密码" />
+            <button type="button" class="btn btn-ghost" id="li-toggle" title="显示/隐藏">隐藏</button>
+          </div>
+          <p class="field-hint">若输入框无法改：点一次密码框，全选后直接输入；或用下方「命令行重置」。</p>
+          <button type="submit" class="btn btn-primary btn-block" id="li-go">登录</button>
+        </form>
       </div>
     </div>`;
-  const go = async () => {
+  const passEl = document.getElementById('li-pass');
+  // 默认明文，方便远程面板/VNC 输入；可点「隐藏」变回密文
+  let hidden = false;
+  document.getElementById('li-toggle').onclick = () => {
+    hidden = !hidden;
+    passEl.type = hidden ? 'password' : 'text';
+    document.getElementById('li-toggle').textContent = hidden ? '显示' : '隐藏';
+  };
+  const go = async (e) => {
+    e?.preventDefault?.();
     try {
       await api('/api/login', {
         method: 'POST',
-        body: { username: val('li-user'), password: val('li-pass') },
+        body: {
+          username: document.getElementById('li-user').value.trim() || 'admin',
+          // 密码不要 trim 尾部空格以外的内容；仅去掉首尾空白
+          password: document.getElementById('li-pass').value,
+        },
       });
       await boot();
-    } catch (e) {
-      toast(e.message, 'err');
+    } catch (err) {
+      toast(err.message, 'err');
+      passEl.focus();
+      passEl.select();
     }
   };
-  document.getElementById('li-go').onclick = go;
-  document.getElementById('li-pass').onkeydown = (e) => e.key === 'Enter' && go();
+  document.getElementById('li-form').onsubmit = go;
+  setTimeout(() => {
+    passEl.focus();
+    passEl.select();
+  }, 50);
 }
 
 function shell(content) {

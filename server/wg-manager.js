@@ -276,7 +276,9 @@ function ensureServerKeys(state) {
 }
 
 function defaultPostUp(interfaceName, egressIface = 'eth0') {
+  // 接口起来时确保转发开启，并做 FORWARD + SNAT(MASQUERADE)
   return (
+    `sysctl -w net.ipv4.ip_forward=1; ` +
     `iptables -A FORWARD -i ${interfaceName} -j ACCEPT; ` +
     `iptables -A FORWARD -o ${interfaceName} -j ACCEPT; ` +
     `iptables -t nat -A POSTROUTING -o ${egressIface} -j MASQUERADE`
@@ -289,6 +291,209 @@ function defaultPostDown(interfaceName, egressIface = 'eth0') {
     `iptables -D FORWARD -o ${interfaceName} -j ACCEPT; ` +
     `iptables -t nat -D POSTROUTING -o ${egressIface} -j MASQUERADE`
   );
+}
+
+function hasNatTemplate(postUp = '', egressIface = '') {
+  const s = String(postUp || '');
+  if (!/MASQUERADE/i.test(s) && !/SNAT/i.test(s)) return false;
+  if (egressIface && !s.includes(egressIface)) return true; // 有 NAT 但网卡名可能不同，仍算配置了
+  return true;
+}
+
+async function checkMasqueradeActive(egressIface) {
+  const r = await runCmd('iptables', ['-t', 'nat', '-S', 'POSTROUTING']);
+  if (!r.ok) {
+    return {
+      ok: false,
+      active: false,
+      detail: r.stderr || '无法读取 iptables NAT 规则（需要 root 或 iptables）',
+      rules: '',
+    };
+  }
+  const rules = r.stdout || '';
+  const lines = rules.split('\n').filter((l) => /MASQUERADE|SNAT/i.test(l));
+  const matched = egressIface
+    ? lines.filter((l) => l.includes(`-o ${egressIface}`) || l.includes(egressIface))
+    : lines;
+  return {
+    ok: true,
+    active: matched.length > 0 || lines.length > 0,
+    matchedEgress: matched.length > 0,
+    detail:
+      matched.length > 0
+        ? `已生效（出口 ${egressIface || '任意'}）`
+        : lines.length > 0
+          ? '系统有 MASQUERADE，但出口网卡可能不一致'
+          : '尚未生效（需应用配置并启动接口）',
+    rules: lines.join('\n'),
+  };
+}
+
+function enableIpForwardPersistent() {
+  const results = { runtime: false, persistent: false, messages: [] };
+  try {
+    if (fs.existsSync('/proc/sys/net/ipv4/ip_forward')) {
+      fs.writeFileSync('/proc/sys/net/ipv4/ip_forward', '1\n');
+      results.runtime = true;
+      results.messages.push('已开启运行时 ip_forward');
+    }
+  } catch (err) {
+    results.messages.push(`运行时开启失败: ${err.message}`);
+  }
+  try {
+    const confDir = '/etc/sysctl.d';
+    const confFile = path.join(confDir, '99-wireguard-forward.conf');
+    if (!fs.existsSync(confDir)) fs.mkdirSync(confDir, { recursive: true });
+    fs.writeFileSync(confFile, 'net.ipv4.ip_forward=1\n', 'utf8');
+    results.persistent = true;
+    results.messages.push(`已写入 ${confFile}`);
+  } catch (err) {
+    results.messages.push(`持久化失败: ${err.message}（可能无 root 权限）`);
+  }
+  return results;
+}
+
+async function getExitStatus(state) {
+  const iface = state.server?.interfaceName || 'wg0';
+  const egress = await detectDefaultInterface();
+  const forward = ipForwardEnabled();
+  const natConfigured = hasNatTemplate(state.server?.postUp, egress.iface);
+  const natLive = await checkMasqueradeActive(egress.iface);
+  const ifaceStatus = await getInterfaceStatus(iface);
+  const exitIp = await detectPublicIp();
+  const fullTunnelCount = (state.clients || []).filter((c) => {
+    const a = String(c.allowedIPs || '');
+    return a.includes('0.0.0.0/0');
+  }).length;
+
+  const ready =
+    forward === true &&
+    natConfigured &&
+    Boolean(state.server?.endpoint) &&
+    ifaceStatus.up &&
+    natLive.active;
+
+  return {
+    ok: true,
+    ready,
+    forward,
+    egressIface: egress.iface,
+    egress: egress,
+    natConfigured,
+    natActive: natLive.active,
+    natDetail: natLive.detail,
+    natRules: natLive.rules,
+    interfaceUp: ifaceStatus.up,
+    interfaceName: iface,
+    endpoint: state.server?.endpoint || '',
+    postUp: state.server?.postUp || '',
+    postDown: state.server?.postDown || '',
+    exitPublicIp: exitIp.ok ? exitIp.ip : null,
+    exitIpSource: exitIp.ok ? exitIp.source : null,
+    fullTunnelClients: fullTunnelCount,
+    clientCount: (state.clients || []).length,
+    tips: [
+      !state.server?.endpoint ? '请先填写 Endpoint（客户端连接地址）' : null,
+      forward === false ? 'IPv4 转发未开启' : null,
+      !natConfigured ? '尚未配置 NAT（PostUp MASQUERADE）' : null,
+      !ifaceStatus.up ? 'WireGuard 接口未启动，请先应用配置' : null,
+      natConfigured && ifaceStatus.up && !natLive.active
+        ? 'NAT 已写入配置但未在 iptables 生效，请重新应用'
+        : null,
+    ].filter(Boolean),
+  };
+}
+
+/**
+ * 一键落地：开转发 + 写 NAT + 可选全局代理客户端 + 可选立即应用
+ */
+async function setupExit(state, opts = {}) {
+  const iface = state.server.interfaceName || 'wg0';
+  const egress = await detectDefaultInterface();
+  const egressIface = opts.egressIface || egress.iface || 'eth0';
+  const steps = [];
+
+  const forwardResult = enableIpForwardPersistent();
+  const forwardNow = forwardResult.runtime || ipForwardEnabled() === true;
+  steps.push({
+    id: 'ip_forward',
+    // 即使当前无权限写 sysctl，PostUp 里也有 sysctl -w，接口启动时会再开一次
+    ok: true,
+    warn: !forwardNow,
+    title: 'IPv4 转发',
+    detail: forwardNow
+      ? forwardResult.messages.join('；')
+      : `${forwardResult.messages.join('；') || '当前未能立即开启'}；将在接口 PostUp 时再次尝试`,
+  });
+
+  state.server.postUp = defaultPostUp(iface, egressIface);
+  state.server.postDown = defaultPostDown(iface, egressIface);
+  steps.push({
+    id: 'nat',
+    ok: true,
+    title: 'NAT 规则',
+    detail: `已写入 PostUp/PostDown，出口网卡 ${egressIface}`,
+  });
+
+  let clientsUpdated = 0;
+  if (opts.fullTunnelClients !== false) {
+    for (const c of state.clients || []) {
+      const next = '0.0.0.0/0, ::/0';
+      if (c.allowedIPs !== next) {
+        c.allowedIPs = next;
+        c.updatedAt = new Date().toISOString();
+        clientsUpdated += 1;
+      }
+      if (!c.persistentKeepalive) {
+        c.persistentKeepalive = 25;
+        c.updatedAt = new Date().toISOString();
+      }
+    }
+    steps.push({
+      id: 'clients',
+      ok: true,
+      title: '客户端全局代理',
+      detail:
+        clientsUpdated > 0
+          ? `已将 ${clientsUpdated} 个客户端设为 0.0.0.0/0, ::/0`
+          : '客户端已是全局代理或暂无客户端',
+    });
+  }
+
+  let applyResult = null;
+  if (opts.apply) {
+    applyResult = await applyConfig(state);
+    steps.push({
+      id: 'apply',
+      ok: Boolean(applyResult?.ok),
+      title: '应用到服务器',
+      detail: applyResult?.message || (applyResult?.ok ? '已应用' : '应用失败'),
+    });
+  } else {
+    steps.push({
+      id: 'apply',
+      ok: true,
+      title: '应用到服务器',
+      detail: '已保存配置，尚未应用（可在面板点击应用）',
+      skipped: true,
+    });
+  }
+
+  const status = await getExitStatus(state);
+  return {
+    ok: steps.every((s) => s.ok || s.skipped),
+    egressIface,
+    clientsUpdated,
+    applied: Boolean(opts.apply && applyResult?.ok),
+    applyResult,
+    steps,
+    status,
+    message: opts.apply
+      ? applyResult?.ok
+        ? `落地已配置并应用（出口 ${egressIface}）`
+        : `落地规则已写入，但应用失败：${applyResult?.message || ''}`
+      : `落地规则已写入（出口 ${egressIface}），请点击「应用」生效`,
+  };
 }
 
 async function detectDefaultInterface() {
@@ -665,6 +870,10 @@ module.exports = {
   peerAllowedIps,
   isValidClientAddress,
   normalizeClientAddress,
+  enableIpForwardPersistent,
+  getExitStatus,
+  setupExit,
+  checkMasqueradeActive,
   preflight,
   applyConfig,
   stopInterface,

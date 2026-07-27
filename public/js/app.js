@@ -295,6 +295,7 @@ function renderDashboard() {
       </div>
       <div class="header-actions">
         <button class="btn btn-ghost" id="dash-add">添加客户端</button>
+        <button class="btn btn-primary" id="dash-exit">一键落地</button>
         <button class="btn btn-success" id="dash-apply">应用到服务器</button>
       </div>
     </div>
@@ -331,21 +332,21 @@ function renderDashboard() {
           </span></div>
         </div>
         <div class="btn-row" style="margin-top:14px">
-          <button class="btn btn-sm btn-ghost" id="dash-fill-ip">填公网 IP</button>
           <button class="btn btn-sm btn-ghost" id="dash-preflight">预检</button>
           <button class="btn btn-sm btn-ghost" data-nav-jump="server">设置</button>
         </div>
       </div>
       <div class="card">
-        <h3>快速开始</h3>
-        <div class="guide">
-          <ol>
-            <li>确认 Endpoint（可用「填公网 IP」）</li>
-            <li>添加客户端并扫码导入</li>
-            <li>预检通过后点「应用到服务器」</li>
-            <li>防火墙放行 UDP ${esc(s.listenPort || 51820)}</li>
-          </ol>
+        <div class="card-head">
+          <h3>落地 / 网关</h3>
+          <button class="btn btn-sm btn-ghost" id="dash-exit-refresh">刷新</button>
         </div>
+        <div id="exit-status-box" class="muted small">点击刷新查看转发、NAT、出口状态</div>
+        <div class="btn-row" style="margin-top:14px">
+          <button class="btn btn-sm btn-primary" id="dash-exit-2">一键落地</button>
+          <button class="btn btn-sm btn-ghost" id="dash-exit-status">查看详情</button>
+        </div>
+        <p class="field-hint" style="margin-top:10px">一键落地会：开转发、写 NAT、客户端改为全局代理，并应用配置</p>
       </div>
     </div>
 
@@ -386,10 +387,14 @@ function bindDashboard() {
   document.getElementById('dash-add-2')?.addEventListener('click', add);
   document.getElementById('dash-apply')?.addEventListener('click', applyConfig);
   document.getElementById('dash-preflight')?.addEventListener('click', showPreflight);
-  document.getElementById('dash-fill-ip')?.addEventListener('click', () => fillPublicIp(false));
+  document.getElementById('dash-exit')?.addEventListener('click', () => setupExit(true));
+  document.getElementById('dash-exit-2')?.addEventListener('click', () => setupExit(true));
+  document.getElementById('dash-exit-refresh')?.addEventListener('click', () => loadExitStatusBox());
+  document.getElementById('dash-exit-status')?.addEventListener('click', showExitStatus);
   document.querySelectorAll('[data-qr]').forEach((b) => {
     b.onclick = () => showClientQr(b.dataset.qr);
   });
+  loadExitStatusBox();
 }
 
 function renderClients() {
@@ -551,15 +556,17 @@ function renderServer() {
         </label>
       </div>
       <div class="card">
-        <h3>密钥与 NAT</h3>
+        <h3>密钥与落地</h3>
         <div class="form-row">
           <label>服务器公钥</label>
           <input class="field mono" readonly value="${esc(s.publicKey || '')}" />
         </div>
         <div class="btn-row" style="margin-bottom:12px">
-          <button class="btn btn-sm btn-ghost" id="srv-regen">重置密钥</button>
+          <button class="btn btn-sm btn-primary" id="srv-exit">一键落地</button>
+          <button class="btn btn-sm btn-ghost" id="srv-exit-status">落地状态</button>
+          <button class="btn btn-sm btn-ghost" id="srv-nat">仅填 NAT</button>
           <button class="btn btn-sm btn-ghost" id="srv-view-conf">预览配置</button>
-          <button class="btn btn-sm btn-ghost" id="srv-nat">NAT 模板</button>
+          <button class="btn btn-sm btn-ghost" id="srv-regen">重置密钥</button>
         </div>
         <div class="form-row">
           <label>PostUp</label>
@@ -568,7 +575,7 @@ function renderServer() {
         <div class="form-row">
           <label>PostDown</label>
           <textarea class="textarea mono" id="s-postDown">${esc(s.postDown || '')}</textarea>
-          <div class="field-hint">NAT 模板会自动识别出口网卡</div>
+          <div class="field-hint">「一键落地」= 开转发 + NAT + 客户端全局代理 + 应用。商家机器请手动确认 Endpoint，勿依赖探测。</div>
         </div>
       </div>
     </div>`;
@@ -605,6 +612,8 @@ function bindServer() {
       toast(res.tip || '已填入 NAT 模板');
     } catch (ex) { toast(ex.message, 'err'); }
   };
+  document.getElementById('srv-exit').onclick = () => setupExit(true);
+  document.getElementById('srv-exit-status').onclick = showExitStatus;
   document.getElementById('srv-regen').onclick = async () => {
     if (!confirm('重置服务器密钥后，所有客户端都需要重新导入。继续？')) return;
     try {
@@ -1183,10 +1192,130 @@ async function fillPublicIp(intoServerField = false) {
     }
     state.server = res.server || state.server;
     state.dirty = Boolean(res.dirty);
-    toast('Endpoint：' + res.endpoint);
+    toast('Endpoint：' + res.endpoint + '（有入口前置的机器请人工核对）', 'warn');
     if (!intoServerField) render();
   } catch (ex) {
     toast(ex.message || '探测失败', 'err');
+  }
+}
+
+function exitStatusHtml(st) {
+  if (!st) return '<span class="muted">暂无数据</span>';
+  const row = (label, ok, text) =>
+    `<div class="kv"><span>${label}</span><span><span class="badge ${ok ? 'ok' : 'warn'}">${ok ? '正常' : '待处理'}</span> ${esc(text || '')}</span></div>`;
+  return `
+    <div class="alert ${st.ready ? 'ok' : 'warn'}" style="margin-bottom:12px">
+      <div><strong>${st.ready ? '落地条件已就绪' : '落地尚未完全就绪'}</strong>
+      ${st.exitPublicIp ? ` · 出口 IP ${esc(st.exitPublicIp)}` : ''}</div>
+    </div>
+    <div class="kvs">
+      ${row('IPv4 转发', st.forward === true, st.forward === true ? '已开启' : st.forward === false ? '未开启' : '无法检测')}
+      ${row('NAT 配置', st.natConfigured, st.natConfigured ? `PostUp 已含 MASQUERADE` : '未配置')}
+      ${row('NAT 生效', st.natActive, st.natDetail || '')}
+      ${row('接口', st.interfaceUp, st.interfaceName || 'wg0')}
+      ${row('出口网卡', Boolean(st.egressIface), st.egressIface || '-')}
+      ${row('Endpoint', Boolean(st.endpoint), st.endpoint || '未设置')}
+      ${row('全局代理客户端', true, `${st.fullTunnelClients || 0} / ${st.clientCount || 0}`)}
+    </div>
+    ${(st.tips || []).length ? `<ul class="small muted" style="margin:12px 0 0;padding-left:1.1rem">${st.tips.map((t) => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}`;
+}
+
+async function loadExitStatusBox() {
+  const box = document.getElementById('exit-status-box');
+  if (!box) return;
+  try {
+    const st = await api('/api/exit/status');
+    state.exitStatus = st;
+    box.innerHTML = `
+      <div class="kvs" style="margin:0">
+        <div class="kv"><span>状态</span><span class="badge ${st.ready ? 'ok' : 'warn'}">${st.ready ? '就绪' : '未就绪'}</span></div>
+        <div class="kv"><span>转发</span><span>${st.forward === true ? '开' : st.forward === false ? '关' : '?'}</span></div>
+        <div class="kv"><span>NAT</span><span>${st.natActive ? '已生效' : st.natConfigured ? '已配置未生效' : '未配置'}</span></div>
+        <div class="kv"><span>出口网卡</span><span class="mono">${esc(st.egressIface || '-')}</span></div>
+        <div class="kv"><span>出口 IP</span><span class="mono">${esc(st.exitPublicIp || '未知')}</span></div>
+      </div>`;
+  } catch (ex) {
+    box.innerHTML = `<span class="muted">${esc(ex.message)}</span>`;
+  }
+}
+
+async function showExitStatus() {
+  try {
+    const st = await api('/api/exit/status');
+    state.exitStatus = st;
+    state.modal = {
+      title: '落地状态',
+      body: `
+        ${exitStatusHtml(st)}
+        <div class="actions-end">
+          <button class="btn btn-ghost" id="ex-close">关闭</button>
+          <button class="btn btn-primary" id="ex-setup">一键落地</button>
+        </div>`,
+      after() {
+        document.getElementById('ex-close').onclick = closeModal;
+        document.getElementById('ex-setup').onclick = () => {
+          closeModal();
+          setupExit(true);
+        };
+      },
+    };
+    renderModal(state.modal);
+  } catch (ex) {
+    toast(ex.message, 'err');
+  }
+}
+
+async function setupExit(apply = true) {
+  const msg = apply
+    ? '将开启转发、配置 NAT、把客户端改为全局代理，并立即应用到服务器。\n\n已有客户端需重新扫码/导入。继续？'
+    : '将写入落地规则（不立即应用）。继续？';
+  if (!confirm(msg)) return;
+  try {
+    toast('正在配置落地…', 'warn');
+    const res = await api('/api/exit/setup', {
+      method: 'POST',
+      body: {
+        apply: apply !== false,
+        fullTunnelClients: true,
+      },
+    });
+    if (res.server) state.server = res.server;
+    state.dirty = Boolean(res.dirty);
+    state.exitStatus = res.status || null;
+    toast(res.message || (res.ok ? '落地完成' : '落地未完全成功'), res.ok ? 'ok' : 'err');
+
+    state.modal = {
+      title: res.ok ? '落地完成' : '落地结果',
+      body: `
+        <div class="alert ${res.ok ? 'ok' : 'warn'}" style="margin-bottom:12px">
+          <div>${esc(res.message || '')}</div>
+        </div>
+        <div class="table-wrap"><table style="min-width:0">
+          <thead><tr><th>步骤</th><th>结果</th><th>说明</th></tr></thead>
+          <tbody>
+            ${(res.steps || []).map((s) => `
+              <tr>
+                <td>${esc(s.title)}</td>
+                <td><span class="badge ${s.ok ? 'ok' : s.skipped ? 'muted' : 'err'}">${s.ok ? '完成' : s.skipped ? '跳过' : '失败'}</span></td>
+                <td class="small muted">${esc(s.detail || '')}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table></div>
+        ${res.status ? `<div style="margin-top:12px">${exitStatusHtml(res.status)}</div>` : ''}
+        <p class="small muted" style="margin-top:12px">手机请删除旧隧道后重新扫码。连上后访问 ifconfig.me，应显示服务器出口 IP。</p>
+        <div class="actions-end">
+          <button class="btn btn-primary" id="ex-done">知道了</button>
+        </div>`,
+      after() {
+        document.getElementById('ex-done').onclick = async () => {
+          closeModal();
+          await refreshAndRender();
+        };
+      },
+    };
+    renderModal(state.modal);
+  } catch (ex) {
+    toast(ex.data?.message || ex.message || '落地失败', 'err');
   }
 }
 

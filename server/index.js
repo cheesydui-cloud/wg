@@ -308,6 +308,57 @@ app.post('/api/server/nat-template', async (req, res) => {
   });
 });
 
+// ---------- 落地 / 网关出口 ----------
+
+app.get('/api/exit/status', async (req, res) => {
+  try {
+    const status = await wg.getExitStatus(state);
+    res.json(status);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * 一键落地：
+ * - 开启 IPv4 转发（运行时 + sysctl.d 持久化）
+ * - 自动识别出口网卡并写入 NAT PostUp/PostDown
+ * - 默认把客户端 AllowedIPs 设为全局代理
+ * - apply=true 时立即写入系统并启动/重载接口
+ */
+app.post('/api/exit/setup', async (req, res) => {
+  try {
+    const body = req.body || {};
+    // 应用前先修客户端空 IP
+    for (const c of state.clients || []) {
+      if (c.enabled === false) continue;
+      if (wg.isValidClientAddress(c.address)) continue;
+      c.address = wg.nextClientAddress(
+        state.server.address,
+        state.clients.filter((x) => x.id !== c.id)
+      );
+      c.updatedAt = new Date().toISOString();
+    }
+
+    const result = await wg.setupExit(state, {
+      apply: body.apply !== false,
+      fullTunnelClients: body.fullTunnelClients !== false,
+      egressIface: body.egressIface || undefined,
+    });
+    persist();
+    const iface = await wg.getInterfaceStatus(state.server.interfaceName);
+    res.status(result.ok && (result.applied || body.apply === false) ? 200 : 500).json({
+      ...result,
+      server: publicServer(state.server),
+      interface: iface,
+      dirty: wg.isDirty(state),
+      lastAppliedAt: state.lastAppliedAt,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.get('/api/server/config', (req, res) => {
   wg.ensureServerKeys(state);
   const config = wg.buildServerConfig(state);

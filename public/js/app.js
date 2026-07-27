@@ -62,6 +62,38 @@ function toast(msg, type = 'ok') {
   setTimeout(() => t.remove(), 3200);
 }
 
+/** HTTP 非安全上下文下 clipboard API 常不可用，用 textarea 回退 */
+async function copyText(text) {
+  const value = String(text ?? '');
+  if (!value) throw new Error('没有可复制的内容');
+  // 优先异步 clipboard（仅 https / localhost 可靠）
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      /* fallback */
+    }
+  }
+  const ta = document.createElement('textarea');
+  ta.value = value;
+  ta.setAttribute('readonly', '');
+  ta.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;opacity:0;';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  ta.setSelectionRange(0, value.length);
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch {
+    ok = false;
+  }
+  document.body.removeChild(ta);
+  if (!ok) throw new Error('复制失败，请手动长按/拖选文本复制');
+  return true;
+}
+
 function help(tip) {
   return `<span class="help" tabindex="0" data-tip="${esc(tip)}">?</span>`;
 }
@@ -785,24 +817,49 @@ function openAddNodeModal() {
 
 function showInstallCommand(res) {
   const cmd = res.installCommand || '';
+  const token = res.token || '';
   state.modal = {
     title: `安装 Agent — ${res.node?.name || ''}`,
     body: `
       <div class="alert ok" style="margin-bottom:12px">
         <div>节点已创建。请在<strong>落地服务器</strong>上以 root 执行下面命令。</div>
       </div>
-      <pre class="pre-box" id="install-cmd">${esc(cmd)}</pre>
-      <p class="small muted">Token（请妥善保存）：</p>
-      <pre class="pre-box">${esc(res.token || '')}</pre>
-      <div class="btn-row">
+      <label class="small muted">安装命令（可点选后 Ctrl/Cmd+C）</label>
+      <textarea class="textarea mono" id="install-cmd" readonly rows="4" style="margin-top:6px">${esc(cmd)}</textarea>
+      <label class="small muted" style="display:block;margin-top:12px">Token（请妥善保存）</label>
+      <textarea class="textarea mono" id="install-token" readonly rows="2" style="margin-top:6px">${esc(token)}</textarea>
+      <div class="btn-row" style="margin-top:12px">
         <button class="btn btn-primary" id="copy-install">复制安装命令</button>
+        <button class="btn btn-ghost" id="copy-token">复制 Token</button>
         <button class="btn btn-ghost" id="install-done">完成</button>
       </div>
-      <p class="field-hint" style="margin-top:12px">安装成功后回到节点列表，状态变为「在线」即可远程应用 / 落地。</p>`,
+      <p class="field-hint" style="margin-top:12px">若按钮无效：点一下文本框 → Ctrl+A 全选 → Ctrl+C 复制。安装成功后节点变为「在线」。</p>`,
     after() {
+      const selectAll = (id) => {
+        const box = document.getElementById(id);
+        if (!box) return;
+        box.focus();
+        box.select();
+      };
+      document.getElementById('install-cmd')?.addEventListener('focus', () => selectAll('install-cmd'));
+      document.getElementById('install-token')?.addEventListener('focus', () => selectAll('install-token'));
       document.getElementById('copy-install').onclick = async () => {
-        await navigator.clipboard.writeText(cmd);
-        toast('已复制');
+        try {
+          await copyText(cmd);
+          toast('安装命令已复制');
+        } catch (ex) {
+          selectAll('install-cmd');
+          toast(ex.message || '请手动复制', 'warn');
+        }
+      };
+      document.getElementById('copy-token').onclick = async () => {
+        try {
+          await copyText(token);
+          toast('Token 已复制');
+        } catch (ex) {
+          selectAll('install-token');
+          toast(ex.message || '请手动复制', 'warn');
+        }
       };
       document.getElementById('install-done').onclick = async () => {
         closeModal();
@@ -1453,8 +1510,12 @@ async function showClientQr(id) {
         <pre class="pre-box" style="margin-top:12px">${esc(data.config)}</pre>`,
       after() {
         document.getElementById('qr-copy').onclick = async () => {
-          await navigator.clipboard.writeText(data.config);
-          toast('已复制');
+          try {
+            await copyText(data.config);
+            toast('已复制');
+          } catch (ex) {
+            toast(ex.message || '请手动复制', 'warn');
+          }
         };
       },
     };
@@ -1476,8 +1537,12 @@ async function showServerConfig() {
         </div>`,
       after() {
         document.getElementById('sc-copy').onclick = async () => {
-          await navigator.clipboard.writeText(data.config);
-          toast('已复制');
+          try {
+            await copyText(data.config);
+            toast('已复制');
+          } catch (ex) {
+            toast(ex.message || '请手动复制', 'warn');
+          }
         };
       },
     };

@@ -194,6 +194,9 @@ function authMiddleware(getState) {
     if (!req.path.startsWith('/api/')) return next();
     if (req.path === '/api/login' || req.path === '/api/status' || req.path === '/api/health') return next();
 
+    // Agent API：由业务层用 Bearer token 校验节点，这里放行
+    if (req.path.startsWith('/api/agent/')) return next();
+
     const token = req.cookies?.wg_session || req.headers['x-session-token'];
     if (!isAuthed(token)) {
       return res.status(401).json({ error: '未登录或会话已过期', needLogin: true });

@@ -42,6 +42,7 @@ function defaultState() {
       confPath: '/etc/wireguard/wg0.conf',
     },
     clients: [],
+    nodes: [],
     settings: {
       theme: 'auto',
       language: 'zh',

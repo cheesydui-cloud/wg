@@ -19,10 +19,12 @@ const {
 } = require('./config');
 const auth = require('./auth');
 const wg = require('./wg-manager');
+const nodes = require('./nodes');
 
 ensureDataDir();
 auth.setSessionsFile(SESSIONS_FILE);
 let state = loadState();
+nodes.ensureNodes(state);
 
 if (!state.username) {
   state.username = auth.DEFAULT_USERNAME;
@@ -667,6 +669,325 @@ app.post('/api/import', (req, res) => {
   state.lastAppliedHash = null;
   persist();
   res.json({ ok: true, message: `已导入 ${state.clients.length} 个客户端`, dirty: true });
+});
+
+// ---------- 节点（中心面板 + 边缘 Agent） ----------
+
+function agentAuth(req, res) {
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7).trim() : req.headers['x-agent-token'];
+  const node = nodes.findNodeByToken(state, token);
+  if (!node) {
+    res.status(401).json({ error: '无效的 Agent Token' });
+    return null;
+  }
+  return node;
+}
+
+function panelBaseUrl(req) {
+  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').toString().split(',')[0].trim();
+  const host = (req.headers['x-forwarded-host'] || req.headers.host || `127.0.0.1:${PORT}`).toString();
+  return `${proto}://${host}`;
+}
+
+app.get('/install-agent.sh', (req, res) => {
+  res.type('text/plain; charset=utf-8');
+  res.sendFile(path.join(ROOT, 'install-agent.sh'));
+});
+
+app.get('/api/nodes', (req, res) => {
+  nodes.ensureNodes(state);
+  res.json({
+    nodes: state.nodes.map((n) => nodes.publicNode(n)),
+    count: state.nodes.length,
+  });
+});
+
+app.post('/api/nodes', (req, res) => {
+  const body = req.body || {};
+  const { node, token } = nodes.createNode(state, {
+    name: body.name,
+    note: body.note,
+  });
+  persist();
+  const base = body.panelUrl || panelBaseUrl(req);
+  res.status(201).json({
+    node: nodes.publicNode(node, { includeToken: true }),
+    token,
+    installCommand: nodes.installCommand({ panelUrl: base, token, name: node.name }),
+    panelUrl: base,
+    tip: '请复制安装命令，在「落地服务器」上以 root 执行。Token 请妥善保管。',
+  });
+});
+
+app.get('/api/nodes/:id', (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  res.json({
+    node: nodes.publicNode(node, { includeToken: Boolean(node.tokenPlain) }),
+    server: nodes.publicNodeServer(node.server),
+    clients: (node.clients || []).map((c) => nodes.publicNodeClient(c)),
+    jobs: (node.jobs || []).slice(0, 20),
+    tokenAvailable: Boolean(node.tokenPlain),
+  });
+});
+
+app.put('/api/nodes/:id', (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  const body = req.body || {};
+  if (body.name !== undefined) node.name = String(body.name).trim() || node.name;
+  if (body.note !== undefined) node.note = String(body.note);
+  if (body.server && typeof body.server === 'object') {
+    const fields = [
+      'interfaceName',
+      'listenPort',
+      'address',
+      'endpoint',
+      'dns',
+      'mtu',
+      'postUp',
+      'postDown',
+      'confPath',
+    ];
+    for (const f of fields) {
+      if (body.server[f] !== undefined) node.server[f] = body.server[f];
+    }
+    if (body.server.listenPort !== undefined) {
+      node.server.listenPort = Number(body.server.listenPort) || 51820;
+    }
+    if (body.server.mtu !== undefined) {
+      node.server.mtu =
+        body.server.mtu === '' || body.server.mtu === null ? null : Number(body.server.mtu);
+    }
+    if (body.server.regenerateKeys) {
+      const kp = wg.generateKeyPair();
+      node.server.privateKey = kp.privateKey;
+      node.server.publicKey = kp.publicKey;
+    }
+    nodes.markNodeDirty(node);
+  }
+  persist();
+  res.json({ node: nodes.publicNode(node), server: nodes.publicNodeServer(node.server) });
+});
+
+app.delete('/api/nodes/:id', (req, res) => {
+  const removed = nodes.deleteNode(state, req.params.id);
+  if (!removed) return res.status(404).json({ error: '节点不存在' });
+  persist();
+  res.json({ ok: true, removed: nodes.publicNode(removed) });
+});
+
+app.post('/api/nodes/:id/token', (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  const token = nodes.rotateNodeToken(node);
+  persist();
+  const base = req.body?.panelUrl || panelBaseUrl(req);
+  res.json({
+    ok: true,
+    token,
+    installCommand: nodes.installCommand({ panelUrl: base, token, name: node.name }),
+    tip: '旧 Token 已失效，请在目标机重新安装/更新 agent 环境变量',
+  });
+});
+
+app.get('/api/nodes/:id/install-command', (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  if (!node.tokenPlain) {
+    return res.status(400).json({
+      error: 'Token 仅在创建或轮换时可见，请点击「轮换 Token」生成新命令',
+    });
+  }
+  const base = req.query.panelUrl || panelBaseUrl(req);
+  res.json({
+    installCommand: nodes.installCommand({
+      panelUrl: base,
+      token: node.tokenPlain,
+      name: node.name,
+    }),
+    token: node.tokenPlain,
+    panelUrl: base,
+  });
+});
+
+app.post('/api/nodes/:id/clients', (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  const body = req.body || {};
+  const name = (body.name || '').trim() || `客户端-${(node.clients || []).length + 1}`;
+  let address = (body.address || '').trim();
+  if (!address) {
+    try {
+      address = wg.nextClientAddress(node.server.address, node.clients || []);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+  }
+  try {
+    address = wg.normalizeClientAddress(address);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  const kp = wg.generateKeyPair();
+  const client = {
+    id: crypto.randomUUID(),
+    name,
+    privateKey: kp.privateKey,
+    publicKey: kp.publicKey,
+    presharedKey: body.usePresharedKey === false ? '' : wg.generatePresharedKey(),
+    address,
+    allowedIPs: (body.allowedIPs && String(body.allowedIPs).trim()) || '0.0.0.0/0, ::/0',
+    persistentKeepalive:
+      body.persistentKeepalive !== undefined ? Number(body.persistentKeepalive) : 25,
+    enabled: true,
+    note: body.note || '',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  if (!Array.isArray(node.clients)) node.clients = [];
+  node.clients.push(client);
+  nodes.markNodeDirty(node);
+  persist();
+  res.status(201).json({ client: nodes.publicNodeClient(client), node: nodes.publicNode(node) });
+});
+
+app.get('/api/nodes/:id/clients/:cid/config', async (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  const c = (node.clients || []).find((x) => x.id === req.params.cid);
+  if (!c) return res.status(404).json({ error: '客户端不存在' });
+  const fakeState = { server: node.server, clients: node.clients };
+  wg.ensureServerKeys(fakeState);
+  const config = wg.buildClientConfig(fakeState, c);
+  const format = req.query.format || 'text';
+  if (format === 'download') {
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${wg.sanitizeName(c.name)}.conf"`
+    );
+    return res.send(config);
+  }
+  if (format === 'qr') {
+    const qr = await QRCode.toDataURL(config, { margin: 1, width: 280 });
+    return res.json({ name: c.name, config, qr });
+  }
+  res.type('text/plain').send(config);
+});
+
+app.delete('/api/nodes/:id/clients/:cid', (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  const idx = (node.clients || []).findIndex((x) => x.id === req.params.cid);
+  if (idx < 0) return res.status(404).json({ error: '客户端不存在' });
+  const [removed] = node.clients.splice(idx, 1);
+  nodes.markNodeDirty(node);
+  persist();
+  res.json({ ok: true, removed: nodes.publicNodeClient(removed) });
+});
+
+app.post('/api/nodes/:id/apply', (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  const job = nodes.enqueueJob(node, 'apply', {});
+  persist();
+  res.json({
+    ok: true,
+    job,
+    message: node.lastSeenAt
+      ? '已下发「应用配置」任务，等待 Agent 拉取执行'
+      : '任务已创建，但节点尚未上线，请先在目标机安装 Agent',
+    node: nodes.publicNode(node),
+  });
+});
+
+app.post('/api/nodes/:id/exit', (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  // 节点侧落地：把客户端改为全局代理，NAT 由 agent 在目标机写入
+  for (const c of node.clients || []) {
+    c.allowedIPs = '0.0.0.0/0, ::/0';
+    if (!c.persistentKeepalive) c.persistentKeepalive = 25;
+    c.updatedAt = new Date().toISOString();
+  }
+  nodes.markNodeDirty(node);
+  const job = nodes.enqueueJob(node, 'exit', {});
+  persist();
+  res.json({
+    ok: true,
+    job,
+    message: '已下发「一键落地」任务到节点（转发+NAT+应用）',
+    node: nodes.publicNode(node),
+  });
+});
+
+// Agent endpoints
+app.post('/api/agent/hello', (req, res) => {
+  const node = agentAuth(req, res);
+  if (!node) return;
+  nodes.touchNode(node, {
+    hostname: req.body?.hostname,
+    agentVersion: req.body?.agentVersion,
+    meta: { nameHint: req.body?.name || '' },
+  });
+  if (req.body?.name && !node.name) node.name = String(req.body.name);
+  persist();
+  res.json({ ok: true, nodeId: node.id, name: node.name });
+});
+
+app.post('/api/agent/heartbeat', (req, res) => {
+  const node = agentAuth(req, res);
+  if (!node) return;
+  nodes.touchNode(node, {
+    hostname: req.body?.hostname,
+    agentVersion: req.body?.agentVersion,
+    meta: req.body?.meta,
+    status: req.body?.status,
+  });
+  const pending = nodes.getPendingJobs(node, 5);
+  for (const j of pending) {
+    if (!j.startedAt) {
+      j.startedAt = new Date().toISOString();
+      j.status = 'running';
+    }
+  }
+  persist();
+  res.json({
+    ok: true,
+    nodeId: node.id,
+    jobs: pending.map((j) => ({ id: j.id, type: j.type, payload: j.payload || {} })),
+  });
+});
+
+app.get('/api/agent/bundle', (req, res) => {
+  const node = agentAuth(req, res);
+  if (!node) return;
+  const bundle = nodes.buildAgentBundle(node, wg);
+  persist();
+  res.json(bundle);
+});
+
+app.get('/api/agent/download', (req, res) => {
+  const node = agentAuth(req, res);
+  if (!node) return;
+  res.type('application/javascript; charset=utf-8');
+  res.sendFile(path.join(ROOT, 'agent', 'index.js'));
+});
+
+app.post('/api/agent/job-result', (req, res) => {
+  const node = agentAuth(req, res);
+  if (!node) return;
+  const { jobId, ok, message, detail } = req.body || {};
+  const job = nodes.completeJob(node, jobId, { ok, message, detail });
+  if (!job) return res.status(404).json({ error: '任务不存在' });
+  if (ok && (job.type === 'apply' || job.type === 'exit')) {
+    const hash = detail?.configHash || nodes.configHashForNode(node, wg);
+    nodes.markNodeClean(node, hash);
+  }
+  persist();
+  res.json({ ok: true, job });
 });
 
 // SPA fallback

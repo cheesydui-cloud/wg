@@ -206,7 +206,8 @@ function shell(content) {
   const nav = [
     ['dashboard', '概览', '◉'],
     ['clients', '客户端', '◎'],
-    ['server', '服务器', '▣'],
+    ['server', '本机', '▣'],
+    ['nodes', '节点', '⬡'],
     ['deploy', '部署', '➜'],
     ['settings', '设置', '⚙'],
   ];
@@ -266,6 +267,7 @@ async function loadMainData() {
   state.status = statusRes;
   state.dirty = Boolean(statusRes.dirty ?? serverRes.dirty ?? clientsRes.dirty);
   state.lastAppliedAt = statusRes.lastAppliedAt || serverRes.lastAppliedAt || null;
+  await loadNodes();
 }
 
 function onlineCount() {
@@ -628,6 +630,358 @@ function bindServer() {
   document.getElementById('srv-preflight').onclick = showPreflight;
 }
 
+function renderNodes() {
+  const list = state.nodes || [];
+  return `
+    <div class="page-header">
+      <div>
+        <h2>节点 / Agent</h2>
+        <p>中心面板管理多台落地服务器。Agent 装在目标机上，由面板远程下发配置与落地。</p>
+      </div>
+      <div class="header-actions">
+        <button class="btn btn-ghost" id="nodes-refresh">刷新</button>
+        <button class="btn btn-primary" id="nodes-add">添加节点</button>
+      </div>
+    </div>
+    <div class="alert info">
+      <div>
+        <strong>用法</strong>：添加节点 → 复制安装命令 → 在落地服务器用 root 执行 → 节点在线后填 Endpoint/客户端 → 远程应用或一键落地。
+        本机 WG 仍在「本机」页管理。
+        <br/>有<strong>移动入口</strong>的机器：监听端口用商家范围（如 7901），Endpoint 填「外部连接 IP」或「移动入口 IP」+ 该端口，不要用探测到的出网 IP。
+      </div>
+    </div>
+    <div class="card" style="padding:0;overflow:hidden">
+      ${list.length ? `
+        <div class="table-wrap" style="border:0;border-radius:0">
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>状态</th>
+                <th>Endpoint</th>
+                <th>客户端</th>
+                <th>任务</th>
+                <th>上次在线</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${list.map((n) => `
+                <tr>
+                  <td>
+                    <span class="cell-name">${esc(n.name)}</span>
+                    ${n.hostname ? `<span class="cell-note">${esc(n.hostname)}</span>` : ''}
+                  </td>
+                  <td><span class="badge ${n.online ? 'ok' : 'warn'}">${n.online ? '在线' : '离线'}</span></td>
+                  <td class="mono small">${esc(n.endpoint || '-')}</td>
+                  <td>${n.clientCount || 0}</td>
+                  <td>${n.pendingJobs || 0}</td>
+                  <td class="small muted">${esc(fmtTime(n.lastSeenAt))}</td>
+                  <td>
+                    <div class="ops">
+                      <button class="btn btn-sm btn-ghost" data-node-open="${n.id}">管理</button>
+                      <button class="btn btn-sm btn-primary" data-node-exit="${n.id}">落地</button>
+                      <button class="btn btn-sm btn-success" data-node-apply="${n.id}">应用</button>
+                      <button class="btn btn-sm btn-danger" data-node-del="${n.id}">删除</button>
+                    </div>
+                  </td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>` : `
+        <div class="empty">
+          <div class="empty-title">还没有节点</div>
+          <p class="small muted">添加后生成安装命令，在商家 CM / VPS 上安装 Agent</p>
+          <button class="btn btn-primary" style="margin-top:12px" id="nodes-add-2">添加节点</button>
+        </div>`}
+    </div>`;
+}
+
+function bindNodes() {
+  const add = () => openAddNodeModal();
+  document.getElementById('nodes-add')?.addEventListener('click', add);
+  document.getElementById('nodes-add-2')?.addEventListener('click', add);
+  document.getElementById('nodes-refresh')?.addEventListener('click', async () => {
+    await loadNodes();
+    render();
+  });
+  document.querySelectorAll('[data-node-open]').forEach((b) => {
+    b.onclick = () => openNodeDetail(b.dataset.nodeOpen);
+  });
+  document.querySelectorAll('[data-node-apply]').forEach((b) => {
+    b.onclick = async () => {
+      try {
+        const res = await api(`/api/nodes/${b.dataset.nodeApply}/apply`, { method: 'POST' });
+        toast(res.message || '已下发应用任务');
+        await loadNodes();
+        render();
+      } catch (ex) { toast(ex.message, 'err'); }
+    };
+  });
+  document.querySelectorAll('[data-node-exit]').forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm('向该节点下发「一键落地」？\n将在目标机开启转发、NAT 并应用配置。')) return;
+      try {
+        const res = await api(`/api/nodes/${b.dataset.nodeExit}/exit`, { method: 'POST' });
+        toast(res.message || '已下发落地任务');
+        await loadNodes();
+        render();
+      } catch (ex) { toast(ex.message, 'err'); }
+    };
+  });
+  document.querySelectorAll('[data-node-del]').forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm('删除该节点？目标机上的 Agent 不会自动卸载。')) return;
+      try {
+        await api(`/api/nodes/${b.dataset.nodeDel}`, { method: 'DELETE' });
+        toast('已删除');
+        await loadNodes();
+        render();
+      } catch (ex) { toast(ex.message, 'err'); }
+    };
+  });
+}
+
+function openAddNodeModal() {
+  state.modal = {
+    title: '添加节点',
+    body: `
+      <div class="form-row">
+        <label>名称</label>
+        <input class="field" id="n-name" placeholder="CM-落地-1" value="落地节点" />
+      </div>
+      <div class="form-row">
+        <label>备注</label>
+        <input class="field" id="n-note" placeholder="可选" />
+      </div>
+      <div class="form-row">
+        <label>面板访问地址 ${help('目标机能访问到的面板 URL，用于生成安装命令')}</label>
+        <input class="field mono" id="n-panel-url" placeholder="http://你的面板IP:51821" value="${esc(window.location.origin)}" />
+      </div>
+      <div class="actions-end">
+        <button class="btn btn-ghost" id="n-cancel">取消</button>
+        <button class="btn btn-primary" id="n-create">创建并生成安装命令</button>
+      </div>`,
+    after() {
+      document.getElementById('n-cancel').onclick = closeModal;
+      document.getElementById('n-create').onclick = async () => {
+        try {
+          const res = await api('/api/nodes', {
+            method: 'POST',
+            body: {
+              name: val('n-name'),
+              note: val('n-note'),
+              panelUrl: val('n-panel-url') || window.location.origin,
+            },
+          });
+          await loadNodes();
+          showInstallCommand(res);
+        } catch (ex) { toast(ex.message, 'err'); }
+      };
+    },
+  };
+  renderModal(state.modal);
+}
+
+function showInstallCommand(res) {
+  const cmd = res.installCommand || '';
+  state.modal = {
+    title: `安装 Agent — ${res.node?.name || ''}`,
+    body: `
+      <div class="alert ok" style="margin-bottom:12px">
+        <div>节点已创建。请在<strong>落地服务器</strong>上以 root 执行下面命令。</div>
+      </div>
+      <pre class="pre-box" id="install-cmd">${esc(cmd)}</pre>
+      <p class="small muted">Token（请妥善保存）：</p>
+      <pre class="pre-box">${esc(res.token || '')}</pre>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="copy-install">复制安装命令</button>
+        <button class="btn btn-ghost" id="install-done">完成</button>
+      </div>
+      <p class="field-hint" style="margin-top:12px">安装成功后回到节点列表，状态变为「在线」即可远程应用 / 落地。</p>`,
+    after() {
+      document.getElementById('copy-install').onclick = async () => {
+        await navigator.clipboard.writeText(cmd);
+        toast('已复制');
+      };
+      document.getElementById('install-done').onclick = async () => {
+        closeModal();
+        state.page = 'nodes';
+        await loadNodes();
+        render();
+      };
+    },
+  };
+  renderModal(state.modal);
+}
+
+async function openNodeDetail(id) {
+  try {
+    const data = await api(`/api/nodes/${id}`);
+    const n = data.node;
+    const s = data.server || {};
+    const clients = data.clients || [];
+    state.modal = {
+      title: `节点 · ${n.name}`,
+      body: `
+        <div class="alert ${n.online ? 'ok' : 'warn'}" style="margin-bottom:12px">
+          <div>${n.online ? 'Agent 在线' : 'Agent 离线 — 请确认目标机服务与网络'} · ${esc(n.hostname || '')}</div>
+        </div>
+        <div class="inline-fields">
+          <div class="form-row">
+            <label>监听端口</label>
+            <input class="field" type="number" id="nd-port" value="${esc(s.listenPort || 51820)}" />
+          </div>
+          <div class="form-row">
+            <label>内网地址</label>
+            <input class="field mono" id="nd-address" value="${esc(s.address || '10.8.0.1/24')}" />
+          </div>
+        </div>
+        <div class="form-row">
+          <label>Endpoint ${help('客户端连接地址。有移动入口的机器：优先 外部连接IP:端口；移动用户可试 移动入口IP:同一端口。端口须在商家可用范围（如 7901），勿用探测出口 IP。')}</label>
+          <input class="field mono" id="nd-endpoint" value="${esc(s.endpoint || '')}" placeholder="114.111.176.37:7901 或 211.x.x.x:7901" />
+        </div>
+        <p class="field-hint">示例：外部连接 <code>114.111.176.37:7901</code>；移动入口 <code>211.136.162.184:7901</code>（端口与监听一致，SSH 7900 勿占用）</p>
+        <div class="form-row">
+          <label>DNS</label>
+          <input class="field mono" id="nd-dns" value="${esc(s.dns || '1.1.1.1')}" />
+        </div>
+        <div class="btn-row" style="margin-bottom:12px">
+          <button class="btn btn-sm btn-primary" id="nd-save">保存配置</button>
+          <button class="btn btn-sm btn-success" id="nd-apply">远程应用</button>
+          <button class="btn btn-sm btn-primary" id="nd-exit">远程落地</button>
+          <button class="btn btn-sm btn-ghost" id="nd-token">轮换 Token / 安装命令</button>
+        </div>
+        <h3 style="margin:8px 0;font-size:14px">客户端 (${clients.length})</h3>
+        <div class="btn-row" style="margin-bottom:8px">
+          <button class="btn btn-sm btn-ghost" id="nd-add-client">添加客户端</button>
+        </div>
+        ${clients.length ? `
+          <div class="table-wrap"><table style="min-width:0">
+            <thead><tr><th>名称</th><th>IP</th><th>状态</th><th></th></tr></thead>
+            <tbody>
+              ${clients.map((c) => `
+                <tr>
+                  <td>${esc(c.name)}</td>
+                  <td class="mono small">${esc(c.address)}</td>
+                  <td><span class="badge ${c.online ? 'ok' : 'muted'}">${c.online ? '在线' : '-'}</span></td>
+                  <td class="ops">
+                    <button class="btn btn-sm btn-ghost" data-nd-qr="${c.id}">二维码</button>
+                    <button class="btn btn-sm btn-danger" data-nd-cdel="${c.id}">删</button>
+                  </td>
+                </tr>`).join('')}
+            </tbody>
+          </table></div>` : '<p class="muted small">暂无客户端</p>'}
+        <div class="actions-end">
+          <button class="btn btn-ghost" id="nd-close">关闭</button>
+        </div>`,
+      after() {
+        document.getElementById('nd-close').onclick = closeModal;
+        document.getElementById('nd-save').onclick = async () => {
+          try {
+            await api(`/api/nodes/${id}`, {
+              method: 'PUT',
+              body: {
+                server: {
+                  listenPort: Number(val('nd-port')) || 51820,
+                  address: val('nd-address'),
+                  endpoint: val('nd-endpoint'),
+                  dns: val('nd-dns'),
+                  syncEndpointPort: true,
+                },
+              },
+            });
+            // sync endpoint port
+            const port = Number(val('nd-port')) || 51820;
+            let ep = val('nd-endpoint');
+            if (ep && ep.includes(':')) {
+              const host = ep.split(':')[0];
+              ep = `${host}:${port}`;
+              await api(`/api/nodes/${id}`, { method: 'PUT', body: { server: { endpoint: ep, listenPort: port } } });
+            }
+            toast('已保存');
+            openNodeDetail(id);
+          } catch (ex) { toast(ex.message, 'err'); }
+        };
+        document.getElementById('nd-apply').onclick = async () => {
+          try {
+            const res = await api(`/api/nodes/${id}/apply`, { method: 'POST' });
+            toast(res.message || '已下发');
+          } catch (ex) { toast(ex.message, 'err'); }
+        };
+        document.getElementById('nd-exit').onclick = async () => {
+          if (!confirm('远程一键落地到该节点？')) return;
+          try {
+            const res = await api(`/api/nodes/${id}/exit`, { method: 'POST' });
+            toast(res.message || '已下发落地');
+          } catch (ex) { toast(ex.message, 'err'); }
+        };
+        document.getElementById('nd-token').onclick = async () => {
+          try {
+            const res = await api(`/api/nodes/${id}/token`, {
+              method: 'POST',
+              body: { panelUrl: window.location.origin },
+            });
+            showInstallCommand({ ...res, node: n, installCommand: res.installCommand, token: res.token });
+          } catch (ex) { toast(ex.message, 'err'); }
+        };
+        document.getElementById('nd-add-client').onclick = async () => {
+          const name = prompt('客户端名称', '手机');
+          if (!name) return;
+          try {
+            await api(`/api/nodes/${id}/clients`, {
+              method: 'POST',
+              body: { name, allowedIPs: '0.0.0.0/0, ::/0', usePresharedKey: true },
+            });
+            toast('已添加');
+            openNodeDetail(id);
+          } catch (ex) { toast(ex.message, 'err'); }
+        };
+        document.querySelectorAll('[data-nd-qr]').forEach((b) => {
+          b.onclick = async () => {
+            try {
+              const data = await api(`/api/nodes/${id}/clients/${b.dataset.ndQr}/config?format=qr`);
+              state.modal = {
+                title: data.name,
+                body: `
+                  <div class="qr-wrap"><img src="${data.qr}" alt="QR" />
+                  <p class="muted small">请确认 Endpoint 已指向该节点</p></div>
+                  <pre class="pre-box">${esc(data.config)}</pre>
+                  <div class="actions-end"><button class="btn btn-ghost" id="qr-back">返回</button></div>`,
+                after() {
+                  document.getElementById('qr-back').onclick = () => openNodeDetail(id);
+                },
+              };
+              renderModal(state.modal);
+            } catch (ex) { toast(ex.message, 'err'); }
+          };
+        });
+        document.querySelectorAll('[data-nd-cdel]').forEach((b) => {
+          b.onclick = async () => {
+            if (!confirm('删除该客户端？')) return;
+            try {
+              await api(`/api/nodes/${id}/clients/${b.dataset.ndCdel}`, { method: 'DELETE' });
+              openNodeDetail(id);
+            } catch (ex) { toast(ex.message, 'err'); }
+          };
+        });
+      },
+    };
+    renderModal(state.modal);
+  } catch (ex) {
+    toast(ex.message, 'err');
+  }
+}
+
+async function loadNodes() {
+  try {
+    const res = await api('/api/nodes');
+    state.nodes = res.nodes || [];
+  } catch {
+    state.nodes = state.nodes || [];
+  }
+}
+
 function renderDeploy() {
   const s = state.server || {};
   const port = s.listenPort || 51820;
@@ -644,6 +998,15 @@ function renderDeploy() {
       </div>
     </div>
     <div class="grid">
+      <div class="card guide">
+        <h3>远程节点（Agent）</h3>
+        <p class="muted small">在落地服务器执行面板「节点」页生成的安装命令：</p>
+        <pre class="pre-box">curl -fsSL "http://面板IP:51821/install-agent.sh" | sudo env \\
+  WG_PANEL_URL="http://面板IP:51821" \\
+  WG_AGENT_TOKEN="节点token" \\
+  bash</pre>
+        <button class="btn btn-sm btn-primary" data-nav-jump="nodes" style="margin-top:8px">打开节点页</button>
+      </div>
       <div class="card guide">
         <h3>更新面板</h3>
         <pre class="pre-box">cd ~/wg && git pull && sudo bash install.sh</pre>
@@ -1391,6 +1754,7 @@ function render() {
   if (state.page === 'dashboard') content = renderDashboard();
   else if (state.page === 'clients') content = renderClients();
   else if (state.page === 'server') content = renderServer();
+  else if (state.page === 'nodes') content = renderNodes();
   else if (state.page === 'deploy') content = renderDeploy();
   else if (state.page === 'settings') content = renderSettings();
   else content = renderDashboard();
@@ -1399,6 +1763,7 @@ function render() {
   if (state.page === 'dashboard') bindDashboard();
   if (state.page === 'clients') bindClients();
   if (state.page === 'server') bindServer();
+  if (state.page === 'nodes') bindNodes();
   if (state.page === 'deploy') bindDeploy();
   if (state.page === 'settings') bindSettings();
 }

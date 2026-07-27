@@ -81,13 +81,37 @@ fi
 
 echo "==> 安装系统依赖"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y curl ca-certificates iptables openssl
+# 有 node 时更新不强制 apt（避免坏掉的 nodesource 403 卡死）
+if command -v node >/dev/null 2>&1 && [[ "${UPDATE_MODE}" -eq 1 || -f "${APP_DIR}/data/state.json" ]]; then
+  echo "    已有 Node $($(command -v node) -v)，跳过 apt 重装依赖"
+else
+  # 禁用失效的 NodeSource 源，避免 403 导致整次 update 失败
+  if ls /etc/apt/sources.list.d/*nodesource* >/dev/null 2>&1; then
+    echo "    发现 NodeSource 源，若 403 将临时禁用"
+    for f in /etc/apt/sources.list.d/*nodesource*; do
+      [[ -f "$f" ]] || continue
+      if ! grep -q 'deb.nodesource.com' "$f" 2>/dev/null; then
+        continue
+      fi
+      # 探测是否可用；失败则改名禁用
+      if ! curl -fsSIL --max-time 8 https://deb.nodesource.com/node_20.x/dists/nodistro/InRelease >/dev/null 2>&1; then
+        mv "$f" "${f}.disabled-by-wg-panel" 2>/dev/null || true
+        echo "    已禁用失效源: $f"
+      fi
+    done
+  fi
+  apt-get update -y || echo "    警告: apt-get update 有错误，继续尝试安装基础包"
+  apt-get install -y curl ca-certificates iptables openssl || true
+fi
 
 if ! command -v node >/dev/null 2>&1; then
   echo "==> 安装 Node.js 20"
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
+  if curl -fsSL https://deb.nodesource.com/setup_20.x | bash -; then
+    apt-get install -y nodejs
+  else
+    echo "    NodeSource 不可用，尝试系统源 nodejs"
+    apt-get install -y nodejs npm || true
+  fi
 fi
 
 NODE_BIN="$(command -v node || true)"

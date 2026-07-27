@@ -71,6 +71,36 @@ function sanitizeName(name) {
     .slice(0, 64) || 'client';
 }
 
+/** 服务端 Peer 的 AllowedIPs：必须是该客户端的 /32 地址 */
+function peerAllowedIps(client) {
+  const raw = String(client?.address || '').trim();
+  if (!raw) return '';
+  try {
+    const { ip } = parseCidr(raw.includes('/') ? raw : `${raw}/32`);
+    return `${ip}/32`;
+  } catch {
+    return '';
+  }
+}
+
+function isValidClientAddress(address) {
+  try {
+    parseCidr(String(address || '').includes('/') ? address : `${address}/32`);
+    return Boolean(String(address || '').trim());
+  } catch {
+    return false;
+  }
+}
+
+function normalizeClientAddress(address) {
+  const raw = String(address || '').trim();
+  if (!raw) return '';
+  const cidr = raw.includes('/') ? raw : `${raw}/32`;
+  const { ip, prefix } = parseCidr(cidr);
+  // 客户端地址统一写成 x.x.x.x/32
+  return `${ip}/32`;
+}
+
 function buildServerConfig(state) {
   const s = state.server;
   const lines = ['[Interface]'];
@@ -85,11 +115,14 @@ function buildServerConfig(state) {
 
   for (const c of state.clients || []) {
     if (c.enabled === false) continue;
+    if (!c.publicKey) continue;
+    const allowed = peerAllowedIps(c);
+    if (!allowed) continue; // 跳过无 IP 的 peer，避免 wg 解析失败
     lines.push('[Peer]');
     lines.push(`# ${sanitizeName(c.name)}${c.note ? ' — ' + c.note : ''}`);
     lines.push(`PublicKey = ${c.publicKey}`);
     if (c.presharedKey) lines.push(`PresharedKey = ${c.presharedKey}`);
-    lines.push(`AllowedIPs = ${c.address.replace(/\/\d+$/, '/32')}`);
+    lines.push(`AllowedIPs = ${allowed}`);
     lines.push('');
   }
   return lines.join('\n').trim() + '\n';
@@ -422,6 +455,19 @@ async function preflight(state) {
     detail: ifaceStatus.up ? `${state.server.interfaceName} 运行中` : `${state.server.interfaceName} 未启动`,
   });
 
+  const badClients = (state.clients || []).filter(
+    (c) => c.enabled !== false && (!c.publicKey || !peerAllowedIps(c))
+  );
+  checks.push({
+    id: 'clients',
+    ok: badClients.length === 0,
+    title: '客户端配置',
+    detail:
+      badClients.length === 0
+        ? `共 ${(state.clients || []).filter((c) => c.enabled !== false).length} 个启用客户端`
+        : `以下客户端缺少有效内网 IP 或公钥：${badClients.map((c) => c.name || c.id).join('、')}`,
+  });
+
   const blocking = checks.filter((c) => !c.ok && !c.warn);
   const warnings = checks.filter((c) => c.warn || (!c.ok && c.id === 'endpoint'));
 
@@ -616,6 +662,9 @@ module.exports = {
   defaultPostDown,
   detectDefaultInterface,
   detectPublicIp,
+  peerAllowedIps,
+  isValidClientAddress,
+  normalizeClientAddress,
   preflight,
   applyConfig,
   stopInterface,

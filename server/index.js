@@ -356,6 +356,14 @@ app.post('/api/clients', (req, res) => {
       return res.status(400).json({ error: err.message });
     }
   }
+  try {
+    address = wg.normalizeClientAddress(address);
+  } catch (err) {
+    return res.status(400).json({ error: `客户端 IP 无效: ${err.message}` });
+  }
+  if (!address) {
+    return res.status(400).json({ error: '客户端内网 IP 不能为空' });
+  }
 
   const kp = wg.generateKeyPair();
   const usePsk = body.usePresharedKey !== false;
@@ -366,7 +374,7 @@ app.post('/api/clients', (req, res) => {
     publicKey: kp.publicKey,
     presharedKey: usePsk ? wg.generatePresharedKey() : '',
     address,
-    allowedIPs: body.allowedIPs || '0.0.0.0/0, ::/0',
+    allowedIPs: (body.allowedIPs && String(body.allowedIPs).trim()) || '0.0.0.0/0, ::/0',
     persistentKeepalive:
       body.persistentKeepalive !== undefined ? Number(body.persistentKeepalive) : 25,
     enabled: body.enabled !== false,
@@ -385,8 +393,41 @@ app.put('/api/clients/:id', (req, res) => {
   if (!c) return res.status(404).json({ error: '客户端不存在' });
   const body = req.body || {};
   if (body.name !== undefined) c.name = String(body.name).trim() || c.name;
-  if (body.address !== undefined) c.address = String(body.address).trim();
-  if (body.allowedIPs !== undefined) c.allowedIPs = String(body.allowedIPs).trim();
+  if (body.address !== undefined) {
+    let address = String(body.address).trim();
+    if (!address) {
+      try {
+        address = wg.nextClientAddress(
+          state.server.address,
+          state.clients.filter((x) => x.id !== c.id)
+        );
+      } catch (err) {
+        return res.status(400).json({ error: err.message });
+      }
+    }
+    try {
+      address = wg.normalizeClientAddress(address);
+    } catch (err) {
+      return res.status(400).json({ error: `客户端 IP 无效: ${err.message}` });
+    }
+    if (!address) return res.status(400).json({ error: '客户端内网 IP 不能为空' });
+    c.address = address;
+  }
+  // 修复历史脏数据：已有客户端若无 IP，保存时自动补齐
+  if (!wg.isValidClientAddress(c.address)) {
+    try {
+      c.address = wg.nextClientAddress(
+        state.server.address,
+        state.clients.filter((x) => x.id !== c.id)
+      );
+    } catch (err) {
+      return res.status(400).json({ error: `客户端缺少内网 IP：${err.message}` });
+    }
+  }
+  if (body.allowedIPs !== undefined) {
+    const a = String(body.allowedIPs).trim();
+    c.allowedIPs = a || '0.0.0.0/0, ::/0';
+  }
   if (body.persistentKeepalive !== undefined) {
     c.persistentKeepalive = Number(body.persistentKeepalive) || 0;
   }
@@ -451,11 +492,33 @@ app.get('/api/preflight', async (req, res) => {
 
 app.post('/api/apply', async (req, res) => {
   wg.ensureServerKeys(state);
+  // 应用前自动修复缺少内网 IP 的客户端，避免生成 AllowedIPs= 空行
+  let healed = 0;
+  for (const c of state.clients || []) {
+    if (c.enabled === false) continue;
+    if (wg.isValidClientAddress(c.address)) continue;
+    try {
+      c.address = wg.nextClientAddress(
+        state.server.address,
+        state.clients.filter((x) => x.id !== c.id)
+      );
+      c.updatedAt = new Date().toISOString();
+      healed += 1;
+    } catch (err) {
+      return res.status(400).json({
+        error: `客户端「${c.name || c.id}」缺少内网 IP：${err.message}`,
+        needFixClients: true,
+      });
+    }
+  }
+  if (healed) persist();
+
   const result = await wg.applyConfig(state);
   if (result.ok) persist();
   const iface = await wg.getInterfaceStatus(state.server.interfaceName);
   res.status(result.ok ? 200 : 500).json({
     ...result,
+    healedClients: healed,
     interface: iface,
     dirty: wg.isDirty(state),
     lastAppliedAt: state.lastAppliedAt,

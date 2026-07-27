@@ -3,7 +3,7 @@
 中文、新手友好的 **mieru / mita 出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v2.0.3**
+当前版本：**v2.0.4**
 
 > **v2 起默认协议是 mieru，不再是 WireGuard。**  
 > 老板移动前置 + 落地家宽只支持 mieru 时，请用本版本。  

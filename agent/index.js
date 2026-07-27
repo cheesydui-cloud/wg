@@ -266,8 +266,20 @@ async function applyMitaConfig(serverJson) {
 
 async function installOrReconfigure(bundle) {
   const s = bundle.server || {};
-  const users = (bundle.users || []).filter((u) => u.enabled !== false);
-  if (!users.length) return { ok: false, message: '没有可用用户' };
+  // 只同步合法 ASCII 用户名（中文备注不能进 mita）
+  const users = (bundle.users || []).filter(
+    (u) =>
+      u.enabled !== false &&
+      u.name &&
+      u.password &&
+      /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(String(u.name))
+  );
+  if (!users.length) {
+    return {
+      ok: false,
+      message: '没有合法 mita 用户（用户名须英文/数字，不能用「我的手机」）',
+    };
+  }
 
   const primary = users[0];
   const port = Number(s.listenPort) || 7901;
@@ -278,6 +290,39 @@ async function installOrReconfigure(bundle) {
   const st0 = await mitaStatus();
   const action = st0.installed && (st0.running || st0.idle || st0.ok) ? 'reconfigure' : 'install';
 
+  // 1) 优先：官方 mita apply 全量配置（所有用户一次写对）
+  if (bundle.serverConfig) {
+    // 过滤 serverConfig 里的非法用户
+    const cfg = JSON.parse(JSON.stringify(bundle.serverConfig));
+    if (Array.isArray(cfg.users)) {
+      cfg.users = cfg.users.filter(
+        (u) => u?.name && u?.password && /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(String(u.name))
+      );
+    }
+    if (!cfg.users?.length) {
+      cfg.users = users.map((u) => ({ name: u.name, password: u.password }));
+    }
+    console.log(
+      `[agent] apply mita full config users=${cfg.users.map((u) => u.name).join(',')} port=${port}`
+    );
+    const ap = await applyMitaConfig(cfg);
+    if (ap.ok) {
+      await openFirewall(port, protocol);
+      return {
+        ok: true,
+        message: `已同步 mita（${cfg.users.length} 用户）· RUNNING`,
+        detail: {
+          action: 'apply-full',
+          mita: ap.mita,
+          configHash: bundle.configHash,
+          users: cfg.users.map((u) => u.name),
+        },
+      };
+    }
+    console.warn('[agent] apply-full 失败，回退 OneClick:', ap.message);
+  }
+
+  // 2) 回退：OneClick 装/重配主用户
   const args = [
     script,
     action === 'install' ? '--install' : '--reconfigure',
@@ -297,7 +342,6 @@ async function installOrReconfigure(bundle) {
     timeout: 600000,
   });
 
-  // 多用户：后续用户用 user-add（若脚本支持）
   if (users.length > 1 && (r.ok || (await mitaStatus()).installed)) {
     for (let i = 1; i < users.length; i++) {
       const u = users[i];
@@ -308,49 +352,19 @@ async function installOrReconfigure(bundle) {
     }
   }
 
-  // 若 OneClick 失败，尝试官方 mita apply 回退
-  let finalMsg = r.ok ? `${action} 完成` : `${action} 脚本退出非零`;
-  if (!r.ok) {
-    console.warn('[agent] install script stderr:', r.stderr.slice(0, 500));
-    if (bundle.serverConfig) {
-      const fallback = await applyMitaConfig(bundle.serverConfig);
-      if (fallback.ok) {
-        return {
-          ok: true,
-          message: `脚本异常，已用 mita apply 回退成功`,
-          detail: { action: 'apply-fallback', mita: fallback.mita, scriptOut: r.stdout.slice(-1500) },
-        };
-      }
-      finalMsg += `；回退 apply 也失败: ${fallback.message}`;
-    }
-  }
-
-  // 多用户时再 apply 完整 serverConfig 覆盖
-  if (bundle.serverConfig && users.length >= 1) {
-    const ap = await applyMitaConfig(bundle.serverConfig);
-    if (ap.ok) {
-      return {
-        ok: true,
-        message: `${finalMsg}；已同步全部用户`,
-        detail: {
-          action,
-          mita: ap.mita,
-          configHash: bundle.configHash,
-          scriptTail: (r.stdout || '').slice(-1200),
-        },
-      };
-    }
-  }
-
+  await openFirewall(port, protocol);
   const st = await mitaStatus();
   return {
     ok: st.running || r.ok,
-    message: st.running ? finalMsg + ' · RUNNING' : finalMsg + ` · ${st.status}`,
+    message: st.running
+      ? `${action} 完成 · RUNNING · 用户 ${users.map((u) => u.name).join(',')}`
+      : `${action} · ${st.status}`,
     detail: {
       action,
       mita: st,
       configHash: bundle.configHash,
       scriptOk: r.ok,
+      users: users.map((u) => u.name),
       scriptTail: ((r.stdout || '') + '\n' + (r.stderr || '')).slice(-2000),
     },
   };

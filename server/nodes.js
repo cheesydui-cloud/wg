@@ -65,7 +65,7 @@ function publicNode(node, { includeToken = false } = {}) {
     listenPort: Number(node.server?.listenPort) || 7901,
     publicKey: node.server?.publicKey || '',
     interfaceName: node.server?.interfaceName || 'wg0',
-    dirty: isNodeDirty(node),
+    dirty: isNodeDirty(node, null),
     lastAppliedAt: node.lastAppliedAt || null,
     pendingJobs: (node.jobs || []).filter((j) => j.status === 'pending' || j.status === 'running')
       .length,
@@ -242,11 +242,21 @@ function configHashForNode(node, wg) {
   return wg.configHash(fakeState);
 }
 
-function isNodeDirty(node) {
+function isNodeDirty(node, wg) {
+  if (node._dirtyFlag) return true;
   if (!node.lastAppliedHash) {
     return (node.clients || []).length > 0 || Boolean(node.server?.privateKey);
   }
-  return Boolean(node._dirtyFlag);
+  // 有 wg 时用配置 hash 校准，避免 flag 卡住
+  if (wg) {
+    try {
+      const h = configHashForNode(node, wg);
+      return h !== node.lastAppliedHash;
+    } catch {
+      return Boolean(node._dirtyFlag);
+    }
+  }
+  return false;
 }
 
 function markNodeDirty(node) {

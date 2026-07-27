@@ -847,6 +847,53 @@ tbody tr:hover td { background: rgba(59, 130, 246, 0.03); }
   justify-content: center;
   margin: 8px 0 12px;
 }
+
+.endpoint-card {
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.08);
+}
+.endpoint-card .card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+.endpoint-card .card-head h3 { margin: 0; }
+.ep-split {
+  display: grid;
+  grid-template-columns: 1fr 110px;
+  gap: 10px;
+  margin: 10px 0 8px;
+}
+@media (max-width: 560px) {
+  .ep-split { grid-template-columns: 1fr; }
+}
+.ep-presets {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 4px;
+}
+.chip {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.chip:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: var(--primary-soft);
+}
+.alert.danger {
+  background: var(--danger-soft);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
 .qr-wrap img {
   width: 240px;
   height: 240px;

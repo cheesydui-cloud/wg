@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * WG Panel Edge Agent v1.4.0
+ * WG Panel Edge Agent v1.4.1
  * 连接中心面板，拉取任务：应用配置 / 一键落地 / 上报状态
  *
  * 环境变量：
@@ -19,7 +19,7 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
-const VERSION = '1.4.0';
+const VERSION = '1.4.1';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';

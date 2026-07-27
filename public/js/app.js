@@ -138,6 +138,31 @@ function exitLabel() {
   return '本机出口（面板这台机器）';
 }
 
+function splitEndpoint(ep, fallbackPort) {
+  const raw = String(ep || '').trim();
+  const portDef = Number(fallbackPort) || 7901;
+  if (!raw) return { host: '', port: portDef };
+  const m6 = raw.match(/^\[([^\]]+)\]:(\d+)$/);
+  if (m6) return { host: m6[1], port: Number(m6[2]) || portDef };
+  const idx = raw.lastIndexOf(':');
+  if (idx > 0) {
+    const maybe = Number(raw.slice(idx + 1));
+    if (!Number.isNaN(maybe) && maybe >= 1 && maybe <= 65535) {
+      return { host: raw.slice(0, idx), port: maybe };
+    }
+  }
+  return { host: raw, port: portDef };
+}
+
+function joinEndpoint(host, port) {
+  const h = String(host || '').trim();
+  if (!h) return '';
+  const p = Number(port) || 0;
+  if (!p) return h;
+  if (h.includes(':') && !h.startsWith('[')) return `[${h}]:${p}`;
+  return `${h}:${p}`;
+}
+
 function topAlerts() {
   const parts = [];
   if (state.status?.forcePasswordChange) {
@@ -152,10 +177,35 @@ function topAlerts() {
       <button class="btn btn-sm btn-primary" data-nav-jump="server">去安装/检查</button>
     </div>`);
   }
+  const job = state.primaryNode?.latestJob || state.latestJob;
+  if (job && (job.status === 'pending' || job.status === 'running')) {
+    parts.push(`<div class="alert warn">
+      <div><strong>任务执行中</strong> · ${esc(job.type === 'exit' ? '一键落地' : '应用配置')}（${esc(
+      job.status
+    )}）· Agent 约每 10 秒拉取</div>
+      <button class="btn btn-sm btn-ghost" id="banner-poll">刷新状态</button>
+    </div>`);
+  } else if (job && (job.status === 'error' || job.status === 'failed')) {
+    parts.push(`<div class="alert danger">
+      <div><strong>最近任务失败</strong> · ${esc(job.message || job.type || '')}</div>
+      <button class="btn btn-sm btn-primary" data-nav-jump="diagnose">看诊断</button>
+    </div>`);
+  }
+  if (state.clientsNeedRescan) {
+    parts.push(`<div class="alert warn">
+      <div><strong>Endpoint 已变更 · 必须重扫</strong> · 手机旧隧道不会自动更新地址</div>
+      <div class="btn-row">
+        <button class="btn btn-sm btn-primary" data-nav-jump="clients">去扫码</button>
+        <button class="btn btn-sm btn-ghost" id="banner-rescan-ack">我已全部重扫</button>
+      </div>
+    </div>`);
+  }
   if (state.dirty) {
     parts.push(`<div class="alert warn">
       <div><strong>有未应用的更改</strong> · ${
-        isAgentMode() ? '需下发到落地机' : '需写入本机 WireGuard'
+        isAgentMode()
+          ? '服务端配置已改，需下发到落地机（只改 Endpoint 不会出现此项）'
+          : '服务端配置已改，需写入本机 WireGuard'
       }</div>
       <div class="btn-row">
         <button class="btn btn-sm btn-ghost" id="banner-diagnose">诊断</button>
@@ -171,6 +221,20 @@ function bindTopAlerts() {
   document.getElementById('banner-diagnose')?.addEventListener('click', () => {
     state.page = 'diagnose';
     render();
+  });
+  document.getElementById('banner-poll')?.addEventListener('click', async () => {
+    await refreshCore().catch(() => {});
+    render();
+  });
+  document.getElementById('banner-rescan-ack')?.addEventListener('click', async () => {
+    try {
+      await api('/api/clients/rescan-ack', { method: 'POST', body: {} });
+      state.clientsNeedRescan = false;
+      toast('已确认重扫');
+      render();
+    } catch (e) {
+      toast(e.message, 'err');
+    }
   });
   document.querySelectorAll('[data-nav-jump]').forEach((b) => {
     b.onclick = () => {
@@ -314,7 +378,11 @@ async function refreshCore() {
   state.primaryNodeId = status.primaryNodeId || null;
   state.server = server.server;
   state.wizardDone = server.wizardDone;
-  state.dirty = clients.dirty ?? status.dirty;
+  state.dirty = Boolean(status.dirty ?? clients.dirty ?? server.dirty);
+  state.clientsNeedRescan = Boolean(
+    status.clientsNeedRescan ?? server.clientsNeedRescan ?? clients.clientsNeedRescan
+  );
+  state.latestJob = status.primaryNode?.latestJob || null;
   state.lastAppliedAt = status.lastAppliedAt;
   state.clients = clients.clients || [];
   state.exitOverview = overview;
@@ -678,6 +746,41 @@ async function renderServer() {
       }
     </div>
 
+    <div class="card endpoint-card" style="margin-top:16px">
+      <div class="card-head">
+        <h3>客户端连接地址（Endpoint）</h3>
+        <span class="badge">可改 · 入站</span>
+      </div>
+      <p class="field-hint">
+        手机真正去连的地址。<strong>不是</strong>诊断页的「出网 IP」，也<strong>不是</strong>面板 IP。
+        改完后手机必须<strong>删除旧隧道并重新扫码</strong>。
+      </p>
+      <div class="ep-split">
+        <div class="ep-host">
+          <label>入站 IP / 域名</label>
+          <input class="field mono" id="s-ep-host" placeholder="114.111.176.37" value="${esc(
+            splitEndpoint(s.endpoint, s.listenPort || 7901).host
+          )}" />
+        </div>
+        <div class="ep-port">
+          <label>端口</label>
+          <input class="field mono" id="s-ep-port" value="${esc(
+            splitEndpoint(s.endpoint, s.listenPort || 7901).port
+          )}" />
+        </div>
+      </div>
+      <input type="hidden" id="s-ep" value="${esc(s.endpoint || '')}" />
+      <div class="ep-presets">
+        <span class="muted small">快捷填入主机（端口沿用右侧）：</span>
+        <button type="button" class="chip" data-ep-host="114.111.176.37">外部连接 114.111.176.37</button>
+        <button type="button" class="chip" data-ep-host="211.136.162.184">移动入口 211.136.162.184</button>
+      </div>
+      <p class="field-hint">
+        当前合成：<code id="s-ep-preview">${esc(s.endpoint || '（未填）')}</code>
+        · 监听端口下方可改；勾选同步后保存会把 Endpoint 端口改成监听端口。
+      </p>
+    </div>
+
     <div class="card" style="margin-top:16px">
       <h3>连接参数</h3>
       <div class="inline-fields">
@@ -698,17 +801,9 @@ async function renderServer() {
           <input class="field mono" id="s-mtu" value="${esc(s.mtu ?? 1420)}" />
         </div>
       </div>
-      <label>客户端连接地址 Endpoint（入站）${help(
-        '手机连接的地址。填商家「外部连接 IP」或「移动入口」+ 端口。不是出网 IP，不是面板 IP。'
-      )}</label>
-      <input class="field mono" id="s-ep" placeholder="114.x.x.x:7901" value="${esc(s.endpoint || '')}" />
-      <p class="field-hint">
-        沪日 IX / 前置入口场景：优先 <code>外部连接IP:端口</code>，移动网再试 <code>移动入口:端口</code>。
-        可用端口段内选端口（如 7901），勿与 SSH 冲突。
-      </p>
       <label>DNS（客户端）</label>
       <input class="field mono" id="s-dns" value="${esc(s.dns || '1.1.1.1')}" />
-      <label class="check-row"><input type="checkbox" id="s-sync" checked /> 保存时同步 Endpoint 端口</label>
+      <label class="check-row"><input type="checkbox" id="s-sync" checked /> 保存时把 Endpoint 端口同步为监听端口</label>
     </div>
 
     <div class="card" style="margin-top:16px">
@@ -779,10 +874,44 @@ async function renderServer() {
   });
   if (agent) loadCmd();
 
+  const syncEpPreview = () => {
+    const host = val('s-ep-host');
+    const epPort = Number(val('s-ep-port')) || Number(val('s-port')) || 7901;
+    const joined = joinEndpoint(host, epPort);
+    const hid = document.getElementById('s-ep');
+    const prev = document.getElementById('s-ep-preview');
+    if (hid) hid.value = joined;
+    if (prev) prev.textContent = joined || '（未填）';
+  };
+  ['s-ep-host', 's-ep-port', 's-port'].forEach((id) => {
+    document.getElementById(id)?.addEventListener('input', syncEpPreview);
+  });
+  document.querySelectorAll('[data-ep-host]').forEach((b) => {
+    b.onclick = () => {
+      const hostEl = document.getElementById('s-ep-host');
+      if (hostEl) hostEl.value = b.dataset.epHost || '';
+      const portEl = document.getElementById('s-ep-port');
+      const listen = Number(val('s-port')) || 7901;
+      if (portEl && !val('s-ep-port')) portEl.value = String(listen);
+      if (portEl && document.getElementById('s-sync')?.checked) {
+        portEl.value = String(listen);
+      }
+      syncEpPreview();
+    };
+  });
+  syncEpPreview();
+
   document.getElementById('srv-save').onclick = async () => {
     try {
       const port = Number(val('s-port')) || 7901;
-      let ep = val('s-ep');
+      const epHost = val('s-ep-host');
+      let epPort = Number(val('s-ep-port')) || port;
+      if (document.getElementById('s-sync')?.checked) epPort = port;
+      const ep = joinEndpoint(epHost, epPort);
+      if (!epHost) {
+        toast('请填写入站 IP（Endpoint 主机）', 'err');
+        return;
+      }
       const body = {
         interfaceName: val('s-iface') || 'wg0',
         listenPort: port,
@@ -797,8 +926,27 @@ async function renderServer() {
       const r = await api('/api/server', { method: 'PUT', body });
       state.server = r.server;
       state.dirty = r.dirty;
-      toast('已保存');
-      render();
+      state.clientsNeedRescan = Boolean(r.clientsNeedRescan);
+      toast(r.tip || '已保存');
+      if (r.endpointChanged) {
+        openModal({
+          title: 'Endpoint 已更新',
+          body: `<p>新的连接地址：<code>${esc(r.server?.endpoint || ep)}</code></p>
+            <p class="field-hint">手机里的旧隧道<strong>不会自动变</strong>。请删除旧配置后到「客户端」重新扫码。</p>
+            <p class="field-hint">只改 Endpoint 时一般<strong>不必</strong>再点「应用配置」；改了监听端口/网段/NAT 才需要应用或一键落地。</p>`,
+          actions: `
+            <button class="btn btn-ghost" data-close>稍后</button>
+            <button class="btn btn-primary" id="ep-go-clients">去重新扫码</button>
+          `,
+        });
+        document.getElementById('ep-go-clients')?.addEventListener('click', () => {
+          closeModal();
+          state.page = 'clients';
+          render();
+        });
+      } else {
+        render();
+      }
     } catch (e) {
       toast(e.message, 'err');
     }
@@ -949,16 +1097,20 @@ function openClientModal(client) {
 async function showClientQr(id) {
   try {
     const data = await api(`/api/clients/${id}/config?format=qr`);
+    const ep = data.endpoint || state.server?.endpoint || '';
+    const rescan = state.clientsNeedRescan
+      ? `<div class="alert warn" style="margin-bottom:12px"><div><strong>请确认这是最新码</strong> · Endpoint 改过后必须删掉手机旧隧道再扫</div></div>`
+      : '';
     openModal({
       title: `客户端 · ${data.name || ''}`,
       body: `
+        ${rescan}
         <div class="qr-wrap"><img src="${data.qr}" alt="qr" /></div>
-        <p class="muted center">WireGuard 官方 App 扫码 · Endpoint: <code>${esc(
-          data.endpoint || state.server?.endpoint || ''
-        )}</code></p>
-        <p class="field-hint center">${esc(
-          data.tip || '打开隧道后到「诊断」查看是否握手；ifconfig.me 应显示落地机出口 IP'
-        )}</p>
+        <p class="muted center">WireGuard 官方 App 扫码</p>
+        <p class="center mono" style="font-size:13px">Endpoint: <strong>${esc(ep)}</strong></p>
+        <p class="field-hint center">
+          打开隧道 →「诊断」看握手。有握手后 ifconfig.me 应是<strong>落地机出网 IP</strong>（美国家宽），不是面板 IP，也不是 Endpoint 上的入站 IP。
+        </p>
         <div class="btn-row center">
           <button class="btn btn-ghost" id="qr-copy">复制配置</button>
           <a class="btn btn-primary" href="/api/clients/${id}/config?format=download">下载</a>
@@ -967,7 +1119,7 @@ async function showClientQr(id) {
           data.config
         )}</pre>
       `,
-      actions: `<button class="btn btn-primary" data-close>关闭</button>`,
+      actions: `<button class="btn btn-primary" data-close id="qr-close">关闭</button>`,
     });
     document.getElementById('qr-copy')?.addEventListener('click', async () => {
       try {
@@ -1088,6 +1240,46 @@ async function renderSettings() {
 }
 
 /* ========== 动作 ========== */
+let _jobPollTimer = null;
+function stopJobPoll() {
+  if (_jobPollTimer) {
+    clearInterval(_jobPollTimer);
+    _jobPollTimer = null;
+  }
+}
+function startJobPoll() {
+  stopJobPoll();
+  let n = 0;
+  _jobPollTimer = setInterval(async () => {
+    n += 1;
+    try {
+      await refreshCore();
+      const job = state.primaryNode?.latestJob || state.latestJob;
+      const pending = job && (job.status === 'pending' || job.status === 'running');
+      if (!pending || n >= 18) {
+        stopJobPoll();
+        if (job?.status === 'done') {
+          toast(job.message || '任务已完成');
+        } else if (job?.status === 'error' || job?.status === 'failed') {
+          toast(job.message || '任务失败', 'err');
+        }
+        render();
+        return;
+      }
+      // 轻量更新横幅：不整页重绘输入框
+      const main = document.querySelector('.main');
+      if (main) {
+        const alerts = topAlerts();
+        const first = main.firstElementChild;
+        // 粗略：重新 render 更稳
+        if (n % 2 === 0) render();
+      }
+    } catch {
+      /* ignore */
+    }
+  }, 4000);
+}
+
 async function applyConfig(confirmFirst = false) {
   if (confirmFirst) {
     const msg = isAgentMode()
@@ -1103,7 +1295,7 @@ async function applyConfig(confirmFirst = false) {
       openModal({
         title: '已下发任务',
         body: `<p>${esc(res.message)}</p>
-          <p class="field-hint">Agent 约 10 秒内拉取执行。可到「诊断」刷新查看接口/握手。</p>`,
+          <p class="field-hint">Agent 约 10 秒内拉取执行。顶部会显示任务状态；完成后「未应用」横幅应消失。</p>`,
         actions: `<button class="btn btn-primary" data-close>好的</button>
           <button class="btn btn-ghost" id="go-diag">打开诊断</button>`,
       });
@@ -1112,6 +1304,7 @@ async function applyConfig(confirmFirst = false) {
         state.page = 'diagnose';
         render();
       });
+      startJobPoll();
     }
     await refreshCore();
     render();
@@ -1132,13 +1325,14 @@ async function setupExit(apply = true) {
       body: { apply, fullTunnelClients: true },
     });
     toast(res.message || '完成', res.ok ? 'ok' : 'err');
+    if (res.pending) startJobPoll();
     openModal({
       title: res.ok ? '落地任务已处理' : '落地结果',
       body: `
         <p>${esc(res.message || '')}</p>
         ${
           res.pending
-            ? '<p class="field-hint">远程任务排队中，请等 Agent 在线并执行，然后打开「诊断」。</p>'
+            ? '<p class="field-hint">远程任务排队中。顶部会显示执行状态，完成后请打开「诊断」。</p>'
             : ''
         }
         <p class="field-hint">然后：客户端扫码 → 打开隧道 → 诊断看握手 → ifconfig.me 应是<strong>落地机</strong>出口 IP（美国家宽），不是面板 IP。</p>

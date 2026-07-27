@@ -1173,12 +1173,38 @@ async function diagnose(state, opts = {}) {
   });
 
   if (exitPublicIp) {
+    const sameAsEp =
+      ep.ok && ep.host && String(exitPublicIp).trim() === String(ep.host).trim();
     push({
       id: 'egress_ip',
-      level: 'info',
-      title: '当前出网 IP（勿当 Endpoint）',
-      detail: exitPublicIp,
-      fix: '这是服务器访问外网时的 IP，不是手机应连接的入站地址',
+      level: sameAsEp ? 'warn' : 'info',
+      title: '当前出网 IP（只读，勿填进 Endpoint）',
+      detail: sameAsEp
+        ? `${exitPublicIp} · 与 Endpoint 主机相同（CM/前置入口场景通常不对）`
+        : `${exitPublicIp} · 与入站 Endpoint 不同是正常的`,
+      fix: sameAsEp
+        ? '商家前置入口场景：Endpoint 应填「外部连接 IP」或「移动入口」，不是落地机出网 IP'
+        : '手机 ifconfig.me 成功后应接近这个出网 IP；连接地址仍用 Endpoint',
+    });
+  }
+
+  if (opts.clientsNeedRescan) {
+    push({
+      id: 'need_rescan',
+      level: 'warn',
+      title: '需要重新扫码',
+      detail: 'Endpoint 等连接参数已改过，手机旧隧道仍是旧地址',
+      fix: '在手机删除旧 WireGuard 隧道 → 打开「客户端」重新扫码',
+    });
+  }
+
+  if (opts.dirty) {
+    push({
+      id: 'dirty',
+      level: 'warn',
+      title: '有未应用的更改',
+      detail: mode === 'agent' ? '面板已保存，尚未下发到落地机' : '面板已保存，尚未写入本机 WireGuard',
+      fix: '点「应用配置」或「一键落地」',
     });
   }
 

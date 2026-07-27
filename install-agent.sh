@@ -70,7 +70,7 @@ chmod 755 "${APP_DIR}/index.js"
 cat > "${APP_DIR}/package.json" <<EOF
 {
   "name": "wg-agent",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "private": true,
   "main": "index.js"
 }
@@ -114,7 +114,7 @@ sleep 2
 if systemctl is-active --quiet "${SERVICE_NAME}"; then
   echo ""
   echo "=========================================="
-  echo "  Agent 已安装并运行 (v1.4.0)"
+  echo "  Agent 已安装并运行 (v1.4.1)"
   echo "  名称: ${NAME}"
   echo "  面板: ${PANEL_URL}"
   echo "  服务: systemctl status ${SERVICE_NAME}"

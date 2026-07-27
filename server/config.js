@@ -28,6 +28,7 @@ function defaultState() {
     forcePasswordChange: false,
     sessionSecret: crypto.randomBytes(32).toString('hex'),
     wizardDone: false,
+    clientsNeedRescan: false,
     lastAppliedHash: null,
     lastAppliedAt: null,
     server: {

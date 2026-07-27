@@ -82,13 +82,39 @@ function markDirtyUnified() {
   }
 }
 
+function isUnifiedDirty() {
+  if (state.mode === 'agent') {
+    const primary = nodes.getPrimaryNode(state);
+    return primary ? nodes.isNodeDirty(primary, wg) : false;
+  }
+  return wg.isDirty(state);
+}
+
 function publicModeInfo() {
   const primary = nodes.getPrimaryNode(state);
+  const pub = primary ? nodes.publicNode(primary) : null;
+  if (pub && primary) {
+    pub.dirty = nodes.isNodeDirty(primary, wg);
+    // 最近任务摘要
+    const jobs = primary.jobs || [];
+    const latest = jobs[0] || null;
+    pub.latestJob = latest
+      ? {
+          id: latest.id,
+          type: latest.type,
+          status: latest.status,
+          message: latest.result?.message || '',
+          createdAt: latest.createdAt,
+          finishedAt: latest.finishedAt,
+        }
+      : null;
+  }
   return {
     mode: state.mode || 'local',
     primaryNodeId: state.primaryNodeId || null,
-    primaryNode: primary ? nodes.publicNode(primary) : null,
+    primaryNode: pub,
     showAdvancedNodes: Boolean(state.settings?.showAdvancedNodes),
+    clientsNeedRescan: Boolean(state.clientsNeedRescan),
   };
 }
 
@@ -170,15 +196,7 @@ app.get('/api/status', async (req, res) => {
       iface = await wg.getInterfaceStatus(state.server.interfaceName);
     }
   }
-  let dirty = false;
-  if (loggedIn) {
-    if (state.mode === 'agent') {
-      const primary = nodes.getPrimaryNode(state);
-      dirty = primary ? nodes.isNodeDirty(primary) : false;
-    } else {
-      dirty = wg.isDirty(state);
-    }
-  }
+  const dirty = loggedIn ? isUnifiedDirty() : false;
   res.json({
     needSetup: auth.needsSetup(state),
     loggedIn,
@@ -196,6 +214,7 @@ app.get('/api/status', async (req, res) => {
     primaryNodeId: modeInfo.primaryNodeId,
     primaryNode: loggedIn ? modeInfo.primaryNode : undefined,
     showAdvancedNodes: modeInfo.showAdvancedNodes,
+    clientsNeedRescan: loggedIn ? Boolean(state.clientsNeedRescan) : false,
     server: loggedIn
       ? {
           interfaceName: state.server.interfaceName,
@@ -301,14 +320,25 @@ app.get('/api/server', (req, res) => {
   res.json({
     server: publicServer(state.server),
     wizardDone: state.wizardDone,
-    dirty: wg.isDirty(state),
+    dirty: isUnifiedDirty(),
     lastAppliedAt: state.lastAppliedAt,
+    clientsNeedRescan: Boolean(state.clientsNeedRescan),
   });
 });
 
 app.put('/api/server', (req, res) => {
   const body = req.body || {};
   const s = state.server;
+  const prevEndpoint = String(s.endpoint || '');
+  const prevListen = Number(s.listenPort);
+  const prevServerHash = (() => {
+    try {
+      return wg.configHash({ server: { ...s }, clients: state.clients });
+    } catch {
+      return null;
+    }
+  })();
+
   const fields = [
     'interfaceName',
     'listenPort',
@@ -329,10 +359,19 @@ app.put('/api/server', (req, res) => {
   }
   if (body.mtu !== undefined) s.mtu = body.mtu === '' || body.mtu === null ? null : Number(body.mtu);
 
-  // 端口变更时，若 endpoint 只有 host 或端口不一致，可自动同步
+  // 端口变更时同步 Endpoint 端口
   if (body.syncEndpointPort && s.endpoint) {
-    const host = String(s.endpoint).split(':')[0];
+    const parsed = wg.parseEndpoint(s.endpoint);
+    const host = parsed.host || String(s.endpoint).replace(/:\d+$/, '');
     if (host) s.endpoint = `${host}:${s.listenPort}`;
+  }
+
+  // 规范化 endpoint：host:port
+  if (s.endpoint) {
+    const ep = String(s.endpoint).trim();
+    if (ep && !ep.includes(':') && s.listenPort) {
+      s.endpoint = `${ep}:${s.listenPort}`;
+    }
   }
 
   if (body.regenerateKeys) {
@@ -349,16 +388,58 @@ app.put('/api/server', (req, res) => {
 
   wg.ensureServerKeys(state);
   if (body.wizardDone !== undefined) state.wizardDone = Boolean(body.wizardDone);
-  markDirtyUnified();
+
+  const endpointChanged = prevEndpoint !== String(s.endpoint || '');
+  if (endpointChanged) state.clientsNeedRescan = true;
+
+  // 始终把统一 server 同步到主节点（含 endpoint）
+  if (state.mode === 'agent') nodes.syncPrimaryFromState(state);
+
+  // 用服务端 conf hash 判断是否真的需要 apply（endpoint/dns 不在服务端 conf 里）
+  let serverConfChanged = Boolean(body.regenerateKeys || body.privateKey);
+  try {
+    const nextHash = wg.configHash({ server: { ...s }, clients: state.clients });
+    if (prevServerHash && nextHash !== prevServerHash) serverConfChanged = true;
+    if (!serverConfChanged && prevServerHash && nextHash === prevServerHash) {
+      // 仅客户端侧字段：清掉误标脏
+      if (state.mode === 'agent') {
+        const node = nodes.getPrimaryNode(state);
+        if (node && node.lastAppliedHash && nextHash === node.lastAppliedHash) {
+          node._dirtyFlag = false;
+        }
+      }
+    }
+  } catch {
+    serverConfChanged = true;
+  }
+
+  if (serverConfChanged) markDirtyUnified();
+
   persist();
+  const tipParts = [];
+  if (endpointChanged) {
+    tipParts.push('Endpoint 已更新。手机旧隧道不会自动变，请删除后重新扫码');
+  }
+  if (serverConfChanged) {
+    tipParts.push(isUnifiedDirty() ? '服务端配置有变，请点「应用配置」或「一键落地」' : '');
+  }
   res.json({
     server: publicServer(state.server),
     wizardDone: state.wizardDone,
-    dirty: state.mode === 'agent'
-      ? Boolean(nodes.getPrimaryNode(state) && nodes.isNodeDirty(nodes.getPrimaryNode(state)))
-      : wg.isDirty(state),
+    dirty: isUnifiedDirty(),
     mode: state.mode,
+    endpointChanged,
+    serverConfChanged,
+    clientsNeedRescan: Boolean(state.clientsNeedRescan),
+    tip: tipParts.filter(Boolean).join('。') || '已保存',
   });
+});
+
+/** 确认用户已重扫全部客户端 */
+app.post('/api/clients/rescan-ack', (req, res) => {
+  state.clientsNeedRescan = false;
+  persist();
+  res.json({ ok: true, clientsNeedRescan: false });
 });
 
 app.post('/api/server/nat-template', async (req, res) => {
@@ -500,10 +581,6 @@ app.get('/api/clients', async (req, res) => {
     iface = await wg.getInterfaceStatus(state.server.interfaceName);
   }
   const map = peerMapFromStatus(iface);
-  const dirty =
-    state.mode === 'agent'
-      ? Boolean(nodes.getPrimaryNode(state) && nodes.isNodeDirty(nodes.getPrimaryNode(state)))
-      : wg.isDirty(state);
   res.json({
     clients: state.clients.map((c) => {
       const live = map.get(c.publicKey);
@@ -515,7 +592,8 @@ app.get('/api/clients', async (req, res) => {
       }
       return pub;
     }),
-    dirty,
+    dirty: isUnifiedDirty(),
+    clientsNeedRescan: Boolean(state.clientsNeedRescan),
     interfaceUp: Boolean(iface.up),
     mode: state.mode,
   });
@@ -728,10 +806,11 @@ app.post('/api/apply', async (req, res) => {
       job,
       healedClients: healed,
       message: node.lastSeenAt
-        ? '已向落地节点下发「应用配置」，等待 Agent 执行'
+        ? '已向落地节点下发「应用配置」，等待 Agent 执行（约 10 秒）'
         : '任务已创建，但 Agent 尚未上线',
       node: nodes.publicNode(node),
-      dirty: true,
+      dirty: isUnifiedDirty(),
+      clientsNeedRescan: Boolean(state.clientsNeedRescan),
     });
   }
 
@@ -743,8 +822,9 @@ app.post('/api/apply', async (req, res) => {
     mode: 'local',
     healedClients: healed,
     interface: iface,
-    dirty: wg.isDirty(state),
+    dirty: isUnifiedDirty(),
     lastAppliedAt: state.lastAppliedAt,
+    clientsNeedRescan: Boolean(state.clientsNeedRescan),
   });
 });
 
@@ -940,7 +1020,25 @@ app.get('/api/diagnose', async (req, res) => {
       agentOnline: primary ? nodes.isNodeOnline(primary) : false,
       hostname: primary?.hostname,
       agentVersion: primary?.agentVersion,
+      clientsNeedRescan: Boolean(state.clientsNeedRescan),
+      dirty: isUnifiedDirty(),
     });
+    result.clientsNeedRescan = Boolean(state.clientsNeedRescan);
+    result.dirty = isUnifiedDirty();
+    if (primary) {
+      const jobs = primary.jobs || [];
+      const latest = jobs[0] || null;
+      result.latestJob = latest
+        ? {
+            id: latest.id,
+            type: latest.type,
+            status: latest.status,
+            message: latest.result?.message || '',
+            createdAt: latest.createdAt,
+            finishedAt: latest.finishedAt,
+          }
+        : null;
+    }
     res.json(result);
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });

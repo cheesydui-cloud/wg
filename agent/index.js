@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Edge Agent v4.2.0 — mieru / mita 落地（支持多落地 + 流量/套餐）
+ * Edge Agent v4.2.2 — mieru / mita 落地（支持多落地 + 流量/套餐）
  * 连接中心面板，拉取任务：安装/应用 mita、上报状态与用量
  *
  * 环境变量：
@@ -19,7 +19,7 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
-const VERSION = '4.2.0';
+const VERSION = '4.2.2';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';
@@ -96,9 +96,16 @@ async function maybeSelfUpdate(panelVersion) {
       /* */
     }
     fs.writeFileSync(selfPath, text, { mode: 0o755 });
+    try {
+      const verFile = path.join(path.dirname(selfPath), 'VERSION');
+      const m = text.match(/const VERSION = ['"]([^'"]+)['"]/);
+      if (m) fs.writeFileSync(verFile, m[1] + '\n');
+    } catch {
+      /* */
+    }
     console.log(`[agent] 已写入 ${selfPath}，即将退出由 systemd 重启（目标 ${panelVersion}）`);
-    // 给上报一点时间
-    setTimeout(() => process.exit(0), 500);
+    // 任务已在本 tick 处理完；稍后再退
+    setTimeout(() => process.exit(0), 800);
     return true;
   } catch (e) {
     console.warn('[agent] 自更新失败:', e.message);
@@ -996,10 +1003,8 @@ async function tick() {
     status,
   };
   const res = await request('POST', '/api/agent/heartbeat', body);
-  // 面板版本更高时自动拉新 agent（systemd Restart=always）
-  if (res.panelVersion && (await maybeSelfUpdate(res.panelVersion))) {
-    return;
-  }
+  // 必须先执行本轮已下发的任务，再自更新。
+  // 旧逻辑：发现面板版本高 → 立刻 exit → 本轮 job 已 lease 却未执行 → 2 分钟后「任务超时，已重新排队」死循环。
   const jobs = res.jobs || [];
   for (const job of jobs) {
     let result;
@@ -1019,6 +1024,10 @@ async function tick() {
     } catch (err) {
       console.error('[agent] 上报失败:', err.message);
     }
+  }
+  // 任务完成后再自更新（systemd Restart=always 拉起新版本）
+  if (res.panelVersion && (await maybeSelfUpdate(res.panelVersion))) {
+    return;
   }
 }
 

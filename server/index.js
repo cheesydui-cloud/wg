@@ -358,6 +358,14 @@ function buildBundleForNode(node) {
 
 function enqueueApply(node, type = 'mieru_apply') {
   nodes.markNodeDirty(node);
+  // 清掉已 error 的同类旧任务展示噪音（不影响 pending 去重）
+  if (Array.isArray(node.jobs)) {
+    for (const j of node.jobs) {
+      if (j.type === type && j.status === 'error' && j.result?.message?.includes('超时')) {
+        j.status = 'cancelled';
+      }
+    }
+  }
   return nodes.enqueueJob(node, type, {});
 }
 

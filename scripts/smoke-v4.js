@@ -523,5 +523,23 @@ ok('publicTopology per-IX ingress/endpoints');
   ok('agent hello must not overwrite panel landing name');
 }
 
+
+// 17) 任务 lease 超时回收：多次后 error，避免永久 pending
+{
+  const node = { jobs: [] };
+  const job = {
+    id: 'j1',
+    type: 'mieru_apply',
+    status: 'running',
+    startedAt: new Date(Date.now() - 11 * 60 * 1000).toISOString(),
+    leaseUntil: new Date(Date.now() - 60 * 1000).toISOString(),
+    reclaimCount: 4,
+  };
+  node.jobs = [job];
+  nodes.reclaimStaleJobs(node);
+  assert.strictEqual(job.status, 'error', '5th reclaim → error');
+  ok('job lease reclaim marks error after 5');
+}
+
 console.log('\nsmoke-v4: all passed');
 console.log('tmp data:', tmp);

@@ -3,7 +3,7 @@
 中文、新手友好的 **mieru / mita 拓扑出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v4.2.1**（固定面板升级命令）
+当前版本：**v4.2.2**（修 apply 任务超时死循环 · Agent 先执行任务再自更新）
 
 - 每台 IX 独立商家前置（IP/域名）与端口段
 - 拓扑 = IX 工作台；落地列表点开详情；客户端按落地分组
@@ -31,6 +31,11 @@
 | **兼容 v3.1** | 单前置 / 单 IX / 单落地自动迁成一条路由，Endpoint 保留 |
 
 路径保持不变。业务流量不经面板。
+
+### v4.2.2
+
+- **修「任务超时，已重新排队」死循环**：旧 Agent 在 heartbeat 领到 apply 任务后若先自更新 exit，任务已 lease 却未执行，2 分钟后反复超时。现改为**先跑完任务再自更新**；任务 lease 延长至 10 分钟；多次超时后标记失败而非永久 pending。
+- Agent 版本对齐 **4.2.2**。
 
 ### v4.2.1
 
@@ -150,7 +155,7 @@ git clone https://github.com/cheesydui-cloud/wg.git ~/wg
 cd ~/wg && sudo bash install.sh
 ```
 
-打开 `http://面板IP:51821`，确认版本 **v4.2.1**。
+打开 `http://面板IP:51821`，确认版本 **v4.2.2**。
 
 忘记密码：
 

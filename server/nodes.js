@@ -2,7 +2,7 @@ const crypto = require('crypto');
 
 const ONLINE_MS = 90 * 1000;
 const JOB_KEEP = 40;
-const JOB_LEASE_MS = 120 * 1000; // running 超过 2 分钟可回收重试
+const JOB_LEASE_MS = 10 * 60 * 1000; // 10 分钟：mita install/reconfigure 可能较慢；过短会导致「任务超时重排队」
 
 function hashToken(token) {
   return crypto.createHash('sha256').update(String(token)).digest('hex');
@@ -332,10 +332,27 @@ function reclaimStaleJobs(node) {
     const started = job.startedAt ? new Date(job.startedAt).getTime() : 0;
     const leaseEnd = job.leaseUntil ? new Date(job.leaseUntil).getTime() : started + JOB_LEASE_MS;
     if (!started || now > leaseEnd) {
-      job.status = 'pending';
-      job.startedAt = null;
-      job.leaseUntil = null;
-      job.result = job.result || { ok: false, message: '任务超时，已重新排队' };
+      job.reclaimCount = (job.reclaimCount || 0) + 1;
+      // 多次超时仍无结果：标 error，避免永久 pending 刷屏
+      if (job.reclaimCount >= 5) {
+        job.status = 'error';
+        job.finishedAt = new Date().toISOString();
+        job.startedAt = null;
+        job.leaseUntil = null;
+        job.result = {
+          ok: false,
+          message:
+            '任务多次超时未完成。请检查落地 Agent 日志 journalctl -u wg-agent -n 50；确认 mita 正常后重新点「应用配置」',
+        };
+      } else {
+        job.status = 'pending';
+        job.startedAt = null;
+        job.leaseUntil = null;
+        job.result = {
+          ok: false,
+          message: `任务超时，已重新排队（${job.reclaimCount}/5）`,
+        };
+      }
       n += 1;
     }
   }

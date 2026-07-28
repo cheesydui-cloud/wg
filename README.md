@@ -3,7 +3,7 @@
 中文、新手友好的 **mieru / mita 拓扑出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v4.1.7**（修编辑用户「用户不存在」· 补齐缺失 client.id）
+当前版本：**v4.1.8**（修创建用户绑 pro3 后 apply 报无用户 · landing id 唯一）
 
 - 每台 IX 独立商家前置（IP/域名）与端口段
 - 拓扑 = IX 工作台；落地列表点开详情；客户端按落地分组
@@ -31,6 +31,12 @@
 | **兼容 v3.1** | 单前置 / 单 IX / 单落地自动迁成一条路由，Endpoint 保留 |
 
 路径保持不变。业务流量不经面板。
+
+### v4.1.8
+- 修复：客户端列表在 pro3 下有用户，点「应用本落地」却报没有绑定用户
+- 统一 resolveLandingNodeId / clientsForNode 与 UI 分组规则
+- 多落地 landing.id 去重（旧数据 landing-default 重复）
+- 保存/创建时规范化 landingNodeId 为 nodeId
 
 ### v4.1.7
 - 修复：编辑/保存用户报「用户不存在」——旧数据缺 id 或 PUT 路径无效
@@ -114,7 +120,7 @@ sudo bash install.sh --update
 # 新装：sudo bash install.sh
 ```
 
-打开 `http://面板IP:51821`，确认版本 **v4.1.7**。
+打开 `http://面板IP:51821`，确认版本 **v4.1.8**。
 
 忘记密码：
 
@@ -212,7 +218,7 @@ sudo bash install.sh --update
 - **2.x → 4.0**：补拓扑 + 多落地字段  
 - **1.x → 4.0**：WG 归档；重装 Agent；新建 mieru 用户  
 
-升级前建议备份 `data/state.json`。落地机建议再执行一次 Agent 安装命令以对齐 **agent v4.1.7**（用量/配额）。
+升级前建议备份 `data/state.json`。落地机建议再执行一次 Agent 安装命令以对齐 **agent v4.1.8**（用量/配额）。
 
 本地回归：
 

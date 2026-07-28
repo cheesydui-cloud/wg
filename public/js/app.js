@@ -1831,7 +1831,11 @@ async function renderClients() {
     b.onclick = () => openClientModal(null, b.dataset.addLanding || primaryId);
   });
   document.querySelectorAll('[data-apply-landing]').forEach((b) => {
-    b.onclick = () => applyConfig(true, { nodeId: b.dataset.applyLanding });
+    b.onclick = () => {
+      const nodeId = (b.dataset.applyLanding || '').trim();
+      if (!nodeId) return toast('落地 id 缺失，请刷新页面', 'err');
+      applyConfig(true, { nodeId });
+    };
   });
   document.querySelectorAll('[data-qr]').forEach((b) => {
     b.onclick = () => showClientQr(b.dataset.qr);
@@ -1933,8 +1937,14 @@ function openClientModal(client, preferLandingId) {
   });
   document.getElementById('c-save').onclick = async () => {
     try {
-      const landingNodeId = val('c-landing') || null;
+      const landingNodeId = (val('c-landing') || '').trim() || null;
       const L = landingByNodeId(landingNodeId);
+      // 校验下拉值必须是已知 node.id，避免绑到错误 id
+      const known = (state.nodes || []).some((n) => n.id === landingNodeId);
+      if (landingNodeId && !known) {
+        toast('绑定落地无效，请重新选择落地后再保存', 'err');
+        return;
+      }
       const body = {
         name: val('c-name') || client?.name,
         note: val('c-note'),

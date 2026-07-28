@@ -217,10 +217,13 @@ function ensureClientFields(c, primaryNodeId = null) {
   }
   if (!c.route || typeof c.route !== 'object') c.route = defaultClientRoute(primaryNodeId);
   else {
+    let lid = c.route.landingNodeId;
+    if (lid != null) lid = String(lid).trim() || null;
     c.route = {
       ...defaultClientRoute(primaryNodeId),
       ...c.route,
-      landingNodeId: c.route.landingNodeId || primaryNodeId || null,
+      // 空串视为未绑定 → 主落地；有值则保留（apply 时再 resolve）
+      landingNodeId: lid || primaryNodeId || null,
     };
   }
   if (!c.package || typeof c.package !== 'object') c.package = defaultClientPackage();

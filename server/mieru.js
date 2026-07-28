@@ -112,8 +112,51 @@ function ensureMieruDefaults(state) {
   return state;
 }
 
-function clientLandingNodeId(client, state) {
-  return client?.route?.landingNodeId || state?.primaryNodeId || null;
+/**
+ * 把各种「落地引用」规范成 nodes[].id
+ * 兼容：nodeId / topology.landings[].id / 唯一名称；trim；拒绝空串
+ * 注意：旧数据 landings 可能共用 id=landing-default，此时不能只按 id 取第一台
+ */
+function resolveLandingNodeId(state, raw, { fallbackPrimary = false } = {}) {
+  const s = raw == null ? '' : String(raw).trim();
+  if (!s) return fallbackPrimary ? state?.primaryNodeId || null : null;
+
+  const nodeList = Array.isArray(state?.nodes) ? state.nodes : [];
+  if (nodeList.some((n) => n && String(n.id) === s)) return s;
+
+  let landings = [];
+  try {
+    const topology = require('./topology');
+    if (state) topology.ensureTopology(state);
+    landings = state?.topology?.landings || [];
+  } catch {
+    landings = state?.topology?.landings || [];
+  }
+
+  // 已是某落地的 nodeId
+  if (landings.some((L) => L && String(L.nodeId) === s)) return s;
+
+  const byLandingId = landings.filter((L) => L && String(L.id) === s && L.nodeId);
+  if (byLandingId.length === 1) return String(byLandingId[0].nodeId);
+  // 重复 landing.id：无法仅凭 id 判定，留给 clientsForNode 按 nodeId 反查
+
+  const byLName = landings.filter((L) => L && String(L.name || '') === s && L.nodeId);
+  if (byLName.length === 1) return String(byLName[0].nodeId);
+
+  const byNName = nodeList.filter((n) => n && String(n.name || '') === s);
+  if (byNName.length === 1 && byNName[0].id) return byNName[0].id;
+
+  // 不盲目返回歧义 id
+  if (byLandingId.length > 1) return null;
+  return s;
+}
+
+function clientLandingNodeId(client, state, opts = {}) {
+  const raw = client?.route?.landingNodeId;
+  const resolved = resolveLandingNodeId(state, raw, { fallbackPrimary: false });
+  if (resolved) return resolved;
+  if (opts.fallbackPrimary === false) return null;
+  return state?.primaryNodeId || null;
 }
 
 function clientListenPort(client, state, node) {
@@ -129,15 +172,40 @@ function clientListenPort(client, state, node) {
   return Number(state?.server?.listenPort) || 7901;
 }
 
+/** 判断客户端是否应归属某落地 nodeId（与 UI 分组/apply 同一规则） */
+function clientBelongsToNode(state, client, nodeId) {
+  const want = String(
+    resolveLandingNodeId(state, nodeId, { fallbackPrimary: false }) || nodeId || ''
+  );
+  if (!want) return false;
+  const primary = state?.primaryNodeId ? String(state.primaryNodeId) : '';
+  const raw = client?.route?.landingNodeId;
+  const rawS = raw == null ? '' : String(raw).trim();
+  if (!rawS) return Boolean(primary) && want === primary;
+
+  if (rawS === want) return true;
+
+  const resolved = resolveLandingNodeId(state, rawS, { fallbackPrimary: false });
+  if (resolved && String(resolved) === want) return true;
+
+  const landings = state?.topology?.landings || [];
+  // 绑定的是 landing 拓扑 id/名，且该记录的 nodeId 就是目标落地
+  if (
+    landings.some(
+      (L) =>
+        L &&
+        String(L.nodeId || '') === want &&
+        (String(L.id) === rawS || String(L.name || '') === rawS)
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
 function clientsForNode(state, nodeId) {
   ensureMieruDefaults(state);
-  const primary = state.primaryNodeId;
-  return (state.clients || []).filter((c) => {
-    const lid = clientLandingNodeId(c, state);
-    if (lid) return lid === nodeId;
-    // unbound → primary only
-    return nodeId === primary;
-  });
+  return (state.clients || []).filter((c) => clientBelongsToNode(state, c, nodeId));
 }
 
 function enabledUsers(state, nodeId = null) {
@@ -398,7 +466,9 @@ function publicClient(c, state = null) {
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
     route: {
-      landingNodeId: route.landingNodeId || state?.primaryNodeId || null,
+      // 与 apply/clientsForNode 同一套解析，避免「列表在 pro3 下、应用却说没用户」
+      landingNodeId: clientLandingNodeId(c, state),
+      landingNodeIdRaw: route.landingNodeId || null,
       ixId: route.ixId || null,
       listenPort: route.listenPort || null,
       ingressActive: route.ingressActive || null,
@@ -699,7 +769,9 @@ module.exports = {
   ensureMieruDefaults,
   enabledUsers,
   clientsForNode,
+  clientBelongsToNode,
   clientLandingNodeId,
+  resolveLandingNodeId,
   clientListenPort,
   buildServerConfig,
   configHash,

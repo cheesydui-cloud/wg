@@ -216,7 +216,16 @@ function applyRoutePackageBody(client, body) {
   if (body.route && typeof body.route === 'object') {
     const r = body.route;
     if (r.landingNodeId !== undefined) {
-      client.route.landingNodeId = r.landingNodeId || state.primaryNodeId || null;
+      const raw = r.landingNodeId;
+      if (raw === null || raw === '' || raw === undefined) {
+        client.route.landingNodeId = state.primaryNodeId || null;
+      } else {
+        client.route.landingNodeId =
+          mieru.resolveLandingNodeId(state, raw, { fallbackPrimary: false }) ||
+          String(raw).trim() ||
+          state.primaryNodeId ||
+          null;
+      }
     }
     if (r.ixId !== undefined) client.route.ixId = r.ixId || null;
     if (r.listenPort !== undefined) {
@@ -228,7 +237,16 @@ function applyRoutePackageBody(client, body) {
   }
   // flat fields convenience
   if (body.landingNodeId !== undefined) {
-    client.route.landingNodeId = body.landingNodeId || state.primaryNodeId || null;
+    const raw = body.landingNodeId;
+    if (raw === null || raw === '' || raw === undefined) {
+      client.route.landingNodeId = state.primaryNodeId || null;
+    } else {
+      client.route.landingNodeId =
+        mieru.resolveLandingNodeId(state, raw, { fallbackPrimary: false }) ||
+        String(raw).trim() ||
+        state.primaryNodeId ||
+        null;
+    }
   }
   if (body.listenPort !== undefined) {
     client.route.listenPort = body.listenPort ? Number(body.listenPort) : null;
@@ -799,6 +817,12 @@ app.post('/api/clients', (req, res) => {
   ensureClientFields(client, state.primaryNodeId);
   applyRoutePackageBody(client, body);
   if (!client.route.landingNodeId) client.route.landingNodeId = state.primaryNodeId;
+  // 再规范化一次，保证落盘的是 nodeId 而非 landing 拓扑 id
+  if (client.route.landingNodeId) {
+    client.route.landingNodeId =
+      mieru.resolveLandingNodeId(state, client.route.landingNodeId, { fallbackPrimary: false }) ||
+      client.route.landingNodeId;
+  }
   state.clients.push(client);
   state.wizardDone = true;
   markDirtyForClient(client);
@@ -1150,12 +1174,32 @@ app.post('/api/nodes/:id/apply', (req, res) => {
   const node = nodes.findNode(state, req.params.id);
   if (!node) return res.status(404).json({ error: '节点不存在' });
   mieru.ensureMieruDefaults(state);
+  // 写回规范化绑定，避免 landing.id / 空格导致 apply 找不到人
+  for (const c of state.clients || []) {
+    if (c.route?.landingNodeId) {
+      const nrm = mieru.resolveLandingNodeId(state, c.route.landingNodeId, {
+        fallbackPrimary: false,
+      });
+      if (nrm) c.route.landingNodeId = nrm;
+    }
+  }
   const bound = mieru.clientsForNode(state, node.id).filter((c) => c.enabled !== false);
   if (!bound.length) {
+    const dist = (state.clients || [])
+      .map((c) => {
+        const lid = mieru.clientLandingNodeId(c, state);
+        const nn = nodes.findNode(state, lid)?.name || lid || '未绑定';
+        return `${c.name}→${nn}`;
+      })
+      .join('；');
     return res.status(400).json({
       ok: false,
       code: 'NO_USERS',
-      error: `「${node.name}」还没有绑定用户。请到客户端把用户改绑到本落地，再点「应用本落地」`,
+      error: `「${node.name}」还没有绑定用户（nodeId=${node.id.slice(0, 8)}…）。当前绑定：${
+        dist || '无用户'
+      }。请编辑用户把「绑定落地」选成「${node.name}」后保存，再点应用`,
+      nodeId: node.id,
+      boundSample: dist,
     });
   }
   const job = enqueueApply(node, 'mieru_apply');
@@ -1173,12 +1217,20 @@ app.post('/api/nodes/:id/exit', (req, res) => {
   const node = nodes.findNode(state, req.params.id);
   if (!node) return res.status(404).json({ error: '节点不存在' });
   mieru.ensureMieruDefaults(state);
+  for (const c of state.clients || []) {
+    if (c.route?.landingNodeId) {
+      const nrm = mieru.resolveLandingNodeId(state, c.route.landingNodeId, {
+        fallbackPrimary: false,
+      });
+      if (nrm) c.route.landingNodeId = nrm;
+    }
+  }
   const bound = mieru.clientsForNode(state, node.id).filter((c) => c.enabled !== false);
   if (!bound.length) {
     return res.status(400).json({
       ok: false,
       code: 'NO_USERS',
-      error: `「${node.name}」没有绑定用户，无法一键落地。先到客户端把用户绑到本落地，再点「一键落地」`,
+      error: `「${node.name}」没有绑定用户，无法一键落地。先到客户端把用户「绑定落地」选成「${node.name}」并保存`,
     });
   }
   const job = enqueueApply(node, 'exit');

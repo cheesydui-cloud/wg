@@ -69,9 +69,27 @@ function defaultIx(overrides = {}, globalIngress = null) {
   };
 }
 
+
+/** 保证 landings[].id 唯一（旧数据可能全是 landing-default） */
+function uniquifyLandingIds(t) {
+  if (!t || !Array.isArray(t.landings)) return t;
+  const seen = new Set();
+  for (let i = 0; i < t.landings.length; i++) {
+    const L = t.landings[i];
+    if (!L) continue;
+    let id = L.id || '';
+    if (!id || seen.has(id)) {
+      L.id = newId('landing');
+    }
+    seen.add(L.id);
+  }
+  return t;
+}
+
 function defaultLanding(overrides = {}) {
   return {
-    id: overrides.id || 'landing-default',
+    // 多落地时禁止共用 landing-default，否则按 landing.id 解析会命中第一台
+    id: overrides.id || newId('landing'),
     nodeId: overrides.nodeId || null,
     ixId: overrides.ixId || null,
     name: overrides.name || '落地家宽',
@@ -376,6 +394,7 @@ function ensureTopology(state) {
   const host = ingressHostFrom(t.ingress);
   state.server.endpoint = host ? `${host}:${t.ingress.port}` : '';
 
+  uniquifyLandingIds(t);
   return state.topology;
 }
 
@@ -1009,6 +1028,7 @@ module.exports = {
   defaultIx,
   defaultIxIngress,
   defaultLanding,
+  uniquifyLandingIds,
   ensureTopology,
   migrateLegacyTopology,
   activeEndpoint,

@@ -306,5 +306,80 @@ ok('publicTopology per-IX ingress/endpoints');
 }
 }
 
+
+// 13) clientsForNode / resolveLandingNodeId：UI 分组与 apply 必须一致
+{
+  const primary = 'node-primary-uuid';
+  const pro3 = 'node-pro3-uuid';
+  const st = {
+    primaryNodeId: primary,
+    nodes: [
+      { id: primary, name: '落地出口' },
+      { id: pro3, name: 'pro3' },
+    ],
+    server: { listenPort: 7901, protocol: 'TCP', mtu: 1400, multiplexing: 'MULTIPLEXING_LOW' },
+    topology: {
+      landings: [
+        { id: 'landing-primary', name: '落地出口', nodeId: primary, listenPort: 7901, ixId: 'ix1' },
+        { id: 'landing-pro3', name: 'pro3', nodeId: pro3, listenPort: 7902, ixId: 'ix1' },
+      ],
+      ixes: [{ id: 'ix1', name: '沪日IX', portMin: 7900, portMax: 7999 }],
+      ingress: { active: 'external', externalHost: '1.1.1.1', mobileHost: '2.2.2.2', port: 7901 },
+    },
+    clients: [
+      {
+        id: 'c-def',
+        name: 'u7af760',
+        password: 'p1',
+        enabled: true,
+        route: { landingNodeId: primary },
+        package: {},
+        usage: {},
+      },
+      {
+        id: 'c-pro',
+        name: 'u94843d',
+        password: 'p2',
+        enabled: true,
+        route: { landingNodeId: pro3, listenPort: 7902 },
+        package: {},
+        usage: {},
+      },
+    ],
+  };
+  mieru.ensureMieruDefaults(st);
+  assert.deepStrictEqual(
+    mieru.clientsForNode(st, pro3).map((c) => c.name),
+    ['u94843d'],
+    'pro3 by nodeId'
+  );
+  // 用 topology landing.id 绑定也应解析到 pro3
+  st.clients[1].route.landingNodeId = 'landing-pro3';
+  assert.strictEqual(mieru.resolveLandingNodeId(st, 'landing-pro3'), pro3, 'landing.id → nodeId');
+  assert.deepStrictEqual(
+    mieru.clientsForNode(st, pro3).map((c) => c.name),
+    ['u94843d'],
+    'pro3 via landing.id stored'
+  );
+  // 空串不得误绑，回落主落地
+  st.clients[1].route.landingNodeId = '';
+  assert.deepStrictEqual(
+    mieru.clientsForNode(st, pro3).map((c) => c.name),
+    [],
+    'empty string not on pro3'
+  );
+  assert.ok(
+    mieru.clientsForNode(st, primary).some((c) => c.name === 'u94843d'),
+    'empty string falls to primary'
+  );
+  // publicClient 与 apply 一致
+  st.clients[1].route.landingNodeId = pro3;
+  const pub = mieru.publicClient(st.clients[1], st);
+  assert.strictEqual(pub.route.landingNodeId, pro3);
+  // 名称唯一时可解析
+  assert.strictEqual(mieru.resolveLandingNodeId(st, 'pro3'), pro3, 'by name');
+  ok('clientsForNode resolveLandingNodeId matches UI/apply');
+}
+
 console.log('\nsmoke-v4: all passed');
 console.log('tmp data:', tmp);

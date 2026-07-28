@@ -439,15 +439,11 @@ app.use(auth.authMiddleware(() => state));
 app.use(express.static(path.join(ROOT, 'public')));
 
 app.get('/api/health', (req, res) => {
+  // 公开探针：落地机 install 脚本会 curl 此接口；禁止依赖登录态变量
   res.json({
     ok: true,
     version: panelVersion(),
     protocol: 'mieru',
-    outdatedAgents: loggedIn
-      ? (modeInfo.nodes || [])
-          .filter((n) => n.agentOutdated || isAgentOutdated(n.agentVersion))
-          .map((n) => ({ id: n.id, name: n.name, agentVersion: n.agentVersion || '' }))
-      : undefined,
     profile: state.topology?.profile || 'cm-ix-home',
     path: 'client → merchant-ix-ingress → IX → home mita',
     multiLanding: true,

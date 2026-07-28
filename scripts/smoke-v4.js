@@ -177,5 +177,87 @@ assert.ok(pub.ixes.length >= 2);
 assert.ok(pub.pathLabel.includes('商家IX前置'));
 ok('publicTopology multi + compat');
 
+// 8) per-IX ingress migrate + independent fronts
+topology.ensureTopology(state);
+assert.ok(state.topology.ixes[0].ingress, 'first ix has ingress');
+assert.strictEqual(state.topology.ixes[0].ingress.externalHost, '114.111.176.37');
+// second IX gets own fronts / port range
+const ix2 = state.topology.ixes.find((x) => x.id === 'ix-2');
+assert.ok(ix2);
+ix2.ingress = topology.defaultIxIngress({
+  active: 'external',
+  externalHost: '114.9.9.9',
+  mobileHost: '211.9.9.9',
+  customHost: 'front-ix2.example.com',
+});
+ix2.portMin = 8000;
+ix2.portMax = 8099;
+const ep2 = topology.activeEndpoint(state, { ixId: 'ix-2', port: 8001 });
+assert.strictEqual(ep2, '114.9.9.9:8001');
+const alt2 = topology.altEndpoint(state, 8001, { ixId: 'ix-2' });
+assert.ok(alt2.mobile.startsWith('211.9.9.9:'));
+assert.ok(topology.portInMerchantRange(8001, ix2));
+assert.ok(!topology.portInMerchantRange(7901, ix2));
+ok('per-IX fronts + port range independent');
+
+// 9) share links follow client route.ixId / landing.ixId
+state.topology.landings[1].ixId = 'ix-2';
+state.clients[1].route.ixId = 'ix-2';
+state.clients[1].route.landingNodeId = n2.id;
+const dualIx = mieru.buildDualShareLinks(state, state.clients[1]);
+assert.ok(dualIx.endpoints.external.startsWith('114.9.9.9:'));
+assert.ok(dualIx.endpoints.mobile.startsWith('211.9.9.9:'));
+assert.strictEqual(dualIx.ixId, 'ix-2');
+// domain as custom preferred
+state.topology.ixes.find((x) => x.id === 'ix-2').ingress.active = 'custom';
+const dualDom = mieru.buildDualShareLinks(state, state.clients[1]);
+assert.ok(dualDom.preferred.includes('front-ix2.example.com'));
+const jsonDom = mieru.buildClientJson(state, state.clients[1], 'TCP', 'front-ix2.example.com');
+assert.strictEqual(jsonDom.profiles[0].servers[0].domainName, 'front-ix2.example.com');
+assert.strictEqual(jsonDom.profiles[0].servers[0].ipAddress, '');
+const jsonIp = mieru.buildClientJson(state, state.clients[1], 'TCP', '114.9.9.9');
+assert.strictEqual(jsonIp.profiles[0].servers[0].ipAddress, '114.9.9.9');
+assert.strictEqual(jsonIp.profiles[0].servers[0].domainName, '');
+ok('share links + domain/IP client JSON by IX');
+
+// 10) publicTopology exposes per-IX endpoints
+const pub2 = topology.publicTopology(state);
+const pubIx2 = pub2.ixes.find((x) => x.id === 'ix-2');
+assert.ok(pubIx2.ingress);
+assert.ok(pubIx2.endpoints);
+assert.ok(String(pubIx2.merchantPortRange).includes('8000'));
+ok('publicTopology per-IX ingress/endpoints');
+
+// 11) dirty hash: mark clean with bundle hash → isNodeDirty false
+{
+  // simulate panel hasher aligned with buildBundle-style hash
+  const node = state.nodes[0];
+  node.clients = mieru.clientsForNode(state, node.id);
+  const serverConfig = mieru.buildServerConfig({
+    server: { ...state.server, listenPort: 7901 },
+    clients: node.clients.filter((c) => c.enabled !== false),
+    primaryNodeId: node.id,
+  });
+  const users = mieru.usersForBundle(state, node.id);
+  const bundleHash = require('crypto')
+    .createHash('sha256')
+    .update(JSON.stringify({ serverConfig, users: users.map((u) => ({ n: u.name, e: u.enabled, p: u.package })) }))
+    .digest('hex');
+  nodes.markNodeClean(node, bundleHash);
+  const hasher = {
+    nodeHash: () => bundleHash,
+    configHash: () => bundleHash,
+  };
+  assert.strictEqual(nodes.isNodeDirty(node, hasher), false, 'clean after apply');
+  node._dirtyFlag = true;
+  assert.strictEqual(nodes.isNodeDirty(node, hasher), true, 'dirty flag forces dirty');
+  nodes.markNodeClean(node, bundleHash);
+  // wrong hash stays dirty
+  nodes.markNodeClean(node, 'deadbeef');
+  assert.strictEqual(nodes.isNodeDirty(node, hasher), true, 'hash mismatch dirty');
+  nodes.markNodeClean(node, bundleHash);
+  ok('dirty hash aligned with bundle configHash');
+}
+
 console.log('\nsmoke-v4: all passed');
 console.log('tmp data:', tmp);

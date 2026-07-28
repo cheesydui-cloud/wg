@@ -203,12 +203,21 @@ function urlencode(s) {
   );
 }
 
+function resolveClientIxOpts(state, client = null) {
+  const opts = {};
+  if (client?.route?.ixId) opts.ixId = client.route.ixId;
+  if (client?.route?.landingNodeId) opts.landingNodeId = client.route.landingNodeId;
+  if (client?.route?.ingressActive) opts.ingressActive = client.route.ingressActive;
+  // landing.ixId fallback via topology.resolveIx
+  return opts;
+}
+
 function endpointHost(state, client = null) {
   try {
     const topology = require('./topology');
     topology.ensureTopology(state);
-    const active = client?.route?.ingressActive || null;
-    const h = topology.activeIngressHost(state, active || undefined);
+    const opts = resolveClientIxOpts(state, client);
+    const h = topology.activeIngressHost(state, opts.ingressActive, opts);
     if (h) return h;
   } catch {
     /* */
@@ -219,12 +228,30 @@ function endpointHost(state, client = null) {
   return '';
 }
 
+function looksLikeIp(host) {
+  const h = String(host || '').trim();
+  if (!h) return false;
+  // IPv4
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return true;
+  // IPv6 (bare or already unbracketed)
+  if (h.includes(':') && /^[0-9a-fA-F:]+$/.test(h)) return true;
+  return false;
+}
+
+function looksLikeDomain(host) {
+  const h = String(host || '').trim();
+  if (!h || looksLikeIp(h)) return false;
+  // hostname / FQDN (allow subdomain, hyphen); reject spaces
+  if (/\s/.test(h)) return false;
+  return /^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$/.test(h) || h.includes('.');
+}
+
 function shareLinkForHost(state, client, host, protocol, portOverride) {
   ensureMieruDefaults(state);
   const s = state.server;
   const h = String(host || '').trim();
   if (!h) {
-    const err = new Error('请先填写客户端连接地址（商家入站 IP）');
+    const err = new Error('请先填写客户端连接地址（商家前置 IP 或域名）');
     err.code = 'NO_ENDPOINT';
     throw err;
   }
@@ -254,14 +281,20 @@ function buildDualShareLinks(state, client, protocol) {
   const s = state.server;
   let mobileHost = '211.136.162.184';
   let externalHost = '114.111.176.37';
+  let customHost = '';
   let active = client?.route?.ingressActive || 'external';
+  let ixId = client?.route?.ixId || null;
   try {
     const topology = require('./topology');
     topology.ensureTopology(state);
-    const t = state.topology;
-    mobileHost = t.ingress.mobileHost || mobileHost;
-    externalHost = t.ingress.externalHost || externalHost;
-    if (!client?.route?.ingressActive) active = t.ingress.active || 'external';
+    const opts = resolveClientIxOpts(state, client);
+    const ing = topology.resolveIngress(state, opts);
+    const ix = topology.resolveIx(state, opts);
+    mobileHost = ing.mobileHost || mobileHost;
+    externalHost = ing.externalHost || externalHost;
+    customHost = ing.customHost || '';
+    if (!client?.route?.ingressActive) active = ing.active || 'external';
+    ixId = ix?.id || ixId;
   } catch {
     const ep = endpointHost(state, client);
     if (ep === externalHost) active = 'external';
@@ -275,14 +308,7 @@ function buildDualShareLinks(state, client, protocol) {
   const external = shareLinkForHost(state, client, externalHost, proto, listenPort);
   let preferredHost = mobileHost;
   if (active === 'external') preferredHost = externalHost;
-  else if (active === 'custom') {
-    try {
-      const topology = require('./topology');
-      preferredHost = topology.activeIngressHost(state, 'custom') || mobileHost;
-    } catch {
-      preferredHost = mobileHost;
-    }
-  }
+  else if (active === 'custom') preferredHost = customHost || mobileHost;
   const preferred = shareLinkForHost(state, client, preferredHost, proto, listenPort);
   return {
     mobile,
@@ -291,12 +317,13 @@ function buildDualShareLinks(state, client, protocol) {
     active,
     listenPort: port,
     landingNodeId: clientLandingNodeId(client, state),
+    ixId,
     endpoints: {
       mobile: `${mobileHost}:${port}`,
       external: `${externalHost}:${port}`,
       active: `${preferredHost}:${port}`,
     },
-    tip: '电脑/客户端连商家 IX 前置：外部 114 或移动宽带前置 211（不是手机）。',
+    tip: '电脑/客户端连该线路所属 IX 的商家前置（外部/移动宽带），不是手机、不是家宽公网。',
   };
 }
 
@@ -305,7 +332,7 @@ function buildClientJson(state, client, protocol, hostOverride) {
   const s = state.server;
   const host = String(hostOverride || endpointHost(state, client) || '').trim();
   if (!host) {
-    const err = new Error('请先填写客户端连接地址（商家入站 IP）');
+    const err = new Error('请先填写客户端连接地址（商家前置 IP 或域名）');
     err.code = 'NO_ENDPOINT';
     throw err;
   }
@@ -313,6 +340,8 @@ function buildClientJson(state, client, protocol, hostOverride) {
   const proto = String(protocol || protocolsForMode(mode)[0]).toUpperCase();
   const listenPort = clientListenPort(client, state);
   const port = portForProtocol(listenPort, proto, mode);
+  // mieru client: IP → ipAddress; 域名 → domainName（支持自定义域名前置）
+  const useDomain = looksLikeDomain(host) && !looksLikeIp(host);
   return {
     profiles: [
       {
@@ -323,8 +352,8 @@ function buildClientJson(state, client, protocol, hostOverride) {
         },
         servers: [
           {
-            ipAddress: host,
-            domainName: '',
+            ipAddress: useDomain ? '' : host,
+            domainName: useDomain ? host : '',
             portBindings: [{ port, protocol: proto }],
           },
         ],
@@ -632,6 +661,8 @@ module.exports = {
   randomPassword,
   randomUsername,
   isValidMieruUsername,
+  looksLikeIp,
+  looksLikeDomain,
   normalizeProtocol,
   parseEndpoint,
   joinEndpoint,

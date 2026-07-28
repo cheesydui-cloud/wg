@@ -308,6 +308,13 @@ code, pre, .mono { font-family: var(--mono); font-size: 12.5px; }
 .field-with-btn .field { flex: 1; }
 
 /* ---------- Buttons ---------- */
+/* 按钮语义：
+   primary=主操作(保存/创建/登录)
+   success=下发/应用/落地
+   warn=需注意的次要操作
+   danger=删除/危险
+   ghost=次要/导航
+   secondary=中性描边按钮（与 ghost 同级但更实） */
 .btn {
   appearance: none;
   border: 1px solid var(--border);
@@ -322,44 +329,215 @@ code, pre, .mono { font-family: var(--mono); font-size: 12.5px; }
   font-weight: 550;
   font-size: 13px;
   line-height: 1.2;
-  transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
+  transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease, filter 0.12s ease;
   text-decoration: none;
   white-space: nowrap;
+  cursor: pointer;
 }
 .btn:hover { background: var(--surface-2); text-decoration: none; }
-.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; filter: none !important; }
 .btn-primary {
   background: var(--primary);
   border-color: transparent;
   color: #fff;
 }
-.btn-primary:hover { filter: brightness(1.05); background: var(--primary); }
+.btn-primary:hover { filter: brightness(1.06); background: var(--primary); }
 .btn-success {
   background: var(--ok);
   border-color: transparent;
   color: #fff;
 }
-.btn-success:hover { filter: brightness(1.05); background: var(--ok); }
+.btn-success:hover { filter: brightness(1.06); background: var(--ok); }
+.btn-warn {
+  background: var(--warn);
+  border-color: transparent;
+  color: #1a1200;
+}
+.btn-warn:hover { filter: brightness(1.05); background: var(--warn); }
 .btn-danger {
+  background: var(--danger);
+  border-color: transparent;
+  color: #fff;
+}
+.btn-danger:hover { filter: brightness(1.06); background: var(--danger); }
+.btn-danger.btn-outline,
+.btn-danger-outline {
   background: transparent;
-  border-color: rgba(239, 68, 68, 0.35);
+  border-color: rgba(239, 68, 68, 0.45);
   color: var(--danger);
 }
-.btn-danger:hover { background: var(--danger-soft); }
+.btn-danger.btn-outline:hover,
+.btn-danger-outline:hover {
+  background: var(--danger-soft);
+  filter: none;
+}
 .btn-ghost {
   background: transparent;
   border-color: var(--border);
   color: var(--text-2);
 }
 .btn-ghost:hover { color: var(--text); background: var(--surface-2); }
+.btn-secondary {
+  background: var(--surface-2);
+  border-color: var(--border);
+  color: var(--text);
+}
+.btn-secondary:hover { background: var(--border-soft); border-color: var(--text-3); }
 .btn-sm { padding: 5px 9px; font-size: 12px; border-radius: 7px; }
+.btn-block { width: 100%; }
 .btn-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.btn-row.tight { gap: 4px; }
 .actions-end {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
   margin-top: 16px;
   padding-top: 4px;
+}
+.btn[title] { cursor: pointer; }
+
+/* IX 工作台 tabs */
+.ix-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.ix-tab {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  border-radius: 10px;
+  padding: 10px 14px;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.ix-tab small {
+  font-weight: 500;
+  color: var(--text-3);
+  font-size: 11px;
+}
+.ix-tab:hover { border-color: var(--primary); color: var(--text); }
+.ix-tab.on {
+  background: var(--primary-soft);
+  border-color: var(--primary);
+  color: var(--text);
+}
+.ix-tab.add {
+  border-style: dashed;
+  color: var(--primary);
+  justify-content: center;
+  min-width: 88px;
+}
+
+/* 落地列表行 / 详情 */
+.landing-row {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+.landing-row-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 14px;
+  cursor: pointer;
+  user-select: none;
+}
+.landing-row-head:hover { background: var(--surface-2); }
+.landing-row-head .title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+.landing-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.landing-row-body {
+  border-top: 1px solid var(--border-soft);
+  padding: 14px;
+  background: var(--surface-2);
+}
+.landing-row.collapsed .landing-row-body { display: none; }
+.landing-row .chev {
+  color: var(--text-3);
+  font-size: 12px;
+  transition: transform 0.15s;
+}
+.landing-row:not(.collapsed) .chev { transform: rotate(90deg); }
+
+/* 客户端按落地分组 */
+.client-group {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+.client-group-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 14px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border-soft);
+}
+.client-group-head .title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+.client-group .table-wrap,
+.client-group table {
+  border: 0;
+  border-radius: 0;
+  min-width: 0;
+  background: transparent;
+}
+.client-group table { min-width: 560px; }
+
+/* 设置分区 */
+.settings-grid {
+  display: grid;
+  gap: 16px;
+}
+@media (min-width: 900px) {
+  .settings-grid.two {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+.card .card-desc {
+  margin: -4px 0 12px;
+  color: var(--text-2);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.section-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
 }
 
 /* ---------- Table ---------- */

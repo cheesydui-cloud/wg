@@ -27,7 +27,33 @@ function newId(prefix = 'id') {
   return `${prefix}-${crypto.randomBytes(4).toString('hex')}`;
 }
 
-function defaultIx(overrides = {}) {
+function defaultIxIngress(overrides = {}, globalIngress = null) {
+  const g = globalIngress || {};
+  return {
+    active: ['mobile', 'external', 'custom'].includes(overrides.active)
+      ? overrides.active
+      : g.active || 'external',
+    mobileHost: String(
+      overrides.mobileHost != null ? overrides.mobileHost : g.mobileHost || CM_DEFAULTS.mobileIngress
+    ).trim(),
+    externalHost: String(
+      overrides.externalHost != null
+        ? overrides.externalHost
+        : g.externalHost || CM_DEFAULTS.externalIngress
+    ).trim(),
+    customHost: String(
+      overrides.customHost != null ? overrides.customHost : g.customHost || ''
+    ).trim(),
+    provinceWhitelist: String(
+      overrides.provinceWhitelist != null
+        ? overrides.provinceWhitelist
+        : g.provinceWhitelist || CM_DEFAULTS.provinceHint
+    ),
+  };
+}
+
+function defaultIx(overrides = {}, globalIngress = null) {
+  const ingSrc = overrides.ingress && typeof overrides.ingress === 'object' ? overrides.ingress : overrides;
   return {
     id: overrides.id || 'ix-default',
     name: overrides.name || '沪日IX',
@@ -39,6 +65,7 @@ function defaultIx(overrides = {}) {
     homeReachablePort: clampPort(overrides.homeReachablePort, CM_DEFAULTS.defaultPort),
     forwardConfigured: Boolean(overrides.forwardConfigured),
     note: overrides.note || '商家前置流量先到本机内网，再 TCP 转发到落地家宽 mita',
+    ingress: defaultIxIngress(ingSrc, globalIngress),
   };
 }
 
@@ -46,6 +73,7 @@ function defaultLanding(overrides = {}) {
   return {
     id: overrides.id || 'landing-default',
     nodeId: overrides.nodeId || null,
+    ixId: overrides.ixId || null,
     name: overrides.name || '落地家宽',
     role: overrides.role || 'us-home',
     homeReachableHost: String(overrides.homeReachableHost || '').trim(),
@@ -87,12 +115,71 @@ function clampPort(p, fallback = 7901) {
   return n;
 }
 
-function ingressHostFrom(t, activeOverride) {
-  const ing = t?.ingress || {};
+function ingressHostFrom(ingOrTopo, activeOverride) {
+  // accept either ingress object or full topology
+  const ing = ingOrTopo?.ingress && !ingOrTopo.mobileHost ? ingOrTopo.ingress : ingOrTopo || {};
   const active = activeOverride || ing.active;
   if (active === 'external') return String(ing.externalHost || CM_DEFAULTS.externalIngress).trim();
   if (active === 'custom') return String(ing.customHost || '').trim();
   return String(ing.mobileHost || CM_DEFAULTS.mobileIngress).trim();
+}
+
+function getIxIngress(ix, globalIngress = null) {
+  if (ix?.ingress && typeof ix.ingress === 'object') {
+    return defaultIxIngress(ix.ingress, globalIngress);
+  }
+  return defaultIxIngress({}, globalIngress);
+}
+
+/** Resolve IX for client/landing/opts */
+function resolveIx(state, opts = {}) {
+  ensureTopology(state);
+  if (opts.ixId) {
+    const found = state.topology.ixes.find((x) => x.id === opts.ixId);
+    if (found) return found;
+  }
+  if (opts.landingId) {
+    const L = state.topology.landings.find((x) => x.id === opts.landingId);
+    if (L?.ixId) {
+      const found = state.topology.ixes.find((x) => x.id === L.ixId);
+      if (found) return found;
+    }
+  }
+  if (opts.landingNodeId) {
+    const L = state.topology.landings.find((x) => x.nodeId === opts.landingNodeId);
+    if (L?.ixId) {
+      const found = state.topology.ixes.find((x) => x.id === L.ixId);
+      if (found) return found;
+    }
+  }
+  return state.topology.ixes[0] || null;
+}
+
+function resolveIngress(state, opts = {}) {
+  ensureTopology(state);
+  const ix = resolveIx(state, opts);
+  const g = state.topology.ingress;
+  if (ix) return getIxIngress(ix, g);
+  return {
+    active: g.active || 'external',
+    mobileHost: g.mobileHost || CM_DEFAULTS.mobileIngress,
+    externalHost: g.externalHost || CM_DEFAULTS.externalIngress,
+    customHost: g.customHost || '',
+    provinceWhitelist: g.provinceWhitelist || CM_DEFAULTS.provinceHint,
+  };
+}
+
+function mirrorGlobalFromIx(state, ix) {
+  if (!state.topology || !ix) return;
+  const ing = getIxIngress(ix, state.topology.ingress);
+  state.topology.ingress = {
+    ...state.topology.ingress,
+    active: ing.active,
+    mobileHost: ing.mobileHost,
+    externalHost: ing.externalHost,
+    customHost: ing.customHost,
+    provinceWhitelist: ing.provinceWhitelist,
+  };
 }
 
 function migrateLegacyTopology(t) {
@@ -105,31 +192,41 @@ function migrateLegacyTopology(t) {
     panel: { ...base.panel, ...(t.panel || {}) },
   };
 
-  // ixes
+  // ixes — each gets own ingress (copy from global if missing)
+  const gIng = out.ingress;
   if (Array.isArray(t.ixes) && t.ixes.length) {
     out.ixes = t.ixes.map((x, i) =>
-      defaultIx({
-        id: x.id || (i === 0 ? 'ix-default' : newId('ix')),
-        ...x,
-      })
+      defaultIx(
+        {
+          id: x.id || (i === 0 ? 'ix-default' : newId('ix')),
+          ...x,
+        },
+        gIng
+      )
     );
   } else if (t.ix && typeof t.ix === 'object') {
     out.ixes = [
-      defaultIx({
-        id: 'ix-default',
-        ...t.ix,
-      }),
+      defaultIx(
+        {
+          id: 'ix-default',
+          ...t.ix,
+          ingress: t.ix.ingress || gIng,
+        },
+        gIng
+      ),
     ];
   } else {
-    out.ixes = [defaultIx()];
+    out.ixes = [defaultIx({}, gIng)];
   }
 
   // landings
+  const defIxId = out.ixes[0]?.id || null;
   if (Array.isArray(t.landings) && t.landings.length) {
     out.landings = t.landings.map((L, i) =>
       defaultLanding({
         id: L.id || (i === 0 ? 'landing-default' : newId('landing')),
         ...L,
+        ixId: L.ixId || defIxId,
       })
     );
   } else if (t.landing && typeof t.landing === 'object') {
@@ -142,10 +239,11 @@ function migrateLegacyTopology(t) {
         homeReachableHost: t.ix?.homeReachableHost || '',
         homeReachablePort: t.ix?.homeReachablePort || out.ingress.port,
         listenPort: out.ingress.port,
+        ixId: defIxId,
       }),
     ];
   } else {
-    out.landings = [defaultLanding()];
+    out.landings = [defaultLanding({ ixId: defIxId })];
   }
 
   return out;
@@ -173,22 +271,40 @@ function ensureTopology(state) {
   if (!['mobile', 'external', 'custom'].includes(t.ingress.active)) t.ingress.active = 'external';
 
   t.ixes = (Array.isArray(t.ixes) ? t.ixes : []).map((x, i) =>
-    defaultIx({
-      id: x.id || (i === 0 ? 'ix-default' : newId('ix')),
-      ...x,
-      homeReachablePort: clampPort(x.homeReachablePort, t.ingress.port),
-      sshPort: clampPort(x.sshPort, 7900),
-    })
+    defaultIx(
+      {
+        id: x.id || (i === 0 ? 'ix-default' : newId('ix')),
+        ...x,
+        homeReachablePort: clampPort(x.homeReachablePort, t.ingress.port),
+        sshPort: clampPort(x.sshPort, 7900),
+      },
+      t.ingress
+    )
   );
-  if (!t.ixes.length) t.ixes = [defaultIx()];
+  if (!t.ixes.length) t.ixes = [defaultIx({}, t.ingress)];
 
+  // mirror global ingress from first IX (compat + default path)
+  if (t.ixes[0]) {
+    const fi = getIxIngress(t.ixes[0], t.ingress);
+    t.ingress = {
+      ...t.ingress,
+      active: fi.active,
+      mobileHost: fi.mobileHost,
+      externalHost: fi.externalHost,
+      customHost: fi.customHost,
+      provinceWhitelist: fi.provinceWhitelist,
+    };
+  }
+
+  const defIxId = t.ixes[0]?.id || null;
   t.landings = (Array.isArray(t.landings) ? t.landings : []).map((L, i) =>
     defaultLanding({
       id: L.id || (i === 0 ? 'landing-default' : newId('landing')),
       ...L,
       homeReachablePort: clampPort(L.homeReachablePort, t.ingress.port),
       listenPort: clampPort(L.listenPort, t.ingress.port),
-      nodeId: L.nodeId || state.primaryNodeId || null,
+      nodeId: L.nodeId || (i === 0 ? state.primaryNodeId || null : L.nodeId) || null,
+      ixId: L.ixId || defIxId,
     })
   );
   if (!t.landings.length) {
@@ -196,6 +312,7 @@ function ensureTopology(state) {
       defaultLanding({
         nodeId: state.primaryNodeId || null,
         listenPort: t.ingress.port,
+        ixId: defIxId,
       }),
     ];
   }
@@ -214,11 +331,11 @@ function ensureTopology(state) {
     note: t.landings[0].note,
   };
 
-  // sync global server endpoint (default path)
+  // sync global server endpoint (default path = first IX)
   if (!state.server) state.server = {};
   state.server.listenPort = clampPort(t.ingress.port, CM_DEFAULTS.defaultPort);
   state.server.protocol = t.ingress.protocol || state.server.protocol || 'TCP';
-  const host = ingressHostFrom(t);
+  const host = ingressHostFrom(t.ingress);
   state.server.endpoint = host ? `${host}:${t.ingress.port}` : '';
 
   return state.topology;
@@ -248,32 +365,61 @@ function getLandingByNodeId(state, nodeId) {
   return state.topology.landings.find((L) => L.nodeId === nodeId) || null;
 }
 
-function activeIngressHost(state, activeOverride) {
+function activeIngressHost(state, activeOverride, opts = {}) {
   if (!state.topology) ensureTopology(state);
-  return ingressHostFrom(state.topology, activeOverride);
+  const resolveOpts = typeof activeOverride === 'object' && activeOverride !== null
+    ? activeOverride
+    : opts;
+  const active =
+    typeof activeOverride === 'string' ? activeOverride : resolveOpts.ingressActive;
+  const ing = resolveIngress(state, resolveOpts);
+  return ingressHostFrom(ing, active);
 }
 
 function activeEndpoint(state, opts = {}) {
   if (!state.topology) ensureTopology(state);
-  const host = ingressHostFrom(state.topology, opts.ingressActive);
+  const ing = resolveIngress(state, opts);
+  const host = ingressHostFrom(ing, opts.ingressActive);
   const port = clampPort(opts.port || state.topology.ingress.port, CM_DEFAULTS.defaultPort);
   if (!host) return '';
   return `${host}:${port}`;
 }
 
-function altEndpoint(state, portOverride) {
+/** opts: { port, ixId, landingId, landingNodeId, ingressActive } */
+function altEndpoint(state, portOverride, opts = {}) {
   if (!state.topology) ensureTopology(state);
-  const ing = state.topology.ingress;
-  const port = clampPort(portOverride || ing.port, CM_DEFAULTS.defaultPort);
+  const o = typeof portOverride === 'object' && portOverride !== null ? portOverride : opts;
+  const port = clampPort(
+    (typeof portOverride === 'number' || typeof portOverride === 'string'
+      ? portOverride
+      : o.port) || state.topology.ingress.port,
+    CM_DEFAULTS.defaultPort
+  );
+  const ing = resolveIngress(state, o);
   const mobile = `${ing.mobileHost || CM_DEFAULTS.mobileIngress}:${port}`;
   const external = `${ing.externalHost || CM_DEFAULTS.externalIngress}:${port}`;
-  const host = ingressHostFrom(state.topology);
-  return { mobile, external, active: host ? `${host}:${port}` : '' };
+  const host = ingressHostFrom(ing, o.ingressActive);
+  return {
+    mobile,
+    external,
+    active: host ? `${host}:${port}` : '',
+    ingress: { ...ing },
+    ixId: resolveIx(state, o)?.id || null,
+  };
 }
 
-function portInMerchantRange(port) {
+function portInMerchantRange(port, ixOrMin = null, max = null) {
   const p = Number(port);
-  return p >= CM_DEFAULTS.portMin && p <= CM_DEFAULTS.portMax;
+  let min = CM_DEFAULTS.portMin;
+  let mx = CM_DEFAULTS.portMax;
+  if (ixOrMin && typeof ixOrMin === 'object') {
+    min = Number(ixOrMin.portMin) || min;
+    mx = Number(ixOrMin.portMax) || mx;
+  } else if (ixOrMin != null) {
+    min = Number(ixOrMin) || min;
+    if (max != null) mx = Number(max) || mx;
+  }
+  return p >= min && p <= mx;
 }
 
 /**
@@ -371,7 +517,11 @@ function buildIxForwardScript(state, opts = {}) {
     '',
     'echo "============================================"',
     'echo " 转发: :${LISTEN_PORT} → ${HOME_HOST}:${HOME_PORT}"',
-    'echo " 客户端连商家前置: 114.111.176.37:${LISTEN_PORT} 或 211.136.162.184:${LISTEN_PORT}"',
+    `echo " 客户端连本 IX 商家前置: ${JSON.stringify(
+      (ix && getIxIngress(ix, state.topology.ingress).externalHost) || CM_DEFAULTS.externalIngress
+    )}:\${LISTEN_PORT} 或 ${JSON.stringify(
+      (ix && getIxIngress(ix, state.topology.ingress).mobileHost) || CM_DEFAULTS.mobileIngress
+    )}:\${LISTEN_PORT}"`,
     'echo " 路径: 电脑 → 商家IX前置 → 本IX → 落地家宽 mita"',
     'echo "============================================"',
     '',
@@ -396,11 +546,17 @@ function publicTopology(state) {
   const endpoints = altEndpoint(state);
   const fwd = buildIxForwardScript(state);
   const anyForward = t.ixes.some((x) => x.forwardConfigured);
+  const firstIx = t.ixes[0];
   return {
     profile: t.profile,
     pathLabel: '电脑/客户端 → 商家IX前置 → IX → 落地家宽 mita',
     ingress: { ...t.ingress },
-    ixes: t.ixes.map((x) => ({ ...x })),
+    ixes: t.ixes.map((x) => ({
+      ...x,
+      ingress: getIxIngress(x, t.ingress),
+      endpoints: altEndpoint(state, t.ingress.port, { ixId: x.id }),
+      merchantPortRange: `${x.portMin || CM_DEFAULTS.portMin}-${x.portMax || CM_DEFAULTS.portMax}`,
+    })),
     landings: t.landings.map((L) => ({ ...L })),
     // v3 compat
     ix: { ...t.ixes[0] },
@@ -412,8 +568,10 @@ function publicTopology(state) {
     panel: { ...t.panel },
     activeEndpoint: endpoints.active,
     endpoints,
-    portInRange: portInMerchantRange(t.ingress.port),
-    merchantPortRange: `${CM_DEFAULTS.portMin}-${CM_DEFAULTS.portMax}`,
+    portInRange: portInMerchantRange(t.ingress.port, firstIx),
+    merchantPortRange: firstIx
+      ? `${firstIx.portMin}-${firstIx.portMax}`
+      : `${CM_DEFAULTS.portMin}-${CM_DEFAULTS.portMax}`,
     defaults: { ...CM_DEFAULTS },
     forward: {
       ok: fwd.ok,
@@ -448,19 +606,27 @@ function applyTopologyPatch(state, body = {}) {
   // full replace lists if provided
   if (Array.isArray(body.ixes)) {
     t.ixes = body.ixes.map((x, i) =>
-      defaultIx({
-        id: x.id || (i === 0 ? 'ix-default' : newId('ix')),
-        ...x,
-      })
+      defaultIx(
+        {
+          id: x.id || (i === 0 ? 'ix-default' : newId('ix')),
+          ...x,
+        },
+        t.ingress
+      )
     );
-    if (!t.ixes.length) t.ixes = [defaultIx()];
+    if (!t.ixes.length) t.ixes = [defaultIx({}, t.ingress)];
   } else if (body.ix && typeof body.ix === 'object') {
-    // v3 single ix patch → first
+    // v3 single ix patch → first (or body.ixId target)
     const x = body.ix;
-    const target = t.ixes[0] || defaultIx();
+    let target = t.ixes[0] || defaultIx({}, t.ingress);
+    if (body.ixId) {
+      target = t.ixes.find((i) => i.id === body.ixId) || target;
+    }
     if (x.name !== undefined) target.name = String(x.name || target.name);
     if (x.lanIp !== undefined) target.lanIp = String(x.lanIp || '').trim();
     if (x.sshPort !== undefined) target.sshPort = clampPort(x.sshPort, 7900);
+    if (x.portMin !== undefined) target.portMin = Number(x.portMin) || target.portMin;
+    if (x.portMax !== undefined) target.portMax = Number(x.portMax) || target.portMax;
     if (x.homeReachableHost !== undefined) {
       target.homeReachableHost = String(x.homeReachableHost || '').trim();
     }
@@ -471,11 +637,48 @@ function applyTopologyPatch(state, body = {}) {
       target.forwardConfigured = Boolean(x.forwardConfigured);
     }
     if (x.note !== undefined) target.note = String(x.note || '');
-    t.ixes[0] = defaultIx(target);
+    if (x.ingress && typeof x.ingress === 'object') {
+      target.ingress = defaultIxIngress(x.ingress, target.ingress || t.ingress);
+    }
+    const idx = t.ixes.findIndex((i) => i.id === target.id);
+    const normalized = defaultIx(target, t.ingress);
+    if (idx >= 0) t.ixes[idx] = normalized;
+    else t.ixes[0] = normalized;
     // mirror home to default landing if landing empty
     if (target.homeReachableHost && t.landings[0] && !t.landings[0].homeReachableHost) {
       t.landings[0].homeReachableHost = target.homeReachableHost;
       t.landings[0].homeReachablePort = target.homeReachablePort;
+    }
+  }
+
+  // body.ingress alone: also write onto first IX (or body.ixId) so per-IX stays source of truth
+  if (body.ingress && typeof body.ingress === 'object' && !Array.isArray(body.ixes) && !body.ix) {
+    const targetId = body.ixId || t.ixes[0]?.id;
+    const target = t.ixes.find((i) => i.id === targetId) || t.ixes[0];
+    if (target) {
+      target.ingress = defaultIxIngress(
+        {
+          ...(target.ingress || {}),
+          active: body.ingress.active !== undefined ? body.ingress.active : target.ingress?.active,
+          mobileHost:
+            body.ingress.mobileHost !== undefined
+              ? body.ingress.mobileHost
+              : target.ingress?.mobileHost,
+          externalHost:
+            body.ingress.externalHost !== undefined
+              ? body.ingress.externalHost
+              : target.ingress?.externalHost,
+          customHost:
+            body.ingress.customHost !== undefined
+              ? body.ingress.customHost
+              : target.ingress?.customHost,
+          provinceWhitelist:
+            body.ingress.provinceWhitelist !== undefined
+              ? body.ingress.provinceWhitelist
+              : target.ingress?.provinceWhitelist,
+        },
+        t.ingress
+      );
     }
   }
 
@@ -494,6 +697,7 @@ function applyTopologyPatch(state, body = {}) {
     if (L.role !== undefined) target.role = String(L.role || 'us-home');
     if (L.note !== undefined) target.note = String(L.note || '');
     if (L.nodeId !== undefined) target.nodeId = L.nodeId || null;
+    if (L.ixId !== undefined) target.ixId = L.ixId || null;
     if (L.homeReachableHost !== undefined) {
       target.homeReachableHost = String(L.homeReachableHost || '').trim();
     }
@@ -560,17 +764,24 @@ function diagnoseTopology(state, opts = {}) {
   });
 
   for (const ix of t.ixes) {
+    const ing = getIxIngress(ix, t.ingress);
     const home =
+      t.landings.find((L) => L.ixId === ix.id && L.homeReachableHost)?.homeReachableHost ||
       t.landings.find((L) => L.homeReachableHost)?.homeReachableHost ||
       ix.homeReachableHost ||
       '';
+    const rangeOk = portInMerchantRange(port, ix);
     push({
       id: `ix_${ix.id}`,
       level: home || ix.forwardConfigured ? 'ok' : 'warn',
       title: `IX · ${ix.name}`,
-      detail: `内网 ${ix.lanIp} · SSH ${ix.sshPort} · 转发${ix.forwardConfigured ? '已标记' : '未标记'} · 可达 ${home || '未填'}`,
+      detail: `内网 ${ix.lanIp} · 端口段 ${ix.portMin}-${ix.portMax} · 前置 114=${ing.externalHost} / 211=${ing.mobileHost}${
+        ing.customHost ? ` / 自定义=${ing.customHost}` : ''
+      } · 转发${ix.forwardConfigured ? '已标记' : '未标记'} · 可达 ${home || '未填'}`,
       fix: ix.forwardConfigured
-        ? ''
+        ? rangeOk
+          ? ''
+          : `默认端口 ${port} 不在本 IX 段 ${ix.portMin}-${ix.portMax}`
         : '在 IX 执行转发脚本后勾选「已配置」',
     });
   }
@@ -669,6 +880,7 @@ module.exports = {
   CM_DEFAULTS,
   defaultTopology,
   defaultIx,
+  defaultIxIngress,
   defaultLanding,
   ensureTopology,
   migrateLegacyTopology,
@@ -683,6 +895,10 @@ module.exports = {
   getIx,
   getLanding,
   getLandingByNodeId,
+  getIxIngress,
+  resolveIx,
+  resolveIngress,
+  mirrorGlobalFromIx,
   clampPort,
   newId,
 };

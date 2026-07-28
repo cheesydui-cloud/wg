@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Edge Agent v4.0.0 — mieru / mita 落地（支持多落地 + 流量/套餐）
+ * Edge Agent v4.1.1 — mieru / mita 落地（支持多落地 + 流量/套餐）
  * 连接中心面板，拉取任务：安装/应用 mita、上报状态与用量
  *
  * 环境变量：
@@ -19,7 +19,7 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
-const VERSION = '4.0.0';
+const VERSION = '4.1.1';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';
@@ -344,16 +344,29 @@ async function ensureInstallScript() {
 
 async function applyMitaConfig(serverJson) {
   const bin = findMitaBin();
+  // mita 未装时 apply 必然失败，提前返回让上层走 OneClick 安装
+  if (bin.includes('/') && !fs.existsSync(bin)) {
+    const which = await run('sh', ['-c', 'command -v mita || true'], { timeout: 5000 });
+    if (!which.ok || !which.stdout) {
+      return { ok: false, message: 'mita 未安装', notInstalled: true };
+    }
+  }
   const tmp = path.join(DATA_DIR, `mita-apply-${Date.now()}.json`);
   fs.writeFileSync(tmp, JSON.stringify(serverJson, null, 2), { mode: 0o600 });
-  const apply = await run(bin, ['apply', 'config', tmp], { timeout: 30000 });
+  // 保留 stderr，便于面板展示真实失败原因
+  const apply = await run(bin, ['apply', 'config', tmp], { timeout: 45000 });
   try {
     fs.unlinkSync(tmp);
   } catch {
     /* */
   }
   if (!apply.ok) {
-    return { ok: false, message: `mita apply 失败: ${apply.stderr || apply.stdout}` };
+    const errText = (apply.stderr || apply.stdout || '').slice(0, 400);
+    return {
+      ok: false,
+      message: `mita apply 失败: ${errText || 'unknown'}`,
+      applyStderr: errText,
+    };
   }
   let start = await run(bin, ['reload'], { timeout: 20000 });
   if (!start.ok) {
@@ -426,7 +439,8 @@ async function installOrReconfigure(bundle) {
   const st0 = await mitaStatus();
   const action = st0.installed && (st0.running || st0.idle || st0.ok) ? 'reconfigure' : 'install';
 
-  if (bundle.serverConfig) {
+  function buildCfg() {
+    if (!bundle.serverConfig) return null;
     const cfg = JSON.parse(JSON.stringify(bundle.serverConfig));
     if (Array.isArray(cfg.users)) {
       cfg.users = cfg.users.filter(
@@ -436,28 +450,37 @@ async function installOrReconfigure(bundle) {
     if (!cfg.users?.length) {
       cfg.users = users.map((u) => ({ name: u.name, password: u.password }));
     }
+    return cfg;
+  }
+
+  // 1) mita 已装：优先 apply-full（多用户一次到位）
+  let applyFailMsg = '';
+  const cfg0 = buildCfg();
+  if (cfg0 && st0.installed) {
     console.log(
-      `[agent] apply mita full config users=${cfg.users.map((u) => u.name).join(',')} port=${port}`
+      `[agent] apply mita full config users=${cfg0.users.map((u) => u.name).join(',')} port=${port}`
     );
-    const ap = await applyMitaConfig(cfg);
+    const ap = await applyMitaConfig(cfg0);
     if (ap.ok) {
       await openFirewall(port, protocol);
       const pkgNotes = await applyUserPackages(bundle.users, script);
       return {
         ok: true,
-        message: `已同步 mita（${cfg.users.length} 用户）· RUNNING`,
+        message: `已同步 mita（${cfg0.users.length} 用户）· RUNNING`,
         detail: {
           action: 'apply-full',
           mita: ap.mita,
           configHash: bundle.configHash,
-          users: cfg.users.map((u) => u.name),
+          users: cfg0.users.map((u) => u.name),
           packageNotes: pkgNotes,
         },
       };
     }
-    console.warn('[agent] apply-full 失败，回退 OneClick:', ap.message);
+    applyFailMsg = ap.message || 'mita apply 失败';
+    console.warn('[agent] apply-full 失败，回退 OneClick:', applyFailMsg);
   }
 
+  // 2) OneClick 安装/重配（首装或 apply 失败兜底）
   const args = [
     script,
     action === 'install' ? '--install' : '--reconfigure',
@@ -476,6 +499,7 @@ async function installOrReconfigure(bundle) {
   const r = await runShell(`bash ${args.map((a) => JSON.stringify(a)).join(' ')}`, {
     timeout: 600000,
   });
+  const scriptTail = ((r.stdout || '') + '\n' + (r.stderr || '')).slice(-2000);
 
   if (users.length > 1 && (r.ok || (await mitaStatus()).installed)) {
     for (let i = 1; i < users.length; i++) {
@@ -488,13 +512,64 @@ async function installOrReconfigure(bundle) {
   }
 
   await openFirewall(port, protocol);
+
+  // 3) 装完再尝试 apply-full，把全部用户一次写进 mita
+  let secondApplyOk = false;
+  let secondApplyMsg = '';
+  const cfg1 = buildCfg();
+  if (cfg1) {
+    const stMid = await mitaStatus();
+    if (stMid.installed) {
+      const ap2 = await applyMitaConfig(cfg1);
+      secondApplyOk = ap2.ok;
+      secondApplyMsg = ap2.message || '';
+      if (ap2.ok) {
+        const pkgNotes = await applyUserPackages(bundle.users, script);
+        const st = await mitaStatus();
+        const via = applyFailMsg ? '（安装后 apply 成功）' : '';
+        return {
+          ok: true,
+          message: `落地完成 · mita RUNNING · ${cfg1.users.length} 用户${via}`,
+          detail: {
+            action: applyFailMsg ? 'oneclick+apply-full' : 'apply-full',
+            mita: st,
+            configHash: bundle.configHash,
+            users: cfg1.users.map((u) => u.name),
+            packageNotes: pkgNotes,
+            applyFailBefore: applyFailMsg || undefined,
+            scriptOk: r.ok,
+          },
+        };
+      }
+    }
+  }
+
   const pkgNotes = await applyUserPackages(bundle.users, script);
   const st = await mitaStatus();
+  const ok = st.running || r.ok;
+
+  // 成功：明确成功文案（不要「脚本异常…回退」类误导）
+  // 失败：带上脚本尾部便于排查
+  let message;
+  if (ok && st.running) {
+    if (applyFailMsg && r.ok) {
+      message = `落地完成 · mita RUNNING · 用户 ${users.map((u) => u.name).join(',')}（OneClick 成功）`;
+    } else if (r.ok) {
+      message = `${action} 完成 · RUNNING · 用户 ${users.map((u) => u.name).join(',')}`;
+    } else {
+      // 脚本非 0 但 mita 已在跑：仍算成功
+      message = `落地完成 · mita 已 RUNNING · 用户 ${users.map((u) => u.name).join(',')}`;
+    }
+  } else if (ok) {
+    message = `${action} 完成 · 状态 ${st.status}`;
+  } else {
+    const tail = scriptTail.replace(/\s+/g, ' ').slice(-180);
+    message = `落地失败 · ${st.status}${tail ? ' · ' + tail : ''}`;
+  }
+
   return {
-    ok: st.running || r.ok,
-    message: st.running
-      ? `${action} 完成 · RUNNING · 用户 ${users.map((u) => u.name).join(',')}`
-      : `${action} · ${st.status}`,
+    ok,
+    message,
     detail: {
       action,
       mita: st,
@@ -502,7 +577,10 @@ async function installOrReconfigure(bundle) {
       scriptOk: r.ok,
       users: users.map((u) => u.name),
       packageNotes: pkgNotes,
-      scriptTail: ((r.stdout || '') + '\n' + (r.stderr || '')).slice(-2000),
+      scriptTail,
+      applyFailBefore: applyFailMsg || undefined,
+      secondApplyOk: secondApplyOk || undefined,
+      secondApplyMsg: secondApplyMsg || undefined,
     },
   };
 }

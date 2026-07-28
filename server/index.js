@@ -62,10 +62,30 @@ function clientIp(req) {
 
 function hasher() {
   return {
+    // 与 buildBundleForNode.configHash 同一算法，避免「apply 成功但 dirty 不消」
+    nodeHash: (node) => {
+      if (!node) return null;
+      try {
+        return buildBundleForNode(node).configHash;
+      } catch {
+        return null;
+      }
+    },
     configHash: (fake) => {
       // fake may be {server, clients} from node or full state
+      if (fake && fake.id) {
+        try {
+          return buildBundleForNode(fake).configHash;
+        } catch {
+          /* fall through */
+        }
+      }
       if (fake && fake.clients && fake.server && !fake.topology) {
-        return mieru.configHash({ server: fake.server, clients: fake.clients, primaryNodeId: state.primaryNodeId });
+        return mieru.configHash({
+          server: fake.server,
+          clients: fake.clients,
+          primaryNodeId: state.primaryNodeId,
+        });
       }
       return mieru.configHash(fake || state);
     },
@@ -171,6 +191,15 @@ function applyRoutePackageBody(client, body) {
     client.route.listenPort = body.listenPort ? Number(body.listenPort) : null;
   }
   if (body.ixId !== undefined) client.route.ixId = body.ixId || null;
+  // default ixId from landing.ixId when landing set but ix empty
+  if (client.route.landingNodeId && !client.route.ixId) {
+    try {
+      const L = topology.getLandingByNodeId(state, client.route.landingNodeId);
+      if (L?.ixId) client.route.ixId = L.ixId;
+    } catch {
+      /* */
+    }
+  }
 
   if (body.package && typeof body.package === 'object') {
     const p = body.package;
@@ -838,6 +867,7 @@ app.post('/api/nodes', (req, res) => {
   const landing = topology.defaultLanding({
     id: topology.newId('landing'),
     nodeId: node.id,
+    ixId: body.ixId || state.topology.ixes[0]?.id || null,
     name: node.name,
     listenPort: node.server.listenPort,
     homeReachableHost: body.homeReachableHost || '',
@@ -894,6 +924,7 @@ app.put('/api/nodes/:id', (req, res) => {
       landing.homeReachablePort = topology.clampPort(body.homeReachablePort, node.server.listenPort);
     }
     if (body.listenPort !== undefined) landing.listenPort = Number(body.listenPort) || landing.listenPort;
+    if (body.ixId !== undefined) landing.ixId = body.ixId || null;
     if (body.name !== undefined) landing.name = node.name;
   }
   if (body.setPrimary) {
@@ -1347,15 +1378,19 @@ app.post('/api/agent/job-result', (req, res) => {
       job.type === 'mieru_apply' ||
       job.type === 'mieru_install')
   ) {
-    const hash =
-      detail?.configHash ||
-      (() => {
-        try {
-          return buildBundleForNode(node).configHash;
-        } catch {
-          return null;
-        }
-      })();
+    // 镜像本落地用户，保证后续 dirty 比对与 bundle 一致
+    try {
+      node.clients = mieru.clientsForNode(state, node.id);
+    } catch {
+      /* ignore */
+    }
+    // 一律用当前 bundle 算法重算 hash（不轻信 agent 回传的旧算法值）
+    let hash = null;
+    try {
+      hash = buildBundleForNode(node).configHash;
+    } catch {
+      hash = detail?.configHash || null;
+    }
     if (hash) nodes.markNodeClean(node, hash);
     if (state.mode === 'agent' && state.primaryNodeId === node.id) {
       if (hash) {

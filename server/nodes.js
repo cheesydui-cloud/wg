@@ -227,7 +227,12 @@ function deleteNode(state, id) {
 }
 
 function configHashForNode(node, hasher) {
-  const fakeState = { server: node.server, clients: node.clients };
+  // 优先 nodeHash(整节点)：与面板 buildBundleForNode.configHash 对齐
+  if (hasher && typeof hasher.nodeHash === 'function') {
+    const h = hasher.nodeHash(node);
+    if (h) return h;
+  }
+  const fakeState = { server: node.server, clients: node.clients, id: node.id };
   if (hasher && typeof hasher.configHash === 'function') {
     return hasher.configHash(fakeState);
   }
@@ -247,6 +252,7 @@ function isNodeDirty(node, hasher) {
   if (hasher) {
     try {
       const h = configHashForNode(node, hasher);
+      if (!h) return Boolean(node._dirtyFlag);
       return h !== node.lastAppliedHash;
     } catch {
       return Boolean(node._dirtyFlag);

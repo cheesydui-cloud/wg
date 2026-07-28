@@ -1,9 +1,13 @@
-# mieru 出口面板 v4.0
+# mieru 出口面板 v4.1
 
 中文、新手友好的 **mieru / mita 拓扑出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v4.0.0**
+当前版本：**v4.1.1**（一键落地成功后清除 dirty、任务 toast 更准、Agent apply 文案修正）
+
+- 每台 IX 独立商家前置（IP/域名）与端口段
+- 拓扑 = IX 工作台；落地列表点开详情；客户端按落地分组
+- 管理员账号/密码在「设置」完整可改
 
 > **正确路径（已打通验证）**  
 > **电脑/客户端 → 商家 IX 前置(114/211) → IX(DNAT) → 落地家宽 mita → 出网**  
@@ -27,6 +31,17 @@
 | **兼容 v3.1** | 单前置 / 单 IX / 单落地自动迁成一条路由，Endpoint 保留 |
 
 路径保持不变。业务流量不经面板。
+
+### v4.1.1
+- 一键落地成功后正确清除 dirty（bundle hash 对齐）
+- Agent apply-full / OneClick 回退文案修正，失败带脚本尾部
+- 任务 toast 按目标落地轮询；设置页账号密码与按钮样式统一
+
+### v4.1.0
+- 每台 IX 独立商家前置（IP/域名）与端口段
+- 拓扑 = IX 工作台；落地列表+详情；客户端按落地分组
+- 分享链按 route.ixId → landing.ixId 解析前置
+
 
 ---
 
@@ -71,7 +86,7 @@ sudo bash install.sh --update
 # 新装：sudo bash install.sh
 ```
 
-打开 `http://面板IP:51821`，确认版本 **v4.0.0**。
+打开 `http://面板IP:51821`，确认版本 **v4.1.1**。
 
 忘记密码：
 
@@ -169,7 +184,7 @@ sudo bash install.sh --update
 - **2.x → 4.0**：补拓扑 + 多落地字段  
 - **1.x → 4.0**：WG 归档；重装 Agent；新建 mieru 用户  
 
-升级前建议备份 `data/state.json`。落地机建议再执行一次 Agent 安装命令以对齐 **agent v4.0.0**（用量/配额）。
+升级前建议备份 `data/state.json`。落地机建议再执行一次 Agent 安装命令以对齐 **agent v4.1.1**（用量/配额）。
 
 本地回归：
 

@@ -18,6 +18,7 @@ const state = {
   forwardScript: '',
   selectedIxId: null,
   selectedLandingId: null,
+  expandedLandingId: null,
 };
 
 async function api(path, options = {}) {
@@ -131,13 +132,53 @@ function topo() {
   return state.topology || state.status?.topology || {};
 }
 
-function activeEp() {
+function activeEp(ixId) {
   const t = topo();
+  if (ixId) {
+    const ix = (t.ixes || []).find((x) => x.id === ixId);
+    if (ix?.endpoints?.active) return ix.endpoints.active;
+  }
+  const cur = currentIx();
+  if (cur?.endpoints?.active) return cur.endpoints.active;
   return t.activeEndpoint || state.server?.endpoint || '';
 }
 
 function pathLabel() {
-  return topo().pathLabel || '电脑/客户端 → 商家IX前置 → 沪日IX → 落地家宽 mita';
+  return topo().pathLabel || '电脑/客户端 → 商家IX前置 → IX → 落地家宽 mita';
+}
+
+function currentIx() {
+  const ixes = ixesList();
+  if (!ixes.length) return null;
+  const id = state.selectedIxId || ixes[0].id;
+  return ixes.find((x) => x.id === id) || ixes[0];
+}
+
+function ixIngress(ix) {
+  if (!ix) return {};
+  return ix.ingress && typeof ix.ingress === 'object' ? ix.ingress : {};
+}
+
+function landingsForIx(ixId) {
+  const all = landingsList();
+  if (!ixId) return all;
+  const bound = all.filter((L) => L.ixId === ixId);
+  // 未绑 ix 的老数据在第一台 IX 工作台里可见
+  if (bound.length) return bound;
+  const ixes = ixesList();
+  if (ixes[0]?.id === ixId) return all.filter((L) => !L.ixId || L.ixId === ixId);
+  return bound;
+}
+
+function landingByNodeId(nodeId) {
+  if (!nodeId) return null;
+  return landingsList().find((L) => L.nodeId === nodeId) || null;
+}
+
+function ixName(id) {
+  if (!id) return '—';
+  const x = ixesList().find((i) => i.id === id);
+  return x?.name || id.slice(0, 8);
 }
 
 function topAlerts() {
@@ -179,10 +220,10 @@ function topAlerts() {
       <button class="btn btn-sm btn-primary" data-nav-jump="clients">去客户端</button>
     </div>`);
   }
-  const job = state.primaryNode?.latestJob;
+  const job = typeof pickJob === 'function' ? pickJob() : state.primaryNode?.latestJob;
   if (job && (job.status === 'pending' || job.status === 'running')) {
     parts.push(`<div class="alert warn">
-      <div><strong>任务执行中</strong> · ${esc(job.type)}（${esc(job.status)}）</div>
+      <div><strong>任务执行中</strong> · ${esc(job.type)}（${esc(job.status)}）${job.message ? ' · ' + esc(job.message) : ''}</div>
       <button class="btn btn-sm btn-ghost" id="banner-poll">刷新</button>
     </div>`);
   } else if (job && (job.status === 'error' || job.status === 'failed')) {
@@ -257,19 +298,39 @@ function renderSetup() {
       <div class="auth-card">
         <div class="logo">M</div>
         <h1>初始化面板</h1>
-        <p class="muted">面板装<strong>独立 VPS</strong>只管理。<br/>路径：电脑 → 商家IX前置 → 沪日IX → 落地家宽 mita。</p>
-        <label>用户名</label>
-        <input class="field" id="su-user" value="admin" />
-        <label>密码（至少 6 位）</label>
-        <input class="field" id="su-pass" type="password" />
-        <button class="btn btn-primary btn-block" id="su-go">完成初始化</button>
+        <p class="sub">创建管理员账号。面板装<strong>独立 VPS</strong>只管理，不在业务链上。<br/>路径：电脑 → 商家IX前置 → IX → 落地家宽 mita。</p>
+        <label for="su-user">管理员用户名</label>
+        <input class="field" id="su-user" value="admin" autocomplete="username" />
+        <p class="field-hint">建议保留 admin，或改为你自己的短英文名。</p>
+        <label for="su-pass">登录密码（至少 6 位）</label>
+        <div class="field-with-btn">
+          <input class="field" id="su-pass" type="password" autocomplete="new-password" placeholder="设置强密码" />
+          <button type="button" class="btn btn-secondary" id="su-toggle" title="显示或隐藏密码">显示</button>
+        </div>
+        <label for="su-pass2">确认密码</label>
+        <input class="field" id="su-pass2" type="password" autocomplete="new-password" placeholder="再输入一次" />
+        <div class="section-actions" style="border:0;padding-top:8px;margin-top:8px">
+          <button class="btn btn-primary btn-block" id="su-go" title="创建账号并进入面板">完成初始化</button>
+        </div>
       </div>
     </div>`;
+  const passEl = document.getElementById('su-pass');
+  let show = false;
+  document.getElementById('su-toggle').onclick = () => {
+    show = !show;
+    passEl.type = show ? 'text' : 'password';
+    document.getElementById('su-pass2').type = show ? 'text' : 'password';
+    document.getElementById('su-toggle').textContent = show ? '隐藏' : '显示';
+  };
   document.getElementById('su-go').onclick = async () => {
+    const p1 = document.getElementById('su-pass').value;
+    const p2 = document.getElementById('su-pass2').value;
+    if (p1.length < 6) return toast('密码至少 6 位', 'err');
+    if (p1 !== p2) return toast('两次密码不一致', 'err');
     try {
       await api('/api/setup', {
         method: 'POST',
-        body: { username: val('su-user'), password: val('su-pass') },
+        body: { username: val('su-user'), password: p1 },
       });
       toast('初始化成功');
       await boot();
@@ -285,27 +346,27 @@ function renderLogin() {
       <div class="auth-card">
         <div class="logo">M</div>
         <h1>登录</h1>
-        <p class="muted">mieru 拓扑面板 v${esc(state.status?.version || '')}</p>
+        <p class="sub">mieru 拓扑面板 v${esc(state.status?.version || '')} · 多 IX / 多落地</p>
         <form id="li-form" autocomplete="on">
           <label for="li-user">用户名</label>
           <input class="field" id="li-user" name="username" type="text" autocomplete="username"
             autocapitalize="off" spellcheck="false"
-            value="${esc(state.status?.defaultUsername || 'admin')}" />
+            value="${esc(state.status?.defaultUsername || state.status?.username || 'admin')}" />
           <label for="li-pass">密码</label>
           <div class="field-with-btn">
-            <input class="field" id="li-pass" name="password" type="text" inputmode="text"
+            <input class="field" id="li-pass" name="password" type="password" inputmode="text"
               autocomplete="current-password" autocapitalize="off" spellcheck="false"
-              placeholder="点这里输入密码" />
-            <button type="button" class="btn btn-ghost" id="li-toggle" title="显示/隐藏">隐藏</button>
+              placeholder="输入登录密码" />
+            <button type="button" class="btn btn-secondary" id="li-toggle" title="显示或隐藏密码">显示</button>
           </div>
-          <p class="field-hint">忘记密码在面板机执行：
+          <p class="field-hint">忘记密码：在<strong>面板机</strong>执行
             <code>sudo bash install.sh --reset-password '新密码'</code></p>
-          <button type="submit" class="btn btn-primary btn-block" id="li-go">登录</button>
+          <button type="submit" class="btn btn-primary btn-block" id="li-go" title="登录面板">登录</button>
         </form>
       </div>
     </div>`;
   const passEl = document.getElementById('li-pass');
-  let hidden = false;
+  let hidden = true;
   document.getElementById('li-toggle').onclick = () => {
     hidden = !hidden;
     passEl.type = hidden ? 'password' : 'text';
@@ -340,7 +401,6 @@ function renderLogin() {
   document.getElementById('li-form').onsubmit = go;
   setTimeout(() => {
     passEl.focus();
-    passEl.select();
   }, 50);
 }
 
@@ -375,7 +435,7 @@ function shell(content) {
         </nav>
         <div class="sidebar-footer">
           <div class="mode-pill ${isAgentMode() ? 'agent' : 'local'}">${esc(exitLabel())}${totalN ? ` · ${onlineN}/${totalN}` : ''}</div>
-          <button class="btn btn-sm btn-ghost btn-block" id="btn-logout">退出登录</button>
+          <button class="btn btn-sm btn-secondary btn-block" id="btn-logout" title="退出当前会话">退出登录</button>
         </div>
       </aside>
       <main class="main">
@@ -440,24 +500,31 @@ function landingsList() {
   return Array.isArray(t.landings) && t.landings.length ? t.landings : [];
 }
 
-function pathBanner() {
+function pathBanner(ixOverride) {
   const t = topo();
-  const ep = activeEp();
-  const fwdOk = Boolean(t.forward?.configured);
+  const ix = ixOverride || currentIx() || {};
+  const ing = ixIngress(ix);
+  const ep = ix.endpoints?.active || activeEp(ix.id);
+  const range = ix.merchantPortRange || `${ix.portMin || 7900}-${ix.portMax || 7999}`;
+  const fwdOk = Boolean(ix.forwardConfigured);
+  const sideLandings = landingsForIx(ix.id);
+  const onlineN = (state.nodes || []).filter((n) =>
+    sideLandings.some((L) => L.nodeId === n.id && n.online)
+  ).length;
   return `
     <div class="path-banner">
       <div class="path-flow">
         <span class="path-node">电脑/客户端</span>
         <span class="path-arrow">→</span>
-        <span class="path-node on">商家IX前置<br/><small class="mono">${esc(ep || '114:7901')}</small></span>
+        <span class="path-node on">本IX商家前置<br/><small class="mono">${esc(ep || '未配置')}</small></span>
         <span class="path-arrow">→</span>
-        <span class="path-node ${fwdOk ? 'on' : 'warn'}">沪日IX<br/><small>${fwdOk ? '转发已配' : '待转发'}</small></span>
+        <span class="path-node ${fwdOk ? 'on' : 'warn'}">${esc(ix.name || 'IX')}<br/><small>${fwdOk ? '转发已配' : '待转发'}</small></span>
         <span class="path-arrow">→</span>
-        <span class="path-node ${state.primaryNode?.online ? 'on' : ''}">落地家宽<br/><small>mita</small></span>
+        <span class="path-node ${onlineN ? 'on' : ''}">落地×${sideLandings.length || 0}<br/><small>${onlineN} 在线</small></span>
         <span class="path-arrow">→</span>
         <span class="path-node">出网</span>
       </div>
-      <p class="field-hint" style="margin:8px 0 0">面板只管理，不在业务链上。端口 ${esc(t.merchantPortRange || '7900-7999')} · TCP mieru。「移动入口」= 商家移动宽带前置，不是手机。客户端连前置，勿连家宽公网。</p>
+      <p class="field-hint" style="margin:8px 0 0">当前 IX 端口段 <strong>${esc(range)}</strong> · TCP mieru · 前置可填 IP 或域名。「移动入口」= 商家移动宽带前置，不是手机。客户端连前置，勿连家宽公网。</p>
     </div>`;
 }
 
@@ -714,9 +781,9 @@ async function renderDashboard() {
         <p class="muted">${esc(pathLabel())}</p>
       </div>
       <div class="btn-row">
-        <button class="btn btn-success" id="dash-exit">一键落地</button>
-        <button class="btn btn-primary" id="dash-apply">应用全部</button>
-        <button class="btn btn-ghost" id="dash-topo">拓扑</button>
+        <button class="btn btn-success" id="dash-exit" title="在默认落地安装/启动 mita">一键落地</button>
+        <button class="btn btn-success" id="dash-apply" title="下发配置到全部落地">应用全部</button>
+        <button class="btn btn-secondary" id="dash-topo" title="按 IX 配置前置与转发">拓扑</button>
       </div>
     </div>
     ${pathBanner()}
@@ -772,7 +839,7 @@ async function renderDashboard() {
     }
     <div class="card" style="margin-top:16px">
       <div class="card-head"><h3>客户端用户</h3>
-        <button class="btn btn-sm btn-primary" id="dash-add">添加</button>
+        <button class="btn btn-sm btn-primary" id="dash-add" title="添加客户端用户">添加用户</button>
       </div>
       ${
         state.clients.length
@@ -792,7 +859,7 @@ async function renderDashboard() {
                     ? '<span class="badge ok">启用</span>'
                     : '<span class="badge">停用</span>'
             }</td>
-            <td><button class="btn btn-sm btn-ghost" data-qr="${c.id}">211/114</button></td>
+            <td><button class="btn btn-sm btn-primary" data-qr="${c.id}" title="复制 211/114 链接">链接</button></td>
           </tr>`
             )
             .join('')}
@@ -818,85 +885,112 @@ async function renderDashboard() {
 async function renderTopology() {
   await refreshCore().catch(() => {});
   const t = topo();
-  const ing = t.ingress || {};
   const ixes = ixesList();
-  const landings = landingsList();
-  let curIxId = state.selectedIxId || ixes[0]?.id;
-  let curLandingId = state.selectedLandingId || landings[0]?.id;
-  const ix = ixes.find((x) => x.id === curIxId) || ixes[0] || t.ix || {};
-  const landing = landings.find((L) => L.id === curLandingId) || landings[0] || {};
+  if (!state.selectedIxId && ixes[0]) state.selectedIxId = ixes[0].id;
+  const ix = currentIx() || ixes[0] || t.ix || {};
+  const ing = ixIngress(ix);
+  const sideLandings = landingsForIx(ix.id);
+  let curLandingId = state.selectedLandingId;
+  if (!curLandingId || !sideLandings.find((L) => L.id === curLandingId)) {
+    curLandingId = sideLandings[0]?.id || null;
+    state.selectedLandingId = curLandingId;
+  }
+  const landing = sideLandings.find((L) => L.id === curLandingId) || sideLandings[0] || {};
   const script = state.forwardScript || '';
   const homeHost = landing.homeReachableHost || ix.homeReachableHost || '';
-  const homePort = landing.homeReachablePort || landing.listenPort || ix.homeReachablePort || ing.port || 7901;
+  const homePort =
+    landing.homeReachablePort || landing.listenPort || ix.homeReachablePort || t.ingress?.port || 7901;
+  const portMin = ix.portMin || 7900;
+  const portMax = ix.portMax || 7999;
+  const active = ing.active || 'external';
 
   app.innerHTML = shell(`
     <div class="page-header">
       <div>
-        <h2>拓扑</h2>
-        <p class="muted">商家 IX 前置 · 多 IX · 多落地</p>
+        <h2>拓扑 · IX 工作台</h2>
+        <p class="muted">每台 IX 独立前置 IP/域名 + 端口段 · 本侧落地</p>
       </div>
       <div class="btn-row">
-        <button class="btn btn-primary" id="topo-save">保存拓扑</button>
-        <button class="btn btn-ghost" id="topo-diag">诊断</button>
+        <button class="btn btn-primary" id="topo-save" title="保存当前 IX 的前置/机器/落地转发参数">保存本 IX</button>
+        <button class="btn btn-secondary" id="topo-diag" title="检查入口、转发与落地状态">诊断</button>
       </div>
     </div>
-    ${pathBanner()}
+
+    <div class="ix-tabs" id="ix-tabs">
+      ${ixes
+        .map(
+          (x) =>
+            `<button type="button" class="ix-tab ${x.id === ix.id ? 'on' : ''}" data-ix-tab="${esc(x.id)}">${esc(
+              x.name || 'IX'
+            )}<small class="mono">${esc(x.lanIp || '')}</small></button>`
+        )
+        .join('')}
+      <button type="button" class="ix-tab add" id="t-add-ix">+ 添加 IX</button>
+    </div>
+
+    ${pathBanner(ix)}
 
     <div class="card endpoint-card" style="margin-top:16px">
       <div class="card-head">
-        <h3>① 商家 IX 前置（客户端连接）</h3>
-        <span class="badge ${t.portInRange ? 'ok' : 'warn'}">端口段 ${esc(t.merchantPortRange || '7900-7999')}</span>
+        <h3>① 本 IX 商家前置（可改 IP / 域名）</h3>
+        <span class="badge ok">端口段 ${esc(portMin)}–${esc(portMax)}</span>
       </div>
-      <p class="field-hint">「移动入口」= 商家<strong>移动宽带前置</strong>（211），不是你的手机。电脑客户端连这里。多线路靠端口区分。</p>
+      <p class="field-hint">每台 IX 前置与端口段<strong>各自独立</strong>。Host 可填 IP 或域名（如 ix1.example.com）。「移动入口」= 商家移动宽带前置，不是手机。</p>
       <div class="choice-grid" style="margin:10px 0">
-        <button type="button" class="choice-card ${ing.active === 'external' || !ing.active ? 'selected' : ''}" data-act="external">
+        <button type="button" class="choice-card ${active === 'external' || !active ? 'selected' : ''}" data-act="external">
           <strong>外部前置 114</strong>
-          <span class="mono">${esc(ing.externalHost || '114.111.176.37')}</span>
+          <span>当前选用下方 114 地址</span>
         </button>
-        <button type="button" class="choice-card ${ing.active === 'mobile' ? 'selected' : ''}" data-act="mobile">
+        <button type="button" class="choice-card ${active === 'mobile' ? 'selected' : ''}" data-act="mobile">
           <strong>移动宽带前置 211</strong>
-          <span class="mono">${esc(ing.mobileHost || '211.136.162.184')}</span>
+          <span>当前选用下方 211 地址</span>
         </button>
-        <button type="button" class="choice-card ${ing.active === 'custom' ? 'selected' : ''}" data-act="custom">
-          <strong>自定义</strong>
-          <span>填下方</span>
+        <button type="button" class="choice-card ${active === 'custom' ? 'selected' : ''}" data-act="custom">
+          <strong>自定义 / 域名</strong>
+          <span>填自定义 Host</span>
         </button>
       </div>
       <div class="inline-fields">
         <div>
-          <label>默认端口</label>
-          <input class="field mono" id="t-port" value="${esc(ing.port || 7901)}" />
+          <label>外部前置 114（IP 或域名）</label>
+          <input class="field mono" id="t-ext" value="${esc(ing.externalHost || '114.111.176.37')}" placeholder="114.x 或 domain" />
         </div>
         <div>
-          <label>自定义 Host</label>
-          <input class="field mono" id="t-custom" value="${esc(ing.customHost || '')}" placeholder="可选" />
+          <label>移动宽带前置 211（IP 或域名）</label>
+          <input class="field mono" id="t-mob" value="${esc(ing.mobileHost || '211.136.162.184')}" placeholder="211.x 或 domain" />
+        </div>
+        <div>
+          <label>自定义 Host / 域名</label>
+          <input class="field mono" id="t-custom" value="${esc(ing.customHost || '')}" placeholder="可选，如 front.example.com" />
+        </div>
+      </div>
+      <div class="inline-fields" style="margin-top:8px">
+        <div>
+          <label>本 IX 端口下限</label>
+          <input class="field mono" id="t-pmin" value="${esc(portMin)}" />
+        </div>
+        <div>
+          <label>本 IX 端口上限</label>
+          <input class="field mono" id="t-pmax" value="${esc(portMax)}" />
+        </div>
+        <div>
+          <label>默认端口</label>
+          <input class="field mono" id="t-port" value="${esc(t.ingress?.port || landing.listenPort || 7901)}" />
         </div>
         <div>
           <label>白名单提示</label>
           <input class="field" id="t-province" value="${esc(ing.provinceWhitelist || '商家白名单（如有）')}" />
         </div>
       </div>
-      <div class="kv"><span>当前 Endpoint</span><span class="mono">${esc(activeEp())}</span></div>
+      <div class="kv"><span>本 IX 当前 Endpoint</span><span class="mono">${esc(ix.endpoints?.active || activeEp(ix.id) || '—')}</span></div>
     </div>
 
     <div class="card" style="margin-top:16px">
       <div class="card-head">
-        <h3>② IX 列表</h3>
-        <button class="btn btn-sm btn-primary" id="t-add-ix">添加 IX</button>
+        <h3>② 本 IX 机器</h3>
+        <button class="btn btn-sm btn-danger" id="t-del-ix" ${ixes.length <= 1 ? 'disabled' : ''} title="删除当前 IX（至少保留一台）">删除本 IX</button>
       </div>
-      <p class="field-hint">可配置多台 IX。下方脚本按「选中 IX × 落地」生成 DNAT。</p>
       <div class="inline-fields">
-        <div>
-          <label>选择 IX</label>
-          <select class="field" id="t-ix-sel">
-            ${ixes
-              .map(
-                (x) =>
-                  `<option value="${esc(x.id)}" ${x.id === ix.id ? 'selected' : ''}>${esc(x.name)} · ${esc(x.lanIp || '')}</option>`
-              )
-              .join('')}
-          </select>
-        </div>
         <div>
           <label>名称</label>
           <input class="field" id="t-ix-name" value="${esc(ix.name || '')}" />
@@ -914,31 +1008,55 @@ async function renderTopology() {
         <input type="checkbox" id="t-fwd-ok" ${ix.forwardConfigured ? 'checked' : ''} />
         此 IX 已整段执行脚本且探测 OK
       </label>
-      <div class="btn-row" style="margin-top:8px">
-        <button class="btn btn-sm btn-ghost" id="t-del-ix" ${ixes.length <= 1 ? 'disabled' : ''}>删除当前 IX</button>
-      </div>
     </div>
 
     <div class="card" style="margin-top:16px">
       <div class="card-head">
-        <h3>③ 转发脚本（IX → 落地）</h3>
+        <h3>③ 本 IX 落地（${sideLandings.length}）</h3>
+          <button class="btn btn-sm btn-secondary" data-nav-jump="server" title="打开落地列表与详情">管理落地</button>
+      </div>
+      ${
+        sideLandings.length
+          ? `<table><thead><tr><th>名称</th><th>端口</th><th>Agent</th><th>出网</th><th></th></tr></thead><tbody>
+          ${sideLandings
+            .map((L) => {
+              const n = (state.nodes || []).find((x) => x.id === L.nodeId);
+              return `<tr>
+                <td>${esc(L.name)}${n?.isPrimary ? ' <span class="badge ok">默认</span>' : ''}</td>
+                <td class="mono">:${esc(L.listenPort || 7901)}</td>
+                <td>${n ? (n.online ? '<span class="badge ok">在线</span>' : '<span class="badge warn">离线</span>') : '<span class="badge">未绑</span>'}</td>
+                <td class="mono">${esc(n?.exitPublicIp || '—')}</td>
+                <td><button class="btn btn-sm btn-secondary" data-open-landing="${esc(L.nodeId || L.id)}" title="打开落地详情">详情</button></td>
+              </tr>`;
+            })
+            .join('')}
+        </tbody></table>`
+          : '<p class="muted">本 IX 下暂无落地。到「落地」页添加并绑定本 IX。</p>'
+      }
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-head">
+        <h3>④ 转发脚本（本 IX → 落地）</h3>
         <span class="badge ${ix.forwardConfigured ? 'ok' : 'warn'}">${ix.forwardConfigured ? '已标记' : '未配置'}</span>
       </div>
       <div class="inline-fields">
         <div>
           <label>目标落地</label>
           <select class="field" id="t-landing-sel">
-            ${landings
+            ${sideLandings
               .map(
                 (L) =>
-                  `<option value="${esc(L.id)}" ${L.id === landing.id ? 'selected' : ''}>${esc(L.name)} · :${esc(L.listenPort || 7901)}</option>`
+                  `<option value="${esc(L.id)}" ${L.id === landing.id ? 'selected' : ''}>${esc(L.name)} · :${esc(
+                    L.listenPort || 7901
+                  )}</option>`
               )
               .join('') || '<option value="">（请先在落地页添加）</option>'}
           </select>
         </div>
         <div>
           <label>监听端口（前置侧）</label>
-          <input class="field mono" id="t-fwd-port" value="${esc(landing.listenPort || ing.port || 7901)}" />
+          <input class="field mono" id="t-fwd-port" value="${esc(landing.listenPort || t.ingress?.port || 7901)}" />
         </div>
         <div>
           <label>家宽可达地址</label>
@@ -953,89 +1071,106 @@ async function renderTopology() {
         <strong>已验证顺序</strong>
         <ol style="margin:6px 0 0;padding-left:18px;color:var(--text-2);font-size:13px">
           <li>落地 mita RUNNING 且端口在听</li>
-          <li>生成脚本 → 在对应 IX <strong>整文件</strong>执行</li>
+          <li>生成脚本 → 在本 IX <strong>整文件</strong>执行</li>
           <li>IX 探测 OK 后勾选并保存</li>
-          <li>客户端连商家前置 114/211，勿连家宽公网</li>
+          <li>客户端连本 IX 商家前置（可 IP/域名），勿连家宽公网</li>
         </ol>
       </div></div>
       <div class="btn-row" style="margin-top:12px">
-        <button class="btn btn-sm btn-primary" id="t-load-script">生成/刷新转发脚本</button>
-        <button class="btn btn-sm btn-ghost" id="t-copy-script" ${script ? '' : 'disabled'}>复制脚本</button>
-        <a class="btn btn-sm btn-ghost" id="t-dl-script" href="/api/topology/forward-script?download=1">下载 .sh</a>
+        <button class="btn btn-sm btn-primary" id="t-load-script" title="按本 IX × 落地生成 DNAT 脚本">生成/刷新转发脚本</button>
+        <button class="btn btn-sm btn-secondary" id="t-copy-script" ${script ? '' : 'disabled'} title="复制脚本到剪贴板">复制脚本</button>
+        <a class="btn btn-sm btn-secondary" id="t-dl-script" href="/api/topology/forward-script?download=1" title="下载 .sh 文件">下载 .sh</a>
       </div>
       <pre class="code-block" id="t-script" style="margin-top:10px;max-height:220px;overflow:auto">${esc(
         script || '（先填家宽可达地址并生成）'
       )}</pre>
     </div>
-
-    <div class="card" style="margin-top:16px">
-      <div class="card-head">
-        <h3>④ 落地速览</h3>
-        <button class="btn btn-sm btn-ghost" data-nav-jump="server">管理落地</button>
-      </div>
-      ${(state.nodes || [])
-        .map(
-          (n) => `<div class="kv">
-        <span>${esc(n.name)}${n.isPrimary ? ' · 默认' : ''}</span>
-        <span>${n.online ? '<span class="badge ok">在线</span>' : '<span class="badge warn">离线</span>'}
-          · mita ${esc(n.mita?.status || '-')} · 用户 ${n.clientCount ?? 0}</span>
-      </div>`
-        )
-        .join('') || '<p class="muted">暂无落地节点</p>'}
-      <div class="btn-row" style="margin-top:10px">
-        <button class="btn btn-sm btn-success" id="t-exit">默认落地 · 一键落地</button>
-      </div>
-    </div>
   `);
   bindShell();
 
-  let active = ing.active || 'external';
+  let activeChoice = active;
   document.querySelectorAll('[data-act]').forEach((b) => {
     b.onclick = () => {
-      active = b.dataset.act;
+      activeChoice = b.dataset.act;
       document.querySelectorAll('[data-act]').forEach((x) => x.classList.remove('selected'));
       b.classList.add('selected');
     };
   });
 
+  document.querySelectorAll('[data-ix-tab]').forEach((b) => {
+    b.onclick = async () => {
+      try {
+        await saveCurrentIx(activeChoice);
+      } catch {
+        /* */
+      }
+      state.selectedIxId = b.dataset.ixTab;
+      state.selectedLandingId = null;
+      state.forwardScript = '';
+      render();
+    };
+  });
+
+  document.querySelectorAll('[data-open-landing]').forEach((b) => {
+    b.onclick = () => {
+      state.expandedLandingId = b.dataset.openLanding;
+      state.page = 'server';
+      render();
+    };
+  });
+
   const collectIxes = () => {
-    const list = ixes.map((x) => ({ ...x }));
-    const idx = list.findIndex((x) => x.id === (document.getElementById('t-ix-sel')?.value || ix.id));
+    const list = ixes.map((x) => ({ ...x, ingress: { ...(x.ingress || {}) } }));
+    const idx = list.findIndex((x) => x.id === ix.id);
     const target = list[idx >= 0 ? idx : 0];
     if (target) {
       target.name = val('t-ix-name') || target.name;
       target.lanIp = val('t-ix-lan');
       target.sshPort = Number(val('t-ix-ssh')) || 7900;
+      target.portMin = Number(val('t-pmin')) || 7900;
+      target.portMax = Number(val('t-pmax')) || 7999;
       target.forwardConfigured = document.getElementById('t-fwd-ok')?.checked;
       target.homeReachableHost = val('t-home') || target.homeReachableHost;
       target.homeReachablePort = Number(val('t-home-port')) || target.homeReachablePort;
+      target.ingress = {
+        active: activeChoice,
+        externalHost: val('t-ext'),
+        mobileHost: val('t-mob'),
+        customHost: val('t-custom'),
+        provinceWhitelist: val('t-province'),
+      };
     }
     return list;
   };
 
   const collectLandings = () => {
-    const list = landings.map((L) => ({ ...L }));
+    const all = landingsList().map((L) => ({ ...L }));
     const sel = document.getElementById('t-landing-sel')?.value;
-    const target = list.find((L) => L.id === sel) || list[0];
+    const target = all.find((L) => L.id === sel);
     if (target) {
       target.homeReachableHost = val('t-home');
       target.homeReachablePort = Number(val('t-home-port')) || target.homeReachablePort;
       target.listenPort = Number(val('t-fwd-port')) || target.listenPort;
+      if (!target.ixId) target.ixId = ix.id;
     }
-    return list;
+    return all;
   };
 
-  const saveTopo = async () => {
+  async function saveCurrentIx(act) {
+    if (act) activeChoice = act;
     const r = await api('/api/topology', {
       method: 'PUT',
       body: {
         ingress: {
-          active,
+          active: activeChoice,
           port: Number(val('t-port')) || 7901,
+          externalHost: val('t-ext'),
+          mobileHost: val('t-mob'),
           customHost: val('t-custom'),
           provinceWhitelist: val('t-province'),
           protocol: 'TCP',
         },
+        ixId: ix.id,
         ixes: collectIxes(),
         landings: collectLandings(),
       },
@@ -1045,10 +1180,10 @@ async function renderTopology() {
     state.dirty = r.dirty;
     state.clientsNeedRescan = Boolean(r.clientsNeedRescan);
     return r;
-  };
+  }
 
   const scriptQs = () => {
-    const ixId = document.getElementById('t-ix-sel')?.value || '';
+    const ixId = ix.id || '';
     const landingId = document.getElementById('t-landing-sel')?.value || '';
     const port = Number(val('t-fwd-port')) || '';
     const q = new URLSearchParams();
@@ -1058,15 +1193,6 @@ async function renderTopology() {
     return q.toString();
   };
 
-  document.getElementById('t-ix-sel')?.addEventListener('change', async () => {
-    state.selectedIxId = document.getElementById('t-ix-sel').value;
-    try {
-      await saveTopo();
-    } catch {
-      /* */
-    }
-    render();
-  });
   document.getElementById('t-landing-sel')?.addEventListener('change', () => {
     state.selectedLandingId = document.getElementById('t-landing-sel').value;
     render();
@@ -1074,19 +1200,31 @@ async function renderTopology() {
 
   document.getElementById('t-add-ix')?.addEventListener('click', async () => {
     try {
+      await saveCurrentIx(activeChoice).catch(() => {});
       const list = collectIxes();
+      const nid = 'ix-' + Math.random().toString(16).slice(2, 8);
       list.push({
-        id: 'ix-' + Math.random().toString(16).slice(2, 8),
+        id: nid,
         name: `IX-${list.length + 1}`,
         lanIp: '172.16.2.79',
         sshPort: 7900,
+        portMin: 7900,
+        portMax: 7999,
         forwardConfigured: false,
         homeReachableHost: '',
         homeReachablePort: Number(val('t-port')) || 7901,
+        ingress: {
+          active: 'external',
+          externalHost: val('t-ext') || '114.111.176.37',
+          mobileHost: val('t-mob') || '211.136.162.184',
+          customHost: '',
+          provinceWhitelist: val('t-province') || '',
+        },
       });
       await api('/api/topology', { method: 'PUT', body: { ixes: list } });
-      state.selectedIxId = list[list.length - 1].id;
-      toast('已添加 IX');
+      state.selectedIxId = nid;
+      state.selectedLandingId = null;
+      toast('已添加 IX（请改本机前置 IP/端口段）');
       await refreshCore();
       render();
     } catch (e) {
@@ -1096,10 +1234,9 @@ async function renderTopology() {
 
   document.getElementById('t-del-ix')?.addEventListener('click', async () => {
     if (ixes.length <= 1) return;
-    if (!confirm('删除当前 IX？')) return;
+    if (!confirm('删除当前 IX？其落地绑定需另行调整。')) return;
     try {
-      const id = document.getElementById('t-ix-sel')?.value;
-      const list = collectIxes().filter((x) => x.id !== id);
+      const list = collectIxes().filter((x) => x.id !== ix.id);
       await api('/api/topology', { method: 'PUT', body: { ixes: list } });
       state.selectedIxId = list[0]?.id;
       toast('已删除');
@@ -1112,8 +1249,8 @@ async function renderTopology() {
 
   document.getElementById('topo-save').onclick = async () => {
     try {
-      const r = await saveTopo();
-      toast(r.tip || '已保存');
+      const r = await saveCurrentIx(activeChoice);
+      toast(r.tip || '本 IX 已保存');
       const qs = scriptQs();
       const topoRes = await api('/api/topology' + (qs ? '?' + qs : ''));
       state.forwardScript = topoRes.forwardScript || '';
@@ -1126,7 +1263,7 @@ async function renderTopology() {
 
   document.getElementById('t-load-script').onclick = async () => {
     try {
-      await saveTopo();
+      await saveCurrentIx(activeChoice);
       const qs = scriptQs();
       const topoRes = await api('/api/topology' + (qs ? '?' + qs : ''));
       state.forwardScript = topoRes.forwardScript || '';
@@ -1161,7 +1298,6 @@ async function renderTopology() {
   const dl = document.getElementById('t-dl-script');
   if (dl) dl.href = '/api/topology/forward-script?download=1&' + scriptQs();
 
-  document.getElementById('t-exit').onclick = () => setupExit();
   document.getElementById('topo-diag').onclick = () => {
     state.page = 'diagnose';
     render();
@@ -1175,79 +1311,116 @@ async function renderServer() {
   const agent = isAgentMode();
   const nodes = state.nodes || [];
   const landings = landingsList();
+  const ixes = ixesList();
+  const expanded = state.expandedLandingId;
   app.innerHTML = shell(`
     <div class="page-header">
       <div>
         <h2>落地</h2>
-        <p class="muted">多台家宽 Agent + mita。入站到「拓扑」配置。</p>
+        <p class="muted">列表点开详情 · Agent + mita · 绑定所属 IX</p>
       </div>
       <div class="btn-row">
-        <button class="btn btn-primary" id="srv-add">添加落地</button>
-        <button class="btn btn-success" id="srv-apply-all">应用全部</button>
-        <button class="btn btn-ghost" id="srv-save">保存全局 mita 参数</button>
+        <button class="btn btn-primary" id="srv-add" title="新增一台落地家宽节点">添加落地</button>
+        <button class="btn btn-success" id="srv-apply-all" title="把用户配置下发到全部落地 mita">应用全部</button>
+        <button class="btn btn-secondary" id="srv-save" title="保存全局 mita 默认端口/协议">保存全局参数</button>
       </div>
     </div>
 
     <div class="card mode-card">
       <div class="card-head">
         <h3>出口模式</h3>
-        <span class="badge ${agent ? 'ok' : ''}">${agent ? '远程家宽' : '本机'}</span>
+        <span class="badge ${agent ? 'ok' : 'warn'}">${agent ? '远程家宽' : '本机'}</span>
       </div>
+      <p class="card-desc">商家 IX 前置场景请用「远程家宽」：Agent 装在落地机，面板只管理。</p>
       <div class="btn-row">
-        <button class="btn btn-sm ${agent ? 'btn-primary' : 'btn-ghost'}" id="mode-agent">远程家宽 Agent</button>
-        <button class="btn btn-sm ${!agent ? 'btn-primary' : 'btn-ghost'}" id="mode-local">面板本机（不推荐）</button>
+        <button class="btn btn-sm ${agent ? 'btn-primary' : 'btn-secondary'}" id="mode-agent" title="Agent 装在落地家宽">远程家宽 Agent</button>
+        <button class="btn btn-sm ${!agent ? 'btn-primary' : 'btn-secondary'}" id="mode-local" title="不推荐：mita 跑在面板本机">面板本机（不推荐）</button>
       </div>
     </div>
 
-    <div class="card" style="margin-top:16px">
-      <h3>落地节点</h3>
+    <div style="margin-top:16px">
+      <div class="card-head" style="margin-bottom:10px">
+        <h3 style="margin:0;font-size:14px">落地列表</h3>
+        <span class="muted" style="font-size:12px">点击行展开详情配置</span>
+      </div>
       ${
         nodes.length
           ? nodes
               .map((n) => {
                 const L = landings.find((x) => x.nodeId === n.id) || {};
-                return `<div class="card" style="margin:10px 0;padding:12px;border:1px solid var(--border)">
-          <div class="card-head">
-            <strong>${esc(n.name)}</strong>
-            <span>${n.isPrimary ? '<span class="badge ok">默认</span> ' : ''}${
-                  n.online ? '<span class="badge ok">在线</span>' : '<span class="badge warn">离线</span>'
-                }${n.dirty ? ' <span class="badge warn">未应用</span>' : ''}</span>
-          </div>
-          <div class="kv"><span>主机 / Agent</span><span class="mono">${esc(n.hostname || '-')} · ${esc(n.agentVersion || '-')}</span></div>
-          <div class="kv"><span>mita</span><span class="mono">${esc(n.mita?.status || '-')}</span></div>
-          <div class="kv"><span>出网 IP</span><span class="mono">${esc(n.exitPublicIp || '-')}</span></div>
-          <div class="kv"><span>用户数</span><span>${n.clientCount ?? 0}</span></div>
-          <div class="inline-fields" style="margin-top:8px">
-            <div>
-              <label>监听端口</label>
-              <input class="field mono" id="n-port-${n.id}" value="${esc(L.listenPort || n.listenPort || 7901)}" />
+                const isOpen = expanded === n.id;
+                const userN = (state.clients || []).filter((c) => c.route?.landingNodeId === n.id).length;
+                const ixOpts = ixes
+                  .map(
+                    (x) =>
+                      `<option value="${esc(x.id)}" ${
+                        (L.ixId || ixes[0]?.id) === x.id ? 'selected' : ''
+                      }>${esc(x.name)} · ${esc(x.portMin || 7900)}–${esc(x.portMax || 7999)}</option>`
+                  )
+                  .join('');
+                return `<div class="landing-row ${isOpen ? '' : 'collapsed'}" data-landing-row="${esc(n.id)}">
+          <div class="landing-row-head" data-toggle-landing="${esc(n.id)}">
+            <div class="title">
+              <span class="chev">▶</span>
+              <strong>${esc(n.name)}</strong>
+              ${n.isPrimary ? '<span class="badge ok">默认</span>' : ''}
+              ${n.online ? '<span class="badge ok">在线</span>' : '<span class="badge warn">离线</span>'}
+              ${n.dirty ? '<span class="badge warn">未应用</span>' : ''}
             </div>
-            <div>
-              <label>家宽可达地址</label>
-              <input class="field mono" id="n-home-${n.id}" value="${esc(L.homeReachableHost || '')}" placeholder="IX 能访问的家宽 IP" />
+            <div class="landing-row-meta">
+              <span>mita <span class="mono">${esc(n.mita?.status || '-')}</span></span>
+              <span>端口 <span class="mono">:${esc(L.listenPort || n.listenPort || 7901)}</span></span>
+              <span>IX ${esc(ixName(L.ixId || ixes[0]?.id))}</span>
+              <span>用户 ${userN || n.clientCount || 0}</span>
+              <span class="mono">${esc(n.exitPublicIp || '出网—')}</span>
             </div>
           </div>
-          <div class="btn-row" style="margin-top:10px">
-            <button class="btn btn-sm btn-primary" data-save-node="${n.id}">保存</button>
-            <button class="btn btn-sm btn-success" data-exit-node="${n.id}">一键落地</button>
-            <button class="btn btn-sm btn-ghost" data-apply-node="${n.id}">应用配置</button>
-            <button class="btn btn-sm btn-ghost" data-cmd-node="${n.id}">安装命令</button>
-            ${n.isPrimary ? '' : `<button class="btn btn-sm btn-ghost" data-primary-node="${n.id}">设为默认</button>`}
-            <button class="btn btn-sm btn-ghost" data-rotate-node="${n.id}">轮换 Token</button>
-            ${nodes.length > 1 ? `<button class="btn btn-sm btn-ghost" data-del-node="${n.id}">删除</button>` : ''}
+          <div class="landing-row-body">
+            <div class="kv"><span>主机 / Agent</span><span class="mono">${esc(n.hostname || '-')} · v${esc(n.agentVersion || '-')}</span></div>
+            <div class="kv"><span>出网 IP</span><span class="mono">${esc(n.exitPublicIp || '-')}</span></div>
+            <div class="inline-fields" style="margin-top:10px">
+              <div>
+                <label>显示名称</label>
+                <input class="field" id="n-name-${n.id}" value="${esc(n.name || '')}" />
+              </div>
+              <div>
+                <label>所属 IX</label>
+                <select class="field" id="n-ix-${n.id}">${ixOpts || '<option value="">—</option>'}</select>
+              </div>
+              <div>
+                <label>监听端口</label>
+                <input class="field mono" id="n-port-${n.id}" value="${esc(L.listenPort || n.listenPort || 7901)}" />
+              </div>
+              <div>
+                <label>家宽可达地址（IX→家宽）</label>
+                <input class="field mono" id="n-home-${n.id}" value="${esc(L.homeReachableHost || '')}" placeholder="家宽公网 IP 或隧道" />
+              </div>
+            </div>
+            <p class="field-hint">保存后到「拓扑」选对应 IX 生成转发脚本。客户端按本机用户分组管理。</p>
+            <div class="btn-row" style="margin-top:12px">
+              <button class="btn btn-sm btn-primary" data-save-node="${n.id}" title="保存本机名称/端口/IX/可达地址">保存配置</button>
+              <button class="btn btn-sm btn-success" data-exit-node="${n.id}" title="安装/启动 mita 并套用基础参数">一键落地</button>
+              <button class="btn btn-sm btn-success" data-apply-node="${n.id}" title="下发本机用户到 mita">应用配置</button>
+              <button class="btn btn-sm btn-secondary" data-cmd-node="${n.id}" title="复制 Agent 安装命令">安装命令</button>
+              <button class="btn btn-sm btn-secondary" data-users-node="${n.id}" title="查看绑定到本落地的客户端">本机用户</button>
+              ${n.isPrimary ? '' : `<button class="btn btn-sm btn-secondary" data-primary-node="${n.id}" title="未指定路由的用户落到此机">设为默认</button>`}
+              <button class="btn btn-sm btn-warn" data-rotate-node="${n.id}" title="旧 Agent 将失效，需重装">轮换 Token</button>
+              ${nodes.length > 1 ? `<button class="btn btn-sm btn-danger" data-del-node="${n.id}" title="删除节点；用户改绑默认落地">删除</button>` : ''}
+            </div>
+            <pre class="code-block" id="cmd-${n.id}" style="display:none;margin-top:8px"></pre>
           </div>
-          <pre class="code-block" id="cmd-${n.id}" style="display:none;margin-top:8px"></pre>
         </div>`;
               })
               .join('')
-          : '<p class="muted">还没有落地。点「添加落地」或切换远程模式。</p>'
+          : '<div class="card"><p class="muted">还没有落地。点「添加落地」或切换远程模式。</p></div>'
       }
     </div>
 
     <div class="card" style="margin-top:16px">
-      <h3>全局 mita 默认参数</h3>
-      <div class="kv"><span>当前入站 Endpoint</span><span class="mono">${esc(activeEp() || '未配置')}</span></div>
-      <p class="field-hint"><a href="#" id="srv-to-topo">到「拓扑」修改 211/114 与 IX 转发</a></p>
+      <div class="card-head"><h3>全局 mita 默认参数</h3></div>
+      <p class="card-desc">新建落地时的默认值；各落地可单独覆盖监听端口。入站 211/114 请到「拓扑」按 IX 配置。</p>
+      <div class="kv"><span>当前默认 Endpoint</span><span class="mono">${esc(activeEp() || '未配置')}</span></div>
+      <p class="field-hint"><a href="#" id="srv-to-topo">到「拓扑」修改前置 IP/域名与 IX 转发</a></p>
       <div class="inline-fields">
         <div>
           <label>默认监听端口</label>
@@ -1266,10 +1439,21 @@ async function renderServer() {
           <input class="field mono" id="s-mtu" value="${esc(s.mtu ?? 1400)}" />
         </div>
       </div>
-      <p class="field-hint">商家入口场景请保持 <strong>TCP</strong>，端口 7900–7999。各落地可单独覆盖监听端口。</p>
+      <p class="field-hint">商家入口场景请保持 <strong>TCP</strong>。端口建议落在各 IX 自己的端口段内。</p>
+      <div class="section-actions">
+        <button class="btn btn-primary" id="srv-save-2" title="保存全局 mita 参数">保存全局参数</button>
+      </div>
     </div>
   `);
   bindShell();
+
+  document.querySelectorAll('[data-toggle-landing]').forEach((el) => {
+    el.onclick = () => {
+      const id = el.dataset.toggleLanding;
+      state.expandedLandingId = state.expandedLandingId === id ? null : id;
+      render();
+    };
+  });
 
   document.getElementById('srv-to-topo')?.addEventListener('click', (e) => {
     e.preventDefault();
@@ -1307,13 +1491,19 @@ async function renderServer() {
     try {
       const r = await api('/api/nodes', {
         method: 'POST',
-        body: { name: name || undefined, template: 'cm' },
+        body: {
+          name: name || undefined,
+          template: 'cm',
+          ixId: state.selectedIxId || ixesList()[0]?.id || null,
+        },
       });
       toast('已创建落地');
+      state.expandedLandingId = r.node?.id || r.id || null;
       openModal({
         title: '安装 Agent',
-        body: `<p>在新落地家宽 root 执行：</p><pre class="code-block">${esc(r.installCommand)}</pre>
-          <button class="btn btn-sm btn-primary" id="new-copy">复制命令</button>`,
+        body: `<p class="field-hint">在<strong>新落地家宽</strong> root 执行（不是 IX、不是面板）：</p>
+          <pre class="code-block">${esc(r.installCommand)}</pre>
+          <button class="btn btn-sm btn-primary" id="new-copy" title="复制安装命令">复制命令</button>`,
         actions: `<button class="btn btn-primary" data-close>关闭</button>`,
       });
       document.getElementById('new-copy')?.addEventListener('click', async () => {
@@ -1334,11 +1524,14 @@ async function renderServer() {
         await api(`/api/nodes/${id}`, {
           method: 'PUT',
           body: {
+            name: document.getElementById(`n-name-${id}`)?.value?.trim() || undefined,
             listenPort: Number(document.getElementById(`n-port-${id}`)?.value) || 7901,
             homeReachableHost: document.getElementById(`n-home-${id}`)?.value?.trim() || '',
+            ixId: document.getElementById(`n-ix-${id}`)?.value || null,
           },
         });
-        toast('已保存');
+        toast('已保存落地配置');
+        state.expandedLandingId = id;
         render();
       } catch (e) {
         toast(e.message, 'err');
@@ -1368,9 +1561,16 @@ async function renderServer() {
       }
     };
   });
+  document.querySelectorAll('[data-users-node]').forEach((b) => {
+    b.onclick = () => {
+      state.page = 'clients';
+      state.expandedLandingId = b.dataset.usersNode;
+      render();
+    };
+  });
   document.querySelectorAll('[data-rotate-node]').forEach((b) => {
     b.onclick = async () => {
-      if (!confirm('轮换 Token 后需重装 Agent。继续？')) return;
+      if (!confirm('轮换 Token 后旧 Agent 将失效，需用新命令重装。继续？')) return;
       try {
         const r = await api(`/api/nodes/${b.dataset.rotateNode}/token`, { method: 'POST', body: {} });
         toast('已轮换，请复制新安装命令');
@@ -1408,93 +1608,173 @@ async function renderServer() {
     };
   });
 
-  document.getElementById('srv-save').onclick = async () => {
+  const saveGlobal = async () => {
+    const port = Number(val('s-port')) || 7901;
+    const r = await api('/api/server', {
+      method: 'PUT',
+      body: {
+        listenPort: port,
+        protocol: val('s-proto') || 'TCP',
+        mtu: val('s-mtu') === '' ? 1400 : Number(val('s-mtu')),
+        syncEndpointPort: true,
+      },
+    });
+    state.server = r.server;
+    state.topology = r.topology || state.topology;
+    state.dirty = r.dirty;
+    state.clientsNeedRescan = Boolean(r.clientsNeedRescan);
+    return r;
+  };
+  const onSaveGlobal = async () => {
     try {
-      const port = Number(val('s-port')) || 7901;
-      const r = await api('/api/server', {
-        method: 'PUT',
-        body: {
-          listenPort: port,
-          protocol: val('s-proto') || 'TCP',
-          mtu: val('s-mtu') === '' ? 1400 : Number(val('s-mtu')),
-          syncEndpointPort: true,
-        },
-      });
-      state.server = r.server;
-      state.topology = r.topology || state.topology;
-      state.dirty = r.dirty;
-      state.clientsNeedRescan = Boolean(r.clientsNeedRescan);
-      toast(r.tip || '已保存');
+      const r = await saveGlobal();
+      toast(r.tip || '全局参数已保存');
       render();
     } catch (e) {
       toast(e.message, 'err');
     }
   };
+  document.getElementById('srv-save').onclick = onSaveGlobal;
+  document.getElementById('srv-save-2')?.addEventListener('click', onSaveGlobal);
   document.getElementById('srv-apply-all').onclick = () => applyConfig(true, { all: true });
 }
 
 /* ========== 客户端 ========== */
+function clientStatusBadge(c) {
+  const st = c.statusFlags || {};
+  if (st.expired) return '<span class="badge warn">到期</span>';
+  if (st.overQuota) return '<span class="badge warn">超额</span>';
+  if (c.enabled === false) return '<span class="badge">停用</span>';
+  return '<span class="badge ok">启用</span>';
+}
+
+function clientRowHtml(c) {
+  return `<tr>
+    <td class="mono"><strong>${esc(c.name)}</strong>${
+      c.note ? `<div class="muted" style="font-size:11px">${esc(c.note)}</div>` : ''
+    }</td>
+    <td class="mono">${esc(c.route?.listenPort || '默认')}</td>
+    <td class="mono">${esc(c.usage?.totalHuman || '—')}${
+      c.usage?.collectedAt
+        ? `<div class="muted" style="font-size:10px">${esc(fmtTime(c.usage.collectedAt))}</div>`
+        : ''
+    }</td>
+    <td class="mono">${esc(c.package?.expireAt ? String(c.package.expireAt).slice(0, 10) : '不限')}</td>
+    <td class="mono">${c.package?.quotaMb ? esc(c.package.quotaMb) + ' MB' : '不限'}</td>
+    <td>${clientStatusBadge(c)}</td>
+    <td class="btn-row tight">
+      <button class="btn btn-sm btn-primary" data-qr="${c.id}" title="复制 211/114 分享链接与二维码">链接</button>
+      <button class="btn btn-sm btn-secondary" data-edit="${c.id}" title="编辑用户/路由/套餐">编辑</button>
+      <button class="btn btn-sm btn-danger" data-del="${c.id}" title="删除该用户">删除</button>
+    </td>
+  </tr>`;
+}
+
 async function renderClients() {
   await refreshCore().catch(() => {});
   const nodes = state.nodes || [];
+  const primaryId = state.primaryNode?.id || nodes.find((n) => n.isPrimary)?.id;
+  const groups = [];
+  for (const n of nodes) {
+    const list = state.clients.filter((c) => c.route?.landingNodeId === n.id);
+    groups.push({ node: n, clients: list, unbound: false });
+  }
+  const unbound = state.clients.filter(
+    (c) => !c.route?.landingNodeId || !nodes.some((n) => n.id === c.route.landingNodeId)
+  );
+  if (unbound.length || !nodes.length) {
+    groups.push({
+      node: {
+        id: primaryId || '__default',
+        name: nodes.length ? '未绑定 / 默认落地' : '默认',
+        online: state.primaryNode?.online,
+        isPrimary: true,
+      },
+      clients: unbound.length ? unbound : nodes.length ? [] : state.clients,
+      unbound: true,
+    });
+  }
+
   app.innerHTML = shell(`
     <div class="page-header">
       <div>
         <h2>客户端</h2>
-        <p class="muted">路由到指定落地 · 流量/到期套餐 · mierus 双入口</p>
+        <p class="muted">按落地机分组 · 流量/到期 · mierus 双入口（IP/域名）</p>
       </div>
       <div class="btn-row">
-        <button class="btn btn-primary" id="c-add">添加用户</button>
-        <button class="btn btn-success" id="c-apply">应用全部</button>
+        <button class="btn btn-primary" id="c-add" title="创建新的 mieru 用户">添加用户</button>
+        <button class="btn btn-success" id="c-apply" title="下发全部落地用户配置">应用全部</button>
       </div>
     </div>
     ${
       !activeEp()
-        ? `<div class="alert warn"><div>尚未配置入站。请先到「拓扑」选择 211/114。</div>
-          <button class="btn btn-sm btn-primary" data-nav-jump="topology">去拓扑</button></div>`
-        : `<div class="alert info"><div>默认 Endpoint：<code class="mono">${esc(activeEp())}</code> · 用户可绑不同落地/端口</div></div>`
+        ? `<div class="alert warn"><div>尚未配置入站。请先到「拓扑」为 IX 填写前置 IP/域名。</div>
+          <button class="btn btn-sm btn-primary" data-nav-jump="topology" title="去配置前置">去拓扑</button></div>`
+        : `<div class="alert info"><div>默认 Endpoint：<code class="mono">${esc(
+            activeEp()
+          )}</code> · 分享链按用户所属 IX 前置生成</div></div>`
     }
-    <div class="card">
-      ${
-        state.clients.length
-          ? `<div style="overflow:auto"><table><thead><tr>
-              <th>登录名</th><th>落地</th><th>端口</th><th>用量</th><th>到期</th><th>配额</th><th>状态</th><th></th>
-            </tr></thead><tbody>
-          ${state.clients
-            .map((c) => {
-              const st = c.statusFlags || {};
-              const badge = st.expired
-                ? '<span class="badge warn">到期</span>'
-                : st.overQuota
-                  ? '<span class="badge warn">超额</span>'
-                  : c.enabled !== false
-                    ? '<span class="badge ok">启用</span>'
-                    : '<span class="badge">停用</span>';
-              return `<tr>
-            <td class="mono"><strong>${esc(c.name)}</strong>${c.note ? `<div class="muted" style="font-size:11px">${esc(c.note)}</div>` : ''}</td>
-            <td>${esc(nodeName(c.route?.landingNodeId))}</td>
-            <td class="mono">${esc(c.route?.listenPort || '默认')}</td>
-            <td class="mono">${esc(c.usage?.totalHuman || '—')}${c.usage?.collectedAt ? `<div class="muted" style="font-size:10px">${esc(fmtTime(c.usage.collectedAt))}</div>` : ''}</td>
-            <td class="mono">${esc(c.package?.expireAt ? String(c.package.expireAt).slice(0, 10) : '不限')}</td>
-            <td class="mono">${c.package?.quotaMb ? esc(c.package.quotaMb) + ' MB' : '不限'}</td>
-            <td>${badge}</td>
-            <td class="btn-row">
-              <button class="btn btn-sm btn-primary" data-qr="${c.id}">链接</button>
-              <button class="btn btn-sm btn-ghost" data-edit="${c.id}">编辑</button>
-              <button class="btn btn-sm btn-ghost" data-del="${c.id}">删除</button>
-            </td>
-          </tr>`;
+    ${
+      state.clients.length
+        ? groups
+            .filter((g) => g.clients.length || (!g.unbound && nodes.length))
+            .map((g) => {
+              const n = g.node;
+              const L = landingByNodeId(n.id);
+              return `<div class="client-group">
+        <div class="client-group-head">
+          <div class="title">
+            <strong>${esc(n.name || '落地')}</strong>
+            ${n.isPrimary && !g.unbound ? '<span class="badge ok">默认</span>' : ''}
+            ${
+              g.unbound
+                ? '<span class="badge warn">未绑定</span>'
+                : n.online
+                  ? '<span class="badge ok">在线</span>'
+                  : '<span class="badge warn">离线</span>'
+            }
+            <span class="muted" style="font-weight:500;font-size:12px">${g.clients.length} 用户${
+                L?.ixId ? ` · IX ${esc(ixName(L.ixId))}` : ''
+              }</span>
+          </div>
+          <div class="btn-row">
+            ${
+              !g.unbound && n.id && n.id !== '__default'
+                ? `<button class="btn btn-sm btn-success" data-apply-landing="${esc(
+                    n.id
+                  )}" title="只下发本落地用户">应用本落地</button>
+                   <button class="btn btn-sm btn-primary" data-add-landing="${esc(
+                     n.id
+                   )}" title="在本落地创建用户">添加用户</button>`
+                : `<button class="btn btn-sm btn-primary" data-add-landing="" title="添加用户到默认落地">添加用户</button>`
+            }
+          </div>
+        </div>
+        ${
+          g.clients.length
+            ? `<div class="table-wrap"><table><thead><tr>
+                <th>登录名</th><th>端口</th><th>用量</th><th>到期</th><th>配额</th><th>状态</th><th></th>
+              </tr></thead><tbody>
+              ${g.clients.map(clientRowHtml).join('')}
+            </tbody></table></div>`
+            : '<p class="muted" style="padding:12px 14px">本落地暂无用户</p>'
+        }
+      </div>`;
             })
-            .join('')}
-        </tbody></table></div>
-        <p class="field-hint" style="margin-top:10px">客户端「用户」填登录名（英文/数字）。流量为落地 mita 快照，非计费级精确。</p>`
-          : '<p class="muted">还没有用户，点「添加用户」</p>'
-      }
-    </div>
+            .join('') +
+          `<p class="field-hint">客户端「用户」填登录名（英文/数字），不要填中文备注。流量为落地 mita 快照，非计费级精确。改落地后需「应用」才会写到 mita。</p>`
+        : `<div class="card"><p class="muted">还没有用户，点「添加用户」</p></div>`
+    }
   `);
   bindShell();
-  document.getElementById('c-add').onclick = () => openClientModal();
+  document.getElementById('c-add').onclick = () => openClientModal(null, primaryId);
   document.getElementById('c-apply').onclick = () => applyConfig(true, { all: true });
+  document.querySelectorAll('[data-add-landing]').forEach((b) => {
+    b.onclick = () => openClientModal(null, b.dataset.addLanding || primaryId);
+  });
+  document.querySelectorAll('[data-apply-landing]').forEach((b) => {
+    b.onclick = () => applyConfig(true, { nodeId: b.dataset.applyLanding });
+  });
   document.querySelectorAll('[data-qr]').forEach((b) => {
     b.onclick = () => showClientQr(b.dataset.qr);
   });
@@ -1506,7 +1786,7 @@ async function renderClients() {
   });
   document.querySelectorAll('[data-del]').forEach((b) => {
     b.onclick = async () => {
-      if (!confirm('删除该用户？')) return;
+      if (!confirm('删除该用户？删除后需应用配置才会从 mita 移除。')) return;
       try {
         await api(`/api/clients/${b.dataset.del}`, { method: 'DELETE' });
         toast('已删除');
@@ -1518,29 +1798,37 @@ async function renderClients() {
   });
 }
 
-function openClientModal(client) {
+function openClientModal(client, preferLandingId) {
   const isEdit = Boolean(client);
   const nodes = state.nodes || [];
+  const defaultLanding =
+    client?.route?.landingNodeId || preferLandingId || state.primaryNode?.id || nodes[0]?.id || '';
   const landingOpts = nodes
-    .map(
-      (n) =>
-        `<option value="${esc(n.id)}" ${
-          (client?.route?.landingNodeId || state.primaryNode?.id) === n.id ? 'selected' : ''
-        }>${esc(n.name)}${n.isPrimary ? '（默认）' : ''}</option>`
-    )
+    .map((n) => {
+      const L = landingByNodeId(n.id);
+      const ix = L?.ixId ? ` · ${ixName(L.ixId)}` : '';
+      return `<option value="${esc(n.id)}" ${defaultLanding === n.id ? 'selected' : ''}>${esc(
+        n.name
+      )}${n.isPrimary ? '（默认）' : ''}${ix}</option>`;
+    })
     .join('');
   openModal({
     title: isEdit ? '编辑用户' : '添加用户',
     body: `
+      <p class="field-hint" style="margin-top:0">登录名 = mieru 客户端「用户」栏（须英文/数字）。中文写备注。密码可自动生成。</p>
       <label>登录用户名（须英文/数字）</label>
-      <input class="field mono" id="c-name" value="${esc(client?.name || '')}" placeholder="留空自动生成" />
-      <label>密码${isEdit ? '（留空不改）' : ''}</label>
-      <input class="field mono" id="c-pass" value="" placeholder="${isEdit ? '留空保持' : '留空自动'}" />
-      <label>备注</label>
+      <input class="field mono" id="c-name" value="${esc(client?.name || '')}" placeholder="留空自动生成" autocomplete="off" />
+      <label>密码${isEdit ? '（留空不改）' : '（留空自动生成）'}</label>
+      <div class="field-with-btn">
+        <input class="field mono" id="c-pass" value="" placeholder="${isEdit ? '留空保持' : '留空自动'}" autocomplete="new-password" />
+        <button type="button" class="btn btn-secondary" id="c-pass-gen" title="随机生成密码">随机</button>
+      </div>
+      <label>备注（可中文）</label>
       <input class="field" id="c-note" value="${esc(client?.note || '')}" placeholder="例如：我的电脑" />
       <label>绑定落地</label>
       <select class="field" id="c-landing">${landingOpts || '<option value="">默认</option>'}</select>
-      <label>专用端口（空=落地默认）</label>
+      <p class="field-hint">分享链会按该落地所属 IX 的前置 IP/域名生成。</p>
+      <label>专用端口（空=落地默认；须在所属 IX 端口段内）</label>
       <input class="field mono" id="c-port" value="${esc(client?.route?.listenPort || '')}" placeholder="7901" />
       <div class="inline-fields">
         <div>
@@ -1566,17 +1854,29 @@ function openClientModal(client) {
       }
     `,
     actions: `
-      <button class="btn btn-ghost" data-close>取消</button>
-      <button class="btn btn-primary" id="c-save">${isEdit ? '保存' : '创建'}</button>
+      <button class="btn btn-ghost" data-close title="关闭不保存">取消</button>
+      <button class="btn btn-primary" id="c-save" title="${isEdit ? '保存用户' : '创建用户'}">${
+      isEdit ? '保存' : '创建'
+    }</button>
     `,
+  });
+  document.getElementById('c-pass-gen')?.addEventListener('click', () => {
+    const chars = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let s = '';
+    for (let i = 0; i < 16; i++) s += chars[Math.floor(Math.random() * chars.length)];
+    document.getElementById('c-pass').value = s;
+    toast('已填入随机密码');
   });
   document.getElementById('c-save').onclick = async () => {
     try {
+      const landingNodeId = val('c-landing') || null;
+      const L = landingByNodeId(landingNodeId);
       const body = {
         name: val('c-name') || client?.name,
         note: val('c-note'),
         route: {
-          landingNodeId: val('c-landing') || null,
+          landingNodeId,
+          ixId: L?.ixId || null,
           listenPort: val('c-port') ? Number(val('c-port')) : null,
         },
         package: {
@@ -1590,12 +1890,12 @@ function openClientModal(client) {
         body.regeneratePassword = document.getElementById('c-regen')?.checked;
         body.enabled = document.getElementById('c-enabled')?.checked;
         await api(`/api/clients/${client.id}`, { method: 'PUT', body });
-        toast('已保存');
+        toast('已保存（记得点应用下发）');
         closeModal();
         render();
       } else {
         const r = await api('/api/clients', { method: 'POST', body });
-        toast('已创建');
+        toast('已创建（记得点应用下发）');
         closeModal();
         await refreshCore();
         state.page = 'clients';
@@ -1682,7 +1982,7 @@ async function renderDiagnose() {
         <h2>诊断</h2>
         <p class="muted">分层检查：入口 → IX 转发 → 家宽 Agent/mita</p>
       </div>
-      <button class="btn btn-primary" id="d-refresh">重新诊断</button>
+      <button class="btn btn-primary" id="d-refresh" title="重新跑一遍分层检查">重新诊断</button>
     </div>
     ${pathBanner()}
     <div class="card" id="d-box" style="margin-top:16px"><p class="muted">诊断中…</p></div>
@@ -1710,10 +2010,10 @@ async function renderDiagnose() {
             .join('')}
         </div>
         <div class="btn-row" style="margin-top:16px">
-          <button class="btn btn-primary" id="d-exit">一键落地</button>
-          <button class="btn btn-success" id="d-apply">应用配置</button>
-          <button class="btn btn-ghost" data-nav-jump="topology">去拓扑</button>
-          <button class="btn btn-ghost" data-nav-jump="clients">去客户端</button>
+          <button class="btn btn-success" id="d-exit" title="在默认落地安装/启动 mita">一键落地</button>
+          <button class="btn btn-success" id="d-apply" title="下发配置到落地">应用配置</button>
+          <button class="btn btn-secondary" data-nav-jump="topology" title="配置前置与转发">去拓扑</button>
+          <button class="btn btn-secondary" data-nav-jump="clients" title="管理用户">去客户端</button>
         </div>
       `;
       document.getElementById('d-exit').onclick = () => setupExit();
@@ -1731,39 +2031,91 @@ async function renderDiagnose() {
 async function renderSettings() {
   const auto = state.status?.settings?.autoApplyEnforce !== false;
   const nodes = state.nodes || [];
+  const username = state.status?.username || 'admin';
+  const forcePw = Boolean(state.status?.forcePasswordChange);
   app.innerHTML = shell(`
-    <div class="page-header"><div><h2>设置</h2></div></div>
-    <div class="card">
-      <h3>套餐强制</h3>
-      <label class="check-row">
-        <input type="checkbox" id="set-auto" ${auto ? 'checked' : ''} />
-        到期/超额自动停用并下发到落地（默认开）
-      </label>
-      <label style="margin-top:10px">默认落地</label>
-      <select class="field" id="set-primary">
-        ${nodes
-          .map(
-            (n) =>
-              `<option value="${esc(n.id)}" ${n.isPrimary ? 'selected' : ''}>${esc(n.name)}</option>`
-          )
-          .join('')}
-      </select>
-      <button class="btn btn-primary" id="set-save" style="margin-top:10px">保存设置</button>
+    <div class="page-header">
+      <div>
+        <h2>设置</h2>
+        <p class="muted">账号安全 · 套餐策略 · 导出备份</p>
+      </div>
     </div>
-    <div class="card" style="margin-top:16px">
-      <h3>修改密码</h3>
-      <label>当前密码</label><input class="field" type="password" id="pw-old" />
-      <label>新密码</label><input class="field" type="password" id="pw-new" />
-      <button class="btn btn-primary" id="pw-save" style="margin-top:10px">更新</button>
+    ${
+      forcePw
+        ? `<div class="alert warn"><div><strong>请先修改初始密码</strong> · 当前仍在使用初始化或重置后的密码</div></div>`
+        : ''
+    }
+    <div class="settings-grid two">
+      <div class="card">
+        <div class="card-head"><h3>管理员账号</h3><span class="badge ok">已登录</span></div>
+        <p class="card-desc">面板 Web 登录账号，与客户端 mieru 用户无关。可改用户名与密码。</p>
+        <div class="kv"><span>当前用户名</span><span class="mono">${esc(username)}</span></div>
+        <label for="acc-user">新用户名（可空=不改）</label>
+        <input class="field mono" id="acc-user" value="${esc(username)}" autocomplete="username" />
+        <p class="field-hint">建议英文短名；改名后下次登录用新用户名。</p>
+        <label for="pw-old">当前密码</label>
+        <div class="field-with-btn">
+          <input class="field" type="password" id="pw-old" autocomplete="current-password" placeholder="验证身份" />
+          <button type="button" class="btn btn-secondary" id="pw-toggle" title="显示或隐藏密码">显示</button>
+        </div>
+        <label for="pw-new">新密码（至少 6 位）</label>
+        <input class="field" type="password" id="pw-new" autocomplete="new-password" placeholder="设置新密码" />
+        <label for="pw-new2">确认新密码</label>
+        <input class="field" type="password" id="pw-new2" autocomplete="new-password" placeholder="再输入一次" />
+        <p class="field-hint">忘记密码时，在<strong>面板机</strong>执行：
+          <code>sudo bash install.sh --reset-password '新密码'</code></p>
+        <div class="section-actions">
+          <button class="btn btn-primary" id="pw-save" title="保存用户名与密码">保存账号</button>
+          <button class="btn btn-ghost" id="btn-logout-set" title="退出当前会话">退出登录</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>套餐与默认落地</h3></div>
+        <p class="card-desc">到期/超额时自动停用用户并下发到落地 mita；默认落地用于未指定路由的用户。</p>
+        <label class="check-row">
+          <input type="checkbox" id="set-auto" ${auto ? 'checked' : ''} />
+          到期/超额自动停用并下发（推荐开启）
+        </label>
+        <label style="margin-top:12px" for="set-primary">默认落地</label>
+        <select class="field" id="set-primary">
+          ${nodes
+            .map(
+              (n) =>
+                `<option value="${esc(n.id)}" ${n.isPrimary ? 'selected' : ''}>${esc(n.name)}${
+                  n.online ? ' · 在线' : ' · 离线'
+                }</option>`
+            )
+            .join('') || '<option value="">（暂无落地）</option>'}
+        </select>
+        <div class="section-actions">
+          <button class="btn btn-primary" id="set-save" title="保存套餐策略与默认落地">保存设置</button>
+        </div>
+      </div>
     </div>
+
     <div class="card" style="margin-top:16px">
-      <h3>关于</h3>
-      <p class="muted">版本 <strong>v${esc(state.status?.version || '')}</strong> · 协议 <strong>mieru / mita</strong> · 多落地多 IX</p>
-      <p class="field-hint">路径：电脑 → 商家IX前置 → IX → 落地家宽。面板装独立 VPS。升级前请备份 data/state.json。</p>
-      <a class="btn btn-sm btn-ghost" href="/api/export">导出 JSON</a>
+      <div class="card-head"><h3>关于与备份</h3></div>
+      <p class="muted">版本 <strong>v${esc(state.status?.version || '')}</strong> · 协议 <strong>mieru / mita</strong> · 多 IX / 多落地</p>
+      <p class="field-hint">路径：电脑 → 商家IX前置 → IX → 落地家宽。面板装独立 VPS。升级前请备份 <code>data/state.json</code>。</p>
+      <div class="section-actions">
+        <a class="btn btn-secondary" href="/api/export" title="导出完整配置 JSON">导出 JSON</a>
+        <button class="btn btn-ghost" data-nav-jump="diagnose" title="检查链路健康">打开诊断</button>
+      </div>
     </div>
   `);
   bindShell();
+
+  let showPw = false;
+  document.getElementById('pw-toggle')?.addEventListener('click', () => {
+    showPw = !showPw;
+    ['pw-old', 'pw-new', 'pw-new2'].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.type = showPw ? 'text' : 'password';
+    });
+    document.getElementById('pw-toggle').textContent = showPw ? '隐藏' : '显示';
+  });
+
   document.getElementById('set-save').onclick = async () => {
     try {
       await api('/api/settings', {
@@ -1780,40 +2132,78 @@ async function renderSettings() {
       toast(e.message, 'err');
     }
   };
+
   document.getElementById('pw-save').onclick = async () => {
+    const oldP = document.getElementById('pw-old')?.value || '';
+    const n1 = document.getElementById('pw-new')?.value || '';
+    const n2 = document.getElementById('pw-new2')?.value || '';
+    const newUser = val('acc-user');
+    if (!oldP) return toast('请填写当前密码', 'err');
+    if (n1.length < 6) return toast('新密码至少 6 位', 'err');
+    if (n1 !== n2) return toast('两次新密码不一致', 'err');
     try {
-      await api('/api/password', {
+      const r = await api('/api/password', {
         method: 'POST',
-        body: { currentPassword: val('pw-old'), newPassword: val('pw-new') },
+        body: {
+          currentPassword: oldP,
+          newPassword: n1,
+          newUsername: newUser || undefined,
+        },
       });
-      toast('密码已更新');
+      toast(r.message || '账号已更新');
+      document.getElementById('pw-old').value = '';
+      document.getElementById('pw-new').value = '';
+      document.getElementById('pw-new2').value = '';
+      await refreshCore();
+      render();
     } catch (e) {
       toast(e.message, 'err');
     }
   };
+
+  document.getElementById('btn-logout-set')?.addEventListener('click', async () => {
+    await api('/api/logout', { method: 'POST' });
+    await boot();
+  });
 }
 
 /* ========== 动作 ========== */
 let _jobPollTimer = null;
+let _jobPollNodeId = null;
 function stopJobPoll() {
   if (_jobPollTimer) {
     clearInterval(_jobPollTimer);
     _jobPollTimer = null;
   }
 }
-function startJobPoll() {
+function pickJob(nodeId) {
+  const list = state.nodes || [];
+  if (nodeId) {
+    const n = list.find((x) => x.id === nodeId);
+    if (n?.latestJob) return n.latestJob;
+  }
+  // 任一落地有 pending/running 优先；否则 primary 最近任务
+  const busy = list.find(
+    (n) => n.latestJob && (n.latestJob.status === 'pending' || n.latestJob.status === 'running')
+  );
+  if (busy) return busy.latestJob;
+  return state.primaryNode?.latestJob || list.find((n) => n.latestJob)?.latestJob || null;
+}
+function startJobPoll(nodeId) {
   stopJobPoll();
+  _jobPollNodeId = nodeId || null;
   let n = 0;
   _jobPollTimer = setInterval(async () => {
     n += 1;
     try {
       await refreshCore();
-      const job = state.primaryNode?.latestJob;
+      const job = pickJob(_jobPollNodeId);
       const pending = job && (job.status === 'pending' || job.status === 'running');
-      if (!pending || n >= 30) {
+      if (!pending || n >= 45) {
         stopJobPoll();
-        if (job?.status === 'done') toast(job.message || '任务完成');
-        else if (job?.status === 'error') toast(job.message || '任务失败', 'err');
+        if (job?.status === 'done') toast(job.message || '任务完成', 'ok');
+        else if (job?.status === 'error' || job?.status === 'failed')
+          toast(job.message || '任务失败', 'err');
         render();
       } else if (n % 2 === 0) {
         render();
@@ -1842,7 +2232,7 @@ async function applyConfig(confirmFirst = false, opts = {}) {
       ? await api(`/api/nodes/${opts.nodeId}/apply`, { method: 'POST', body: {} })
       : await api('/api/apply', { method: 'POST', body });
     toast(res.message || '完成', res.ok ? 'ok' : 'err');
-    if (res.pending) startJobPoll();
+    if (res.pending) startJobPoll(opts.nodeId || null);
     await refreshCore();
     render();
   } catch (e) {
@@ -1858,7 +2248,7 @@ async function setupExit(nodeId) {
       ? await api(`/api/nodes/${nodeId}/exit`, { method: 'POST', body: {} })
       : await api('/api/exit/setup', { method: 'POST', body: {} });
     toast(res.message || '完成', res.ok ? 'ok' : 'err');
-    if (res.pending) startJobPoll();
+    if (res.pending) startJobPoll(nodeId || res.node?.id || null);
     openModal({
       title: '落地任务',
       body: `

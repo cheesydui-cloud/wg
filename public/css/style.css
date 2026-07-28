@@ -1197,3 +1197,10 @@ tbody tr:hover td { background: rgba(59, 130, 246, 0.03); }
   .page-header h2 { font-size: 18px; }
   table { min-width: 520px; }
 }
+
+
+/* 客户端流量：上下行 */
+.usage-cell { line-height: 1.35; font-size: 12px; }
+.usage-dir { font-weight: 700; margin-right: 2px; }
+.usage-dir.down { color: #0d9488; }
+.usage-dir.up { color: #2563eb; }

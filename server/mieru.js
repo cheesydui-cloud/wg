@@ -415,6 +415,13 @@ function publicClient(c, state = null) {
       uploadBytes: Number(usage.uploadBytes) || 0,
       totalBytes,
       totalHuman: formatBytes(totalBytes),
+      downloadHuman: formatBytes(Number(usage.downloadBytes) || 0),
+      uploadHuman: formatBytes(Number(usage.uploadBytes) || 0),
+      day1DownloadBytes: Number(usage.day1DownloadBytes) || 0,
+      day1UploadBytes: Number(usage.day1UploadBytes) || 0,
+      day30DownloadBytes: Number(usage.day30DownloadBytes) || 0,
+      day30UploadBytes: Number(usage.day30UploadBytes) || 0,
+      lastActive: usage.lastActive || null,
       quotaUsedMb: usage.quotaUsedMb,
       quotaLimitMb: usage.quotaLimitMb,
       collectedAt: usage.collectedAt || null,
@@ -490,24 +497,39 @@ function mergeUsageFromReport(state, nodeId, usage) {
     const download = Number(u.downloadBytes) || Number(u.download) || 0;
     const upload = Number(u.uploadBytes) || Number(u.upload) || 0;
     let total = Number(u.totalBytes) || Number(u.total) || download + upload;
-    // human strings like "1.2 GB"
-    if (!total && u.raw) {
-      const m = String(u.raw).match(/([\d.]+)\s*(KiB|MiB|GiB|KB|MB|GB|B)/i);
-      if (m) {
+    // human strings like "1.2 GB" / "938.1MiB"
+    if ((!total || (!download && !upload)) && u.raw) {
+      const sizes = [...String(u.raw).matchAll(/([\d.]+)\s*(KiB|MiB|GiB|TiB|KB|MB|GB|TB|B)/gi)].map((m) => {
         const num = parseFloat(m[1]);
         const unit = m[2].toUpperCase();
         const mul =
-          unit.startsWith('G') ? 1024 * 1024 * 1024 :
-          unit.startsWith('M') ? 1024 * 1024 :
-          unit.startsWith('K') ? 1024 : 1;
-        total = Math.round(num * mul);
+          unit === 'GIB' || unit === 'GB' ? 1024 ** 3 :
+          unit === 'MIB' || unit === 'MB' ? 1024 ** 2 :
+          unit === 'KIB' || unit === 'KB' ? 1024 :
+          unit === 'TIB' || unit === 'TB' ? 1024 ** 4 : 1;
+        return Math.round(num * mul);
+      });
+      if (sizes.length >= 2 && !download && !upload) {
+        // 优先末两列（常为 30DaysDown/Up）
+        const d = sizes[sizes.length - 2];
+        const up = sizes[sizes.length - 1];
+        if (!total) total = d + up;
+      } else if (sizes.length && !total) {
+        total = sizes[sizes.length - 1];
       }
     }
     c.usage = {
       ...(c.usage || {}),
       downloadBytes: download,
       uploadBytes: upload,
-      totalBytes: total,
+      totalBytes: total || download + upload,
+      day1DownloadBytes: Number(u.day1DownloadBytes) || 0,
+      day1UploadBytes: Number(u.day1UploadBytes) || 0,
+      day7DownloadBytes: Number(u.day7DownloadBytes) || 0,
+      day7UploadBytes: Number(u.day7UploadBytes) || 0,
+      day30DownloadBytes: Number(u.day30DownloadBytes) || download,
+      day30UploadBytes: Number(u.day30UploadBytes) || upload,
+      lastActive: u.lastActive || null,
       collectedAt: usage.collectedAt || new Date().toISOString(),
       source: usage.source || 'mita-cli',
     };

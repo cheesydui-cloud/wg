@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Edge Agent v4.1.1 — mieru / mita 落地（支持多落地 + 流量/套餐）
+ * Edge Agent v4.1.2 — mieru / mita 落地（支持多落地 + 流量/套餐）
  * 连接中心面板，拉取任务：安装/应用 mita、上报状态与用量
  *
  * 环境变量：
@@ -19,7 +19,7 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
-const VERSION = '4.1.1';
+const VERSION = '4.1.2';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';
@@ -27,9 +27,11 @@ const INTERVAL = Math.max(5, Number(process.env.WG_AGENT_INTERVAL || 10));
 const DATA_DIR = process.env.WG_AGENT_DATA || '/var/lib/wg-agent';
 const STATE_FILE = path.join(DATA_DIR, 'agent-state.json');
 const MITA_SCRIPT = process.env.MITA_INSTALL_SCRIPT || path.join(DATA_DIR, 'install-mita.sh');
-const USAGE_EVERY_MS = Math.max(30, Number(process.env.WG_AGENT_USAGE_SEC || 60)) * 1000;
+const USAGE_EVERY_MS = Math.max(15, Number(process.env.WG_AGENT_USAGE_SEC || 30)) * 1000;
 
-if (!PANEL_URL || !TOKEN) {
+if (require.main === module && process.argv.includes('--self-test-usage')) {
+  // self-test continues after function defs; flag only skips env check here
+} else if (!PANEL_URL || !TOKEN) {
   console.error('[agent] 需要环境变量 WG_PANEL_URL 与 WG_AGENT_TOKEN');
   process.exit(1);
 }
@@ -198,16 +200,26 @@ async function mitaStatus() {
   };
 }
 
-/** best-effort parse human sizes */
+/** best-effort parse human sizes (mita ByteCountIEC: 938.1MiB / 4.0GiB / -) */
 function parseSizeToBytes(s) {
   if (s == null) return 0;
-  if (typeof s === 'number' && Number.isFinite(s)) return s;
+  if (typeof s === 'number' && Number.isFinite(s)) return Math.round(s);
   const str = String(s).trim();
+  if (!str || str === '-' || str === '—') return 0;
   if (/^\d+$/.test(str)) return Number(str);
-  const m = str.match(/([\d.]+)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)?/i);
-  if (!m) return 0;
+  const m = str.match(/^([\d.]+)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB|K|M|G|T)?$/i);
+  if (!m) {
+    const m2 = str.match(/([\d.]+)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)/i);
+    if (!m2) return 0;
+    return parseSizeToBytes(m2[0]);
+  }
   const num = parseFloat(m[1]);
-  const unit = (m[2] || 'B').toUpperCase();
+  if (!Number.isFinite(num)) return 0;
+  let unit = (m[2] || 'B').toUpperCase();
+  if (unit === 'K') unit = 'KIB';
+  if (unit === 'M') unit = 'MIB';
+  if (unit === 'G') unit = 'GIB';
+  if (unit === 'T') unit = 'TIB';
   const map = {
     B: 1,
     KIB: 1024,
@@ -222,8 +234,180 @@ function parseSizeToBytes(s) {
   return Math.round(num * (map[unit] || 1));
 }
 
+function splitTableRow(line) {
+  return String(line || '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function findCol(headers, aliases) {
+  const lower = headers.map((h) => String(h).toLowerCase());
+  for (const a of aliases) {
+    const i = lower.indexOf(String(a).toLowerCase());
+    if (i >= 0) return i;
+  }
+  for (const a of aliases) {
+    const key = String(a).toLowerCase();
+    const i = lower.findIndex((h) => h.includes(key));
+    if (i >= 0) return i;
+  }
+  return -1;
+}
+
 /**
- * Collect per-user usage via mita CLI (best-effort, never throws to caller critically)
+ * Parse `mita get users` table:
+ * User LastActive 1DayDown 1DayUp 7DaysDown 7DaysUp 30DaysDown 30DaysUp
+ * (older docs also use 1DayDownload / 30DaysDownload)
+ */
+function parseMitaUsersTable(text) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  let headerIdx = -1;
+  let headers = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^user\b/i.test(lines[i]) && /(down|download|up|upload)/i.test(lines[i])) {
+      headers = splitTableRow(lines[i]);
+      headerIdx = i;
+      break;
+    }
+  }
+  const users = [];
+  if (headerIdx >= 0) {
+    const iUser = findCol(headers, ['User', 'Name']) >= 0 ? findCol(headers, ['User', 'Name']) : 0;
+    const i1dDown = findCol(headers, ['1DayDown', '1DayDownload', '1daydown']);
+    const i1dUp = findCol(headers, ['1DayUp', '1DayUpload', '1dayup']);
+    const i7dDown = findCol(headers, ['7DaysDown', '7DayDown', '7DaysDownload', '7DayDownload']);
+    const i7dUp = findCol(headers, ['7DaysUp', '7DayUp', '7DaysUpload', '7DayUpload']);
+    const i30dDown = findCol(headers, ['30DaysDown', '30DayDown', '30DaysDownload', '30DayDownload']);
+    const i30dUp = findCol(headers, ['30DaysUp', '30DayUp', '30DaysUpload', '30DayUpload']);
+    const iLast = findCol(headers, ['LastActive', 'LastActiveTime', 'Active']);
+
+    for (let i = headerIdx + 1; i < lines.length; i++) {
+      const parts = splitTableRow(lines[i]);
+      if (parts.length < 2) continue;
+      const name = parts[iUser] || parts[0];
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(name)) continue;
+      if (/^(user|name|total|----|mita|days|limit|usage)$/i.test(name)) continue;
+      const cell = (idx) => {
+        if (idx < 0 || idx >= parts.length) return 0;
+        return parseSizeToBytes(parts[idx]);
+      };
+      const day1DownloadBytes = cell(i1dDown);
+      const day1UploadBytes = cell(i1dUp);
+      const day7DownloadBytes = cell(i7dDown);
+      const day7UploadBytes = cell(i7dUp);
+      const day30DownloadBytes = cell(i30dDown);
+      const day30UploadBytes = cell(i30dUp);
+      // 展示默认用 30 天累计（刷视频会动）；没有 30 天列则回落 7/1 天
+      const downloadBytes = day30DownloadBytes || day7DownloadBytes || day1DownloadBytes;
+      const uploadBytes = day30UploadBytes || day7UploadBytes || day1UploadBytes;
+      users.push({
+        name: String(name),
+        downloadBytes,
+        uploadBytes,
+        totalBytes: downloadBytes + uploadBytes,
+        day1DownloadBytes,
+        day1UploadBytes,
+        day7DownloadBytes,
+        day7UploadBytes,
+        day30DownloadBytes,
+        day30UploadBytes,
+        lastActive: iLast >= 0 && parts[iLast] && parts[iLast] !== '-' ? parts[iLast] : null,
+        raw: lines[i].slice(0, 240),
+      });
+    }
+    if (users.length) return users;
+  }
+
+  // fallback: 宽松解析「名字 + 若干体积」
+  for (const line of lines) {
+    if (/^user\b/i.test(line) && /(down|download)/i.test(line)) continue;
+    const m = line.match(/^([A-Za-z0-9][A-Za-z0-9._-]{0,31})\b(.*)$/);
+    if (!m) continue;
+    const name = m[1];
+    if (/^(user|name|total|----|mita|days|limit|usage)$/i.test(name)) continue;
+    const sizes = [...String(m[2]).matchAll(/([\d.]+)\s*(KiB|MiB|GiB|TiB|KB|MB|GB|TB|B)\b/gi)].map((x) =>
+      parseSizeToBytes(x[0])
+    );
+    if (!sizes.length) continue;
+    // 常见列序：1dDown 1dUp 7dDown 7dUp 30dDown 30dUp
+    let downloadBytes = 0;
+    let uploadBytes = 0;
+    if (sizes.length >= 6) {
+      downloadBytes = sizes[4];
+      uploadBytes = sizes[5];
+    } else if (sizes.length >= 4) {
+      downloadBytes = sizes[2];
+      uploadBytes = sizes[3];
+    } else if (sizes.length >= 2) {
+      downloadBytes = sizes[0];
+      uploadBytes = sizes[1];
+    } else {
+      downloadBytes = sizes[0];
+    }
+    users.push({
+      name,
+      downloadBytes,
+      uploadBytes,
+      totalBytes: downloadBytes + uploadBytes,
+      day1DownloadBytes: sizes[0] || 0,
+      day1UploadBytes: sizes[1] || 0,
+      day30DownloadBytes: downloadBytes,
+      day30UploadBytes: uploadBytes,
+      raw: line.slice(0, 240),
+    });
+  }
+  return users;
+}
+
+/** Parse `mita get quotas`: User Days Limit Usage */
+function parseMitaQuotasTable(text) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const out = [];
+  let headerIdx = -1;
+  let headers = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^user\b/i.test(lines[i]) && /days|limit|usage/i.test(lines[i])) {
+      headers = splitTableRow(lines[i]);
+      headerIdx = i;
+      break;
+    }
+  }
+  if (headerIdx < 0) return out;
+  const iUser = findCol(headers, ['User', 'Name']) >= 0 ? findCol(headers, ['User', 'Name']) : 0;
+  const iDays = findCol(headers, ['Days', 'Day']);
+  const iLimit = findCol(headers, ['Limit']);
+  const iUsage = findCol(headers, ['Usage', 'Used']);
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const parts = splitTableRow(lines[i]);
+    if (parts.length < 2) continue;
+    const name = parts[iUser] || parts[0];
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(name)) continue;
+    if (/^(user|name|days|limit|usage)$/i.test(name)) continue;
+    const limitBytes = iLimit >= 0 ? parseSizeToBytes(parts[iLimit]) : 0;
+    const usedBytes = iUsage >= 0 ? parseSizeToBytes(parts[iUsage]) : 0;
+    const days = iDays >= 0 ? Number(parts[iDays]) || null : null;
+    out.push({
+      name: String(name),
+      days,
+      limitMB: limitBytes ? Math.round(limitBytes / (1024 * 1024)) : null,
+      usedMB: usedBytes ? Math.round((usedBytes / (1024 * 1024)) * 10) / 10 : null,
+      limitBytes,
+      usedBytes,
+    });
+  }
+  return out;
+}
+
+/**
+ * Collect per-user usage via mita CLI (best-effort)
+ * Official table columns: 1DayDown/1DayUp/7DaysDown/7DaysUp/30DaysDown/30DaysUp
  */
 async function collectUsage() {
   const bin = findMitaBin();
@@ -240,77 +424,79 @@ async function collectUsage() {
     const quotasR = await run(bin, ['get', 'quotas'], { timeout: 20000 });
     const textU = `${usersR.stdout || ''}\n${usersR.stderr || ''}`;
     const textQ = `${quotasR.stdout || ''}\n${quotasR.stderr || ''}`;
-    out.raw = (textU + '\n' + textQ).slice(0, 4000);
+    out.raw = (textU + '\n' + textQ).slice(0, 6000);
+    out.usersOk = Boolean(usersR.ok);
+    out.quotasOk = Boolean(quotasR.ok);
 
-    // try JSON
-    try {
-      const j = JSON.parse(usersR.stdout || '');
-      const arr = Array.isArray(j) ? j : j.users || j.UserStats || [];
-      if (Array.isArray(arr) && arr.length) {
-        for (const u of arr) {
-          const name = u.name || u.Name || u.user || u.User;
-          if (!name) continue;
-          const downloadBytes = parseSizeToBytes(
-            u.downloadBytes ?? u.DownloadBytes ?? u.download ?? u.Download ?? 0
-          );
-          const uploadBytes = parseSizeToBytes(
-            u.uploadBytes ?? u.UploadBytes ?? u.upload ?? u.Upload ?? 0
-          );
-          const totalBytes =
-            parseSizeToBytes(u.totalBytes ?? u.TotalBytes ?? u.total ?? u.Total) ||
-            downloadBytes + uploadBytes;
-          out.users.push({ name: String(name), downloadBytes, uploadBytes, totalBytes });
+    // mita 输出是文本表，不是 JSON；先按表解析
+    out.users = parseMitaUsersTable(textU);
+
+    // 若有人强行打 JSON，再兼容
+    if (!out.users.length) {
+      try {
+        const j = JSON.parse(usersR.stdout || '');
+        const arr = Array.isArray(j) ? j : j.users || j.items || j.UserStats || [];
+        if (Array.isArray(arr)) {
+          for (const u of arr) {
+            const name = u.name || u.Name || u.user || u.User || u?.user?.name;
+            if (!name) continue;
+            const downloadBytes = parseSizeToBytes(
+              u.downloadBytes ??
+                u.DownloadBytes ??
+                u.day30DownloadBytes ??
+                u['30DaysDown'] ??
+                u.download ??
+                u.Download ??
+                0
+            );
+            const uploadBytes = parseSizeToBytes(
+              u.uploadBytes ??
+                u.UploadBytes ??
+                u.day30UploadBytes ??
+                u['30DaysUp'] ??
+                u.upload ??
+                u.Upload ??
+                0
+            );
+            out.users.push({
+              name: String(name),
+              downloadBytes,
+              uploadBytes,
+              totalBytes: downloadBytes + uploadBytes,
+            });
+          }
         }
-      }
-    } catch {
-      // text parse: lines with username and numbers
-      for (const line of textU.split('\n')) {
-        // e.g. "user xxx  download 1.2GiB upload 3.4MiB"
-        const m = line.match(
-          /(?:user[:\s]+)?([A-Za-z0-9._-]{1,32}).*?(?:down(?:load)?[:\s]+([\d.]+\s*\w+))?.*?(?:up(?:load)?[:\s]+([\d.]+\s*\w+))?/i
-        );
-        if (!m) continue;
-        const name = m[1];
-        if (/^(user|name|total|----|mita)/i.test(name)) continue;
-        const downloadBytes = parseSizeToBytes(m[2] || 0);
-        const uploadBytes = parseSizeToBytes(m[3] || 0);
-        // simpler: any "name ... 123MiB"
-        const sizes = [...line.matchAll(/([\d.]+)\s*(KiB|MiB|GiB|KB|MB|GB|B)/gi)].map((x) =>
-          parseSizeToBytes(x[0])
-        );
-        let total = downloadBytes + uploadBytes;
-        if (!total && sizes.length) total = sizes[sizes.length - 1];
-        if (name && (total || downloadBytes || uploadBytes || /user/i.test(line))) {
-          out.users.push({
-            name,
-            downloadBytes,
-            uploadBytes,
-            totalBytes: total,
-            raw: line.slice(0, 200),
-          });
-        }
+      } catch {
+        /* not json */
       }
     }
 
-    try {
-      const j = JSON.parse(quotasR.stdout || '');
-      const arr = Array.isArray(j) ? j : j.quotas || [];
-      for (const q of arr) {
-        const name = q.name || q.Name || q.user;
-        if (!name) continue;
-        out.quotas.push({
-          name: String(name),
-          limitMB: q.limitMB ?? q.megabytes ?? q.limit ?? null,
-          usedMB: q.usedMB ?? q.used ?? null,
-          days: q.days ?? null,
-          mode: q.mode || null,
-        });
+    out.quotas = parseMitaQuotasTable(textQ);
+    if (!out.quotas.length) {
+      try {
+        const j = JSON.parse(quotasR.stdout || '');
+        const arr = Array.isArray(j) ? j : j.quotas || [];
+        for (const q of arr) {
+          const name = q.name || q.Name || q.user;
+          if (!name) continue;
+          out.quotas.push({
+            name: String(name),
+            limitMB: q.limitMB ?? q.megabytes ?? q.limit ?? null,
+            usedMB: q.usedMB ?? q.used ?? null,
+            days: q.days ?? null,
+            mode: q.mode || null,
+          });
+        }
+      } catch {
+        /* ignore */
       }
-    } catch {
-      /* ignore text quotas */
     }
 
     out.available = out.users.length > 0 || usersR.ok;
+    if (usersR.ok && !out.users.length) {
+      out.parseHint =
+        'mita get users 有输出但未解析到用户行（请升级 Agent；落地执行 mita get users 对照）';
+    }
   } catch (err) {
     out.error = err.message;
     out.available = false;
@@ -763,7 +949,34 @@ async function main() {
   setInterval(loop, INTERVAL * 1000);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (require.main === module && process.argv.includes('--self-test-usage')) {
+  const sample = `User  LastActive            1DayDown  1DayUp  7DaysDown  7DaysUp  30DaysDown  30DaysUp
+u7af760  2026-07-29T01:02:03Z  938.1MiB  12.9MiB  2.1GiB     40.0MiB  4.0GiB      31.8MiB
+123  -  10.0MiB  1.0MiB  10.0MiB  1.0MiB  10.0MiB  1.0MiB
+`;
+  const users = parseMitaUsersTable(sample);
+  if (users.length < 2) {
+    console.error('parse failed', users);
+    process.exit(1);
+  }
+  const u = users.find((x) => x.name === 'u7af760');
+  if (!u || u.downloadBytes < 4 * 1024 ** 3 * 0.9 || u.uploadBytes < 30 * 1024 ** 2) {
+    console.error('expected 30d down/up', u);
+    process.exit(1);
+  }
+  if (u.day1DownloadBytes < 900 * 1024 ** 2) {
+    console.error('expected 1d down', u);
+    process.exit(1);
+  }
+  console.log(
+    'usage parse self-test ok',
+    users.map((x) => ({ n: x.name, d: x.downloadBytes, u: x.uploadBytes }))
+  );
+  process.exit(0);
+} else {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+

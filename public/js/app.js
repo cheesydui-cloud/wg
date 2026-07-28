@@ -843,13 +843,13 @@ async function renderDashboard() {
       </div>
       ${
         state.clients.length
-          ? `<table><thead><tr><th>登录名</th><th>落地</th><th>用量</th><th>状态</th><th></th></tr></thead><tbody>
+          ? `<table><thead><tr><th>登录名</th><th>落地</th><th>流量 ↓↑</th><th>状态</th><th></th></tr></thead><tbody>
           ${state.clients
             .map(
               (c) => `<tr>
             <td class="mono">${esc(c.name)}${c.note ? `<div class="muted" style="font-size:11px">${esc(c.note)}</div>` : ''}</td>
             <td>${esc(nodeName(c.route?.landingNodeId))}</td>
-            <td class="mono">${esc(c.usage?.totalHuman || '—')}</td>
+            <td>${usageCellHtml(c)}</td>
             <td>${
               c.statusFlags?.expired
                 ? '<span class="badge warn">到期</span>'
@@ -1648,17 +1648,32 @@ function clientStatusBadge(c) {
   return '<span class="badge ok">启用</span>';
 }
 
+function usageCellHtml(c) {
+  const u = c.usage || {};
+  const down = u.downloadHuman || (u.downloadBytes != null ? null : null);
+  const has = Number(u.totalBytes) > 0 || Number(u.downloadBytes) > 0 || Number(u.uploadBytes) > 0;
+  if (!has && !u.collectedAt) {
+    return `<span class="muted">—</span><div class="muted" style="font-size:10px">等待 Agent 上报</div>`;
+  }
+  const d = u.downloadHuman || '0 B';
+  const up = u.uploadHuman || '0 B';
+  const tot = u.totalHuman || '0 B';
+  return `<div class="usage-cell mono">
+    <div title="下行（约 30 天）"><span class="usage-dir down">↓</span> ${esc(d)}</div>
+    <div title="上行（约 30 天）"><span class="usage-dir up">↑</span> ${esc(up)}</div>
+    <div class="muted" style="font-size:10px" title="合计">Σ ${esc(tot)}${
+      u.collectedAt ? ` · ${esc(fmtTime(u.collectedAt))}` : ''
+    }</div>
+  </div>`;
+}
+
 function clientRowHtml(c) {
   return `<tr>
     <td class="mono"><strong>${esc(c.name)}</strong>${
       c.note ? `<div class="muted" style="font-size:11px">${esc(c.note)}</div>` : ''
     }</td>
     <td class="mono">${esc(c.route?.listenPort || '默认')}</td>
-    <td class="mono">${esc(c.usage?.totalHuman || '—')}${
-      c.usage?.collectedAt
-        ? `<div class="muted" style="font-size:10px">${esc(fmtTime(c.usage.collectedAt))}</div>`
-        : ''
-    }</td>
+    <td>${usageCellHtml(c)}</td>
     <td class="mono">${esc(c.package?.expireAt ? String(c.package.expireAt).slice(0, 10) : '不限')}</td>
     <td class="mono">${c.package?.quotaMb ? esc(c.package.quotaMb) + ' MB' : '不限'}</td>
     <td>${clientStatusBadge(c)}</td>
@@ -1753,7 +1768,7 @@ async function renderClients() {
         ${
           g.clients.length
             ? `<div class="table-wrap"><table><thead><tr>
-                <th>登录名</th><th>端口</th><th>用量</th><th>到期</th><th>配额</th><th>状态</th><th></th>
+                <th>登录名</th><th>端口</th><th title="mita 30 天累计">流量 ↓↑</th><th>到期</th><th>配额</th><th>状态</th><th></th>
               </tr></thead><tbody>
               ${g.clients.map(clientRowHtml).join('')}
             </tbody></table></div>`

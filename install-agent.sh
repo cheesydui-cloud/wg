@@ -70,7 +70,7 @@ chmod 755 "${APP_DIR}/index.js"
 cat > "${APP_DIR}/package.json" <<EOF
 {
   "name": "wg-agent",
-  "version": "2.0.0",
+  "version": "4.1.2",
   "private": true,
   "main": "index.js"
 }
@@ -114,7 +114,7 @@ sleep 2
 if systemctl is-active --quiet "${SERVICE_NAME}"; then
   echo ""
   echo "=========================================="
-  echo "  Agent 已安装并运行 (v2.0.0 · mieru)"
+  echo "  Agent 已安装并运行（从面板下载最新 agent）"
   echo "  名称: ${NAME}"
   echo "  面板: ${PANEL_URL}"
   echo "  服务: systemctl status ${SERVICE_NAME}"

@@ -3,7 +3,7 @@
 中文、新手友好的 **mieru / mita 拓扑出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v4.1.8**（修创建用户绑 pro3 后 apply 报无用户 · landing id 唯一）
+当前版本：**v4.1.9**（修创建用户刷新后消失 · 主落地心跳不再覆盖全局用户列表）
 
 - 每台 IX 独立商家前置（IP/域名）与端口段
 - 拓扑 = IX 工作台；落地列表点开详情；客户端按落地分组
@@ -31,6 +31,13 @@
 | **兼容 v3.1** | 单前置 / 单 IX / 单落地自动迁成一条路由，Endpoint 保留 |
 
 路径保持不变。业务流量不经面板。
+
+### v4.1.9
+
+- **根因修复**：主落地 Agent 心跳 / 拉 bundle / job-result 后，`syncStateFromPrimary` 曾用「仅含本落地用户」的 `node.clients` 覆盖全局 `state.clients`，导致 **pro3 等其它落地用户一刷新就消失**，应用本落地也误报无用户。
+- 用户列表以 `state.clients` 为唯一真源；`node.clients` 仅作脏标记/缓存，不再回写全局。
+- 启动时 `mergeClientsFromNodes`：若历史数据用户只在 `node.clients`，合并恢复到全局列表。
+- 回归：smoke 覆盖「主落地心跳不抹多落地用户」与 merge 恢复。
 
 ### v4.1.8
 - 修复：客户端列表在 pro3 下有用户，点「应用本落地」却报没有绑定用户
@@ -120,7 +127,7 @@ sudo bash install.sh --update
 # 新装：sudo bash install.sh
 ```
 
-打开 `http://面板IP:51821`，确认版本 **v4.1.8**。
+打开 `http://面板IP:51821`，确认版本 **v4.1.9**。
 
 忘记密码：
 
@@ -218,7 +225,7 @@ sudo bash install.sh --update
 - **2.x → 4.0**：补拓扑 + 多落地字段  
 - **1.x → 4.0**：WG 归档；重装 Agent；新建 mieru 用户  
 
-升级前建议备份 `data/state.json`。落地机建议再执行一次 Agent 安装命令以对齐 **agent v4.1.8**（用量/配额）。
+升级前建议备份 `data/state.json`。落地机建议再执行一次 Agent 安装命令以对齐 **agent v4.1.9**（用量/配额）。
 
 本地回归：
 

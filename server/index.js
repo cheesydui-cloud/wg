@@ -29,6 +29,13 @@ let state = loadState();
 nodes.ensureNodes(state);
 topology.ensureTopology(state);
 mieru.ensureMieruDefaults(state);
+// 旧数据可能把用户只存在 node.clients；合并进 state.clients（唯一真源）
+try {
+  const n = nodes.mergeClientsFromNodes(state);
+  if (n > 0) console.log(`[panel] 从落地节点恢复了 ${n} 个用户到全局列表`);
+} catch (e) {
+  console.warn('[panel] mergeClientsFromNodes failed:', e.message);
+}
 // 保证每个客户端都有 id（否则编辑保存会「用户不存在」）
 for (const c of state.clients || []) ensureClientFields(c, state.primaryNodeId);
 // ensure default landing bound

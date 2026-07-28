@@ -381,5 +381,107 @@ ok('publicTopology per-IX ingress/endpoints');
   ok('clientsForNode resolveLandingNodeId matches UI/apply');
 }
 
+
+// 14) 主落地心跳/sync 不得抹掉其它落地用户
+{
+  const primary = 'node-p';
+  const pro3 = 'node-pro3';
+  const st = {
+    mode: 'agent',
+    primaryNodeId: primary,
+    server: { listenPort: 7901, protocol: 'TCP', endpoint: '1.1.1.1:7901', mtu: 1400 },
+    nodes: [
+      {
+        id: primary,
+        name: '落地出口',
+        server: { listenPort: 7901 },
+        clients: [], // 将被写成「仅主落地用户」模拟 bundle 后
+        lastAppliedHash: null,
+      },
+      { id: pro3, name: 'pro3', server: { listenPort: 7902 }, clients: [] },
+    ],
+    clients: [
+      {
+        id: 'c1',
+        name: 'u7af760',
+        password: 'a',
+        enabled: true,
+        route: { landingNodeId: primary },
+        package: {},
+        usage: {},
+      },
+      {
+        id: 'c2',
+        name: 'u9e23d8',
+        password: 'b',
+        enabled: true,
+        route: { landingNodeId: pro3, listenPort: 7902 },
+        package: {},
+        usage: {},
+      },
+    ],
+    topology: {
+      landings: [
+        { id: 'L1', name: '落地出口', nodeId: primary, listenPort: 7901 },
+        { id: 'L2', name: 'pro3', nodeId: pro3, listenPort: 7902 },
+      ],
+      ixes: [{ id: 'ix1', name: '沪日IX', portMin: 7900, portMax: 7999 }],
+      ingress: { active: 'external', externalHost: '1.1.1.1', mobileHost: '2.2.2.2', port: 7901 },
+    },
+  };
+  // 模拟主落地 pull bundle：node.clients 只剩本机用户
+  const primaryNode = st.nodes[0];
+  primaryNode.clients = mieru.clientsForNode(st, primary);
+  assert.strictEqual(primaryNode.clients.length, 1);
+  assert.strictEqual(primaryNode.clients[0].name, 'u7af760');
+  // 旧 bug：syncStateFromPrimary 会 state.clients = node.clients → pro3 用户消失
+  nodes.syncStateFromPrimary(st, primaryNode);
+  assert.strictEqual(st.clients.length, 2, 'must keep both clients after primary sync');
+  assert.ok(
+    st.clients.some((c) => c.name === 'u9e23d8'),
+    'pro3 user must survive primary heartbeat sync'
+  );
+  assert.deepStrictEqual(
+    mieru.clientsForNode(st, pro3).map((c) => c.name),
+    ['u9e23d8']
+  );
+  ok('primary heartbeat must not wipe multi-landing clients');
+}
+
+
+// 15) 启动合并：仅存在于 node.clients 的用户要回到 state.clients
+{
+  const st = {
+    mode: 'agent',
+    primaryNodeId: 'n1',
+    server: { listenPort: 7901 },
+    nodes: [
+      {
+        id: 'n1',
+        name: '落地出口',
+        clients: [
+          {
+            id: 'only-on-node',
+            name: 'u_legacy',
+            password: 'x',
+            enabled: true,
+            route: { landingNodeId: 'n1' },
+          },
+        ],
+      },
+    ],
+    clients: [],
+  };
+  const added = nodes.mergeClientsFromNodes(st);
+  assert.strictEqual(added, 1);
+  assert.strictEqual(st.clients.length, 1);
+  assert.strictEqual(st.clients[0].name, 'u_legacy');
+  // 已有同名不重复
+  st.nodes[0].clients.push({ id: 'dup', name: 'u_legacy', password: 'y' });
+  assert.strictEqual(nodes.mergeClientsFromNodes(st), 0);
+  assert.strictEqual(st.clients.length, 1);
+  ok('mergeClientsFromNodes recovers orphan node.clients');
+}
+
 console.log('\nsmoke-v4: all passed');
 console.log('tmp data:', tmp);

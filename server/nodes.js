@@ -130,20 +130,36 @@ function getPrimaryNode(state) {
 function syncPrimaryFromState(state) {
   const node = getPrimaryNode(state);
   if (!node) return null;
+  // 只镜像服务端参数；客户端用户以 state.clients 为唯一真源
+  // （多落地时绝不能把全量/过滤用户互相覆盖）
   node.server = { ...(node.server || {}), ...state.server };
-  node.clients = Array.isArray(state.clients) ? state.clients : [];
   return node;
 }
 
 /**
  * 将主节点配置同步回统一 state（心跳/任务后）
+ * 注意：node.clients 可能只是「本落地过滤后的子集」（bundle/apply 会写），
+ * 绝不能用它覆盖 state.clients，否则其它落地的用户会在刷新/心跳后消失。
  */
 function syncStateFromPrimary(state, node) {
   if (!node) return;
   if (state.mode !== 'agent') return;
   if (state.primaryNodeId && node.id !== state.primaryNodeId) return;
-  state.server = { ...state.server, ...node.server };
-  state.clients = Array.isArray(node.clients) ? node.clients : state.clients;
+  // 仅同步 server 元数据与应用时间；用户列表永不从 node 回写
+  if (node.server && typeof node.server === 'object') {
+    const keepListen =
+      state.server?.listenPort != null ? state.server.listenPort : node.server.listenPort;
+    state.server = {
+      ...state.server,
+      // 不把 node 上可能过期的整包 server 无脑盖掉关键字段以外的业务
+      protocol: node.server.protocol || state.server.protocol,
+      mtu: node.server.mtu != null ? node.server.mtu : state.server.mtu,
+      multiplexing: node.server.multiplexing || state.server.multiplexing,
+      // endpoint 以全局/拓扑为准，避免被旧 node.server 冲掉
+      endpoint: state.server.endpoint || node.server.endpoint || '',
+      listenPort: keepListen,
+    };
+  }
   if (node.lastAppliedHash) state.lastAppliedHash = node.lastAppliedHash;
   if (node.lastAppliedAt) state.lastAppliedAt = node.lastAppliedAt;
 }
@@ -196,12 +212,42 @@ function ensurePrimaryNode(state, { name, template } = {}) {
   } else if (node.server) {
     state.server = { ...state.server, ...node.server };
   }
-  if (Array.isArray(state.clients) && state.clients.length && !(node.clients || []).length) {
-    node.clients = state.clients;
-  } else if ((node.clients || []).length && !(state.clients || []).length) {
-    state.clients = node.clients;
-  }
+  // 用户只存在 state.clients；node.clients 仅作缓存/脏标记辅助，缺省留空
+  if (!Array.isArray(node.clients)) node.clients = [];
   return { node, token, created };
+}
+
+/**
+ * 启动/加载时：若历史数据把用户只写在 node.clients（旧单落地镜像），
+ * 且 state.clients 为空或缺少这些用户，则合并回来。
+ * 绝不反向用过滤后的 node.clients 覆盖 state.clients。
+ */
+function mergeClientsFromNodes(state) {
+  if (!Array.isArray(state.clients)) state.clients = [];
+  const byId = new Map();
+  const byName = new Map();
+  for (const c of state.clients) {
+    if (c?.id) byId.set(c.id, c);
+    if (c?.name) byName.set(c.name, c);
+  }
+  let added = 0;
+  for (const node of ensureNodes(state)) {
+    if (!Array.isArray(node.clients)) continue;
+    for (const c of node.clients) {
+      if (!c || typeof c !== 'object') continue;
+      if (c.id && byId.has(c.id)) continue;
+      if (c.name && byName.has(c.name)) continue;
+      // 补绑落地
+      if (!c.route) c.route = {};
+      if (!c.route.landingNodeId) c.route.landingNodeId = node.id;
+      if (!c.id) c.id = newId();
+      state.clients.push(c);
+      byId.set(c.id, c);
+      if (c.name) byName.set(c.name, c);
+      added += 1;
+    }
+  }
+  return added;
 }
 
 function rotateNodeToken(node) {
@@ -450,6 +496,7 @@ module.exports = {
   findNodeByToken,
   getPrimaryNode,
   ensurePrimaryNode,
+  mergeClientsFromNodes,
   syncPrimaryFromState,
   syncStateFromPrimary,
   createNode,

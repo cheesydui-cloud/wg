@@ -126,21 +126,21 @@ fi
 cat > "${APP_DIR}/package.json" <<EOF
 {
   "name": "wg-agent",
-  "version": "4.2.5",
+  "version": "4.2.6",
   "private": true,
   "main": "index.js"
 }
 EOF
 
 mkdir -p /var/lib/wg-agent /etc/wg-agent
-# systemd EnvironmentFile：值用双引号，避免中文名/特殊字符导致服务起不来
-cat > /etc/wg-agent/agent.env <<EOF
-WG_PANEL_URL="${PANEL_URL}"
-WG_AGENT_TOKEN="${TOKEN}"
-WG_AGENT_NAME="${NAME}"
-WG_AGENT_INTERVAL=10
-WG_AGENT_DATA=/var/lib/wg-agent
-EOF
+# systemd EnvironmentFile：双引号 + 转义，避免中文名/特殊字符导致服务起不来
+{
+  printf 'WG_PANEL_URL="%s"\n' "${PANEL_URL//\"/\\\"}"
+  printf 'WG_AGENT_TOKEN="%s"\n' "${TOKEN//\"/\\\"}"
+  printf 'WG_AGENT_NAME="%s"\n' "${NAME//\"/\\\"}"
+  echo 'WG_AGENT_INTERVAL=10'
+  echo 'WG_AGENT_DATA=/var/lib/wg-agent'
+} > /etc/wg-agent/agent.env
 chmod 600 /etc/wg-agent/agent.env
 
 echo "==> 配置 systemd"

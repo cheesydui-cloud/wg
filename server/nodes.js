@@ -130,17 +130,30 @@ function getPrimaryNode(state) {
 function syncPrimaryFromState(state) {
   const node = getPrimaryNode(state);
   if (!node) return null;
-  // 只镜像服务端参数；客户端用户以 state.clients 为唯一真源
-  // （多落地时绝不能把全量/过滤用户互相覆盖）
-  node.server = { ...(node.server || {}), ...state.server };
+  // 只镜像公共参数；绝不能用全局 listenPort(常 7901) 盖掉主落地各自端口
+  // 客户端用户以 state.clients 为唯一真源
+  const keepListen = Number(node.server?.listenPort) || null;
+  let landingPort = null;
+  try {
+    const topology = require('./topology');
+    const L = topology.getLandingByNodeId(state, node.id);
+    if (L?.listenPort) landingPort = Number(L.listenPort);
+  } catch {
+    /* */
+  }
+  const prev = node.server || {};
+  node.server = {
+    ...prev,
+    protocol: state.server?.protocol || prev.protocol,
+    mtu: state.server?.mtu != null ? state.server.mtu : prev.mtu,
+    multiplexing: state.server?.multiplexing || prev.multiplexing,
+    endpoint: state.server?.endpoint || prev.endpoint || '',
+    listenPort:
+      landingPort || keepListen || Number(state.server?.listenPort) || 7901,
+  };
   return node;
 }
 
-/**
- * 将主节点配置同步回统一 state（心跳/任务后）
- * 注意：node.clients 可能只是「本落地过滤后的子集」（bundle/apply 会写），
- * 绝不能用它覆盖 state.clients，否则其它落地的用户会在刷新/心跳后消失。
- */
 function syncStateFromPrimary(state, node) {
   if (!node) return;
   if (state.mode !== 'agent') return;

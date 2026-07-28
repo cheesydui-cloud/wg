@@ -336,15 +336,14 @@ function buildBundleForNode(node) {
     throw err;
   }
   // 强制 portBindings 与本落地 listenPort 一致（防全局 7901 渗入）
+  // BOTH：TCP=base，UDP=base+1（与 share 链 / portForProtocol 一致）
   const proto = mieru.normalizeProtocol(fake.server.protocol || 'TCP');
   const bindings = [];
-  if (proto === 'UDP' || proto === 'UDP_ONLY') {
-    bindings.push({ port: listenPort, protocol: 'UDP' });
-  } else if (proto === 'BOTH') {
-    bindings.push({ port: listenPort, protocol: 'TCP' });
-    bindings.push({ port: listenPort, protocol: 'UDP' });
-  } else {
-    bindings.push({ port: listenPort, protocol: 'TCP' });
+  for (const p of mieru.protocolsForMode(proto)) {
+    bindings.push({
+      port: mieru.portForProtocol(listenPort, p, proto),
+      protocol: p,
+    });
   }
   serverConfig.portBindings = bindings;
   const hash = crypto
@@ -1120,13 +1119,11 @@ app.put('/api/nodes/:id', (req, res) => {
       }
     }
     nodes.markNodeDirty(node);
-    // 端口变更后自动排队 apply，避免「只保存、mita 仍 7901」
-    if (nodes.isNodeOnline(node)) {
-      try {
-        enqueueApply(node, 'mieru_apply');
-      } catch (e) {
-        console.warn('[panel] auto-apply after port change:', e.message);
-      }
+    // 端口变更后一律排队 apply（离线挂起，上线执行），避免 mita 仍停旧端口
+    try {
+      enqueueApply(node, 'mieru_apply');
+    } catch (e) {
+      console.warn('[panel] auto-apply after port change:', e.message);
     }
   }
   if (landing) {

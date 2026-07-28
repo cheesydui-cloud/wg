@@ -582,5 +582,64 @@ ok('publicTopology per-IX ingress/endpoints');
   ok('pro3 homeReachablePort follows listenPort 7902');
 }
 
+
+
+// 19) syncPrimaryFromState 不得用全局 7901 盖掉主落地 7902
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-v4-smoke-'));
+  process.env.WG_DATA_DIR = dir;
+  const st = {
+    mode: 'agent',
+    primaryNodeId: 'n-primary',
+    server: { listenPort: 7901, protocol: 'TCP', mtu: 1400, multiplexing: 'MULTIPLEXING_LOW' },
+    clients: [],
+    nodes: [
+      {
+        id: 'n-primary',
+        name: 'pro3',
+        server: { listenPort: 7902, protocol: 'TCP' },
+        tokenHash: 'x',
+        jobs: [],
+      },
+    ],
+    topology: {
+      profile: 'cm-ix-home',
+      ingress: { active: 'external', port: 7901, protocol: 'TCP', mobileHost: '', externalHost: '1.1.1.1' },
+      ixes: [{ id: 'ix1', name: 'IX', lanIp: '1.1.1.1', portMin: 7900, portMax: 7999, forwardConfigured: true }],
+      landings: [
+        {
+          id: 'L1',
+          name: 'pro3',
+          nodeId: 'n-primary',
+          listenPort: 7902,
+          homeReachablePort: 7902,
+          homeReachableHost: '9.9.9.9',
+          ixId: 'ix1',
+        },
+      ],
+    },
+  };
+  nodes.syncPrimaryFromState(st);
+  assert.strictEqual(
+    Number(st.nodes[0].server.listenPort),
+    7902,
+    'syncPrimary must keep landing port 7902, not global 7901'
+  );
+  ok('syncPrimaryFromState must not clobber primary landing listenPort');
+
+  // buildBundleForNode BOTH bindings: UDP = base+1
+  // use require index helpers via mieru directly
+  const bothBind = [];
+  for (const p of mieru.protocolsForMode('BOTH')) {
+    bothBind.push({ port: mieru.portForProtocol(7902, p, 'BOTH'), protocol: p });
+  }
+  assert.deepStrictEqual(bothBind, [
+    { port: 7902, protocol: 'TCP' },
+    { port: 7903, protocol: 'UDP' },
+  ]);
+  ok('BOTH protocol UDP is base+1');
+}
+
+
 console.log('\nsmoke-v4: all passed');
 console.log('tmp data:', tmp);

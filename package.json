@@ -1,6 +1,6 @@
 {
   "name": "wg-panel",
-  "version": "4.2.5",
+  "version": "4.2.6",
   "description": "mieru 多落地出口面板：多 IX · 每IX前置 · 多落地 · 用户路由 · 流量/期限",
   "main": "server/index.js",
   "scripts": {

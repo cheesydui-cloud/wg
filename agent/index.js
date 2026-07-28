@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Edge Agent v4.2.5 — mieru / mita 落地（支持多落地 + 流量/套餐）
+ * Edge Agent v4.2.6 — mieru / mita 落地（支持多落地 + 流量/套餐）
  * 连接中心面板，拉取任务：安装/应用 mita、上报状态与用量
  *
  * 环境变量：
@@ -19,7 +19,7 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
-const VERSION = '4.2.5';
+const VERSION = '4.2.6';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';
@@ -734,19 +734,31 @@ async function applyUserPackages(users, script) {
   return notes;
 }
 
-async function portIsListening(port) {
+async function portIsListeningOnce(port) {
   const p = Number(port);
   if (!p) return false;
-  const ss = await run('ss', ['-lnt']);
-  if (!ss.ok) {
-    // fallback: bash /dev/tcp
-    const r = await run('bash', ['-c', `timeout 2 bash -c 'echo >/dev/tcp/127.0.0.1/${p}' 2>/dev/null`], {
-      timeout: 5000,
-    });
-    return r.ok;
+  const ss = await run('ss', ['-lntu']);
+  if (ss.ok) {
+    const re = new RegExp(':' + p + '(?:\\s|$)', 'm');
+    if (re.test(ss.stdout || '')) return true;
   }
-  const re = new RegExp(`:${p}\\s`);
-  return re.test(ss.stdout || '');
+  const r = await run(
+    'bash',
+    ['-c', `timeout 1 bash -c 'echo >/dev/tcp/127.0.0.1/${p}' >/dev/null 2>&1`],
+    { timeout: 3000 }
+  );
+  return Boolean(r.ok);
+}
+
+/** mita reload 后端口可能延迟就绪，轮询数秒 */
+async function portIsListening(port, opts = {}) {
+  const tries = opts.tries != null ? opts.tries : 8;
+  const delayMs = opts.delayMs != null ? opts.delayMs : 400;
+  for (let i = 0; i < tries; i++) {
+    if (await portIsListeningOnce(port)) return true;
+    if (i + 1 < tries) await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return false;
 }
 
 async function installOrReconfigure(bundle) {
@@ -787,16 +799,17 @@ async function installOrReconfigure(bundle) {
         mtu: Number(s.mtu) || 1400,
       };
     }
-    // 强制覆盖端口：防止面板/旧 bundle 端口与 node 不一致时 mita 仍停在 7901
-    const bindProto =
-      protocol === 'UDP' || protocol === 'BOTH' || protocol === 'UDP_ONLY' ? protocol : 'TCP';
-    if (bindProto === 'BOTH') {
+    // 强制覆盖端口：BOTH 与分享链一致 TCP:base + UDP:base+1
+    const p = String(protocol || 'TCP').toUpperCase();
+    if (p === 'BOTH') {
       cfg.portBindings = [
         { port, protocol: 'TCP' },
-        { port, protocol: 'UDP' },
+        { port: port + 1, protocol: 'UDP' },
       ];
+    } else if (p === 'UDP' || p === 'UDP_ONLY') {
+      cfg.portBindings = [{ port, protocol: 'UDP' }];
     } else {
-      cfg.portBindings = [{ port, protocol: bindProto === 'UDP' ? 'UDP' : 'TCP' }];
+      cfg.portBindings = [{ port, protocol: 'TCP' }];
     }
     if (Array.isArray(cfg.users)) {
       cfg.users = cfg.users.filter(
@@ -971,20 +984,22 @@ async function installOrReconfigure(bundle) {
 
 async function openFirewall(port, protocol) {
   const p = Number(port) || 7901;
-  const proto = String(protocol || 'TCP').toLowerCase();
-  await runShell(`ufw allow ${p}/${proto} 2>/dev/null || true`);
-  await runShell(
-    `firewall-cmd --permanent --add-port=${p}/${proto} 2>/dev/null && firewall-cmd --reload 2>/dev/null || true`
-  );
-  if (proto === 'tcp' || proto === 'both') {
-    await runShell(
-      `iptables -C INPUT -p tcp --dport ${p} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${p} -j ACCEPT 2>/dev/null || true`
-    );
+  const proto = String(protocol || 'TCP').toUpperCase();
+  const rules = [];
+  if (proto === 'BOTH') {
+    rules.push(['tcp', p], ['udp', p + 1]);
+  } else if (proto === 'UDP' || proto === 'UDP_ONLY') {
+    rules.push(['udp', p]);
+  } else {
+    rules.push(['tcp', p]);
   }
-  if (proto === 'udp' || proto === 'both') {
-    const up = proto === 'both' ? p + 1 : p;
+  for (const [pr, pt] of rules) {
+    await runShell(`ufw allow ${pt}/${pr} 2>/dev/null || true`);
     await runShell(
-      `iptables -C INPUT -p udp --dport ${up} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${up} -j ACCEPT 2>/dev/null || true`
+      `firewall-cmd --permanent --add-port=${pt}/${pr} 2>/dev/null && firewall-cmd --reload 2>/dev/null || true`
+    );
+    await runShell(
+      `iptables -C INPUT -p ${pr} --dport ${pt} -j ACCEPT 2>/dev/null || iptables -I INPUT -p ${pr} --dport ${pt} -j ACCEPT 2>/dev/null || true`
     );
   }
 }
@@ -1008,8 +1023,8 @@ async function collectStatus() {
 
   const ss = await run('ss', ['-lntu']);
   if (ss.ok && local.listenPort) {
-    const re = new RegExp(`:${local.listenPort}\\s`);
-    mita.listening = re.test(ss.stdout);
+    const re = new RegExp(':' + local.listenPort + '(?:\\s|$)', 'm');
+    mita.listening = re.test(ss.stdout || '');
   }
 
   let usage = local.lastUsage || null;
@@ -1159,11 +1174,20 @@ async function main() {
     console.warn('[agent] 预拉脚本失败（首次落地时再试）:', err.message);
   }
 
+  // 禁止重叠 tick：apply 可跑数分钟，并发 tick 会中途 self-update 或二次 lease
+  let tickBusy = false;
   const loop = async () => {
+    if (tickBusy) {
+      console.log('[agent] 上一轮仍在执行，跳过本轮心跳');
+      return;
+    }
+    tickBusy = true;
     try {
       await tick();
     } catch (err) {
       console.error('[agent] 轮询错误:', err.message);
+    } finally {
+      tickBusy = false;
     }
   };
   await loop();

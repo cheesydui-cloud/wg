@@ -1058,7 +1058,7 @@ function diagnoseTopology(state, opts = {}) {
     id: 'test_hint',
     level: 'info',
     title: '如何测通',
-    detail: `本机客户端：NB.JP 用 ${ep || '前置'}:${port}；其它落地用各自端口（当前 ${portList || port}）。IX: nft list table ip mieru_ix_forward；家宽: ss -lntp | grep -E '7901|7902'`,
+    detail: `本机客户端：默认 ${ep || '前置'}:${port}；其它落地用各自端口（当前 ${portList || port}）。IX: nft list table ip mieru_ix_forward；家宽: ss -lntp | grep -E '${String(portList || port).replace(/\//g, '|')}'`,
   });
 
   const errors = items.filter((i) => i.level === 'error').length;

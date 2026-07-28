@@ -133,17 +133,20 @@ function enrichNodePublic(node) {
   const pub = nodes.publicNode(node, { hasher: hasher(), userCount });
   const jobs = node.jobs || [];
   const latest = jobs[0] || null;
+  const jobOk = latest ? latest.status === 'done' : null;
   pub.latestJob = latest
     ? {
         id: latest.id,
         type: latest.type,
         status: latest.status,
-        message: latest.result?.message || '',
+        message: sanitizeAgentMessage(latest.result?.message || '', jobOk),
         createdAt: latest.createdAt,
         finishedAt: latest.finishedAt,
       }
     : null;
   pub.isPrimary = state.primaryNodeId === node.id;
+  pub.agentOutdated = isAgentOutdated(node.agentVersion);
+  pub.panelVersion = panelVersion();
   try {
     topology.ensureTopology(state);
     const L = topology.getLandingByNodeId(state, node.id);
@@ -335,6 +338,47 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
+
+/** 旧 Agent(≤4.0) 成功文案误导，面板展示时改写 */
+function sanitizeAgentMessage(msg, ok) {
+  const s = String(msg || '').trim();
+  if (!s) return s;
+  if (/脚本异常.*mita apply.*回退成功|已用 mita apply 回退成功/.test(s)) {
+    return ok !== false
+      ? '落地/应用成功 · mita 已更新（旧 Agent 文案已纠正；请升级 Agent 到面板同版本）'
+      : s;
+  }
+  if (/脚本异常/.test(s) && ok) {
+    return `任务成功 · ${s.replace(/脚本异常[，,]?\s*/g, '')}`;
+  }
+  return s;
+}
+
+function panelVersion() {
+  try {
+    return require(path.join(ROOT, 'package.json')).version;
+  } catch {
+    return '';
+  }
+}
+
+function isAgentOutdated(agentVer) {
+  const parse = (v) => {
+    const m = String(v || '')
+      .replace(/^v/i, '')
+      .match(/^(\d+)\.(\d+)\.(\d+)/);
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+  };
+  const a = parse(agentVer);
+  const b = parse(panelVersion());
+  if (!a || !b) return Boolean(agentVer) === false ? true : false;
+  for (let i = 0; i < 3; i++) {
+    if (a[i] < b[i]) return true;
+    if (a[i] > b[i]) return false;
+  }
+  return false;
+}
+
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 app.use(cookieParser());
@@ -344,8 +388,13 @@ app.use(express.static(path.join(ROOT, 'public')));
 app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
-    version: require(path.join(ROOT, 'package.json')).version,
+    version: panelVersion(),
     protocol: 'mieru',
+    outdatedAgents: loggedIn
+      ? (modeInfo.nodes || [])
+          .filter((n) => n.agentOutdated || isAgentOutdated(n.agentVersion))
+          .map((n) => ({ id: n.id, name: n.name, agentVersion: n.agentVersion || '' }))
+      : undefined,
     profile: state.topology?.profile || 'cm-ix-home',
     path: 'client → merchant-ix-ingress → IX → home mita',
     multiLanding: true,
@@ -1415,6 +1464,8 @@ app.post('/api/agent/heartbeat', (req, res) => {
     ok: true,
     jobs: pending.map((j) => ({ id: j.id, type: j.type, payload: j.payload || {} })),
     protocol: 'mieru',
+    panelVersion: panelVersion(),
+    agentOutdated: isAgentOutdated(node.agentVersion),
   });
 });
 
@@ -1448,7 +1499,8 @@ app.post('/api/agent/job-result', (req, res) => {
   const node = agentAuth(req, res);
   if (!node) return;
   const { jobId, ok, message, detail } = req.body || {};
-  const job = nodes.completeJob(node, jobId, { ok, message, detail });
+  const cleanMsg = sanitizeAgentMessage(message, ok);
+  const job = nodes.completeJob(node, jobId, { ok, message: cleanMsg, detail });
   if (!job) return res.status(404).json({ error: '任务不存在' });
 
   if (

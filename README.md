@@ -3,7 +3,7 @@
 中文、新手友好的 **mieru / mita 拓扑出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v4.1.4**（多落地 0 用户禁止空 apply · WG 历史横幅可关闭 · Agent 对齐）
+当前版本：**v4.1.5**（纠正「脚本异常…回退」旧文案 · Agent 过旧告警 · 新 Agent 可自更新）
 
 - 每台 IX 独立商家前置（IP/域名）与端口段
 - 拓扑 = IX 工作台；落地列表点开详情；客户端按落地分组
@@ -31,6 +31,11 @@
 | **兼容 v3.1** | 单前置 / 单 IX / 单落地自动迁成一条路由，Endpoint 保留 |
 
 路径保持不变。业务流量不经面板。
+
+### v4.1.5
+- 面板消毒旧 Agent 的「脚本异常，已用 mita apply 回退成功」误导 toast（任务实际已成功）
+- 落地页 / 顶栏提示 Agent 版本过旧；heartbeat 下发 panelVersion
+- Agent ≥4.1.5 可从面板自动拉新并重启；**更旧版本请重装一次安装命令**
 
 ### v4.1.4
 - 落地 0 绑定用户时禁止 apply / 一键落地，直接提示先改绑
@@ -100,7 +105,7 @@ sudo bash install.sh --update
 # 新装：sudo bash install.sh
 ```
 
-打开 `http://面板IP:51821`，确认版本 **v4.1.4**。
+打开 `http://面板IP:51821`，确认版本 **v4.1.5**。
 
 忘记密码：
 
@@ -198,7 +203,7 @@ sudo bash install.sh --update
 - **2.x → 4.0**：补拓扑 + 多落地字段  
 - **1.x → 4.0**：WG 归档；重装 Agent；新建 mieru 用户  
 
-升级前建议备份 `data/state.json`。落地机建议再执行一次 Agent 安装命令以对齐 **agent v4.1.4**（用量/配额）。
+升级前建议备份 `data/state.json`。落地机建议再执行一次 Agent 安装命令以对齐 **agent v4.1.5**（用量/配额）。
 
 本地回归：
 

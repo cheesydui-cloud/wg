@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Edge Agent v4.1.4 — mieru / mita 落地（支持多落地 + 流量/套餐）
+ * Edge Agent v4.1.5 — mieru / mita 落地（支持多落地 + 流量/套餐）
  * 连接中心面板，拉取任务：安装/应用 mita、上报状态与用量
  *
  * 环境变量：
@@ -19,7 +19,7 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
-const VERSION = '4.1.4';
+const VERSION = '4.1.5';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';
@@ -39,6 +39,110 @@ if (require.main === module && process.argv.includes('--self-test-usage')) {
 function ensureDir(d) {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true, mode: 0o700 });
 }
+
+function parseSemver(v) {
+  const m = String(v || '')
+    .trim()
+    .replace(/^v/i, '')
+    .match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+/** a < b → -1; equal → 0; a > b → 1 */
+function cmpSemver(a, b) {
+  const aa = parseSemver(a);
+  const bb = parseSemver(b);
+  if (!aa || !bb) return 0;
+  for (let i = 0; i < 3; i++) {
+    if (aa[i] < bb[i]) return -1;
+    if (aa[i] > bb[i]) return 1;
+  }
+  return 0;
+}
+
+let _lastSelfUpdateAt = 0;
+const SELF_UPDATE_COOLDOWN_MS = 10 * 60 * 1000;
+
+/**
+ * 若面板版本更高，从 /api/agent/download 拉新 index.js 并退出由 systemd 拉起
+ * heartbeat 可返回 panelVersion
+ */
+async function maybeSelfUpdate(panelVersion) {
+  if (!panelVersion || cmpSemver(VERSION, panelVersion) >= 0) return false;
+  if (Date.now() - _lastSelfUpdateAt < SELF_UPDATE_COOLDOWN_MS) return false;
+  _lastSelfUpdateAt = Date.now();
+  const selfPath = process.argv[1] ? path.resolve(process.argv[1]) : '';
+  if (!selfPath || !fs.existsSync(selfPath)) {
+    console.warn('[agent] 无法定位自身路径，跳过自更新');
+    return false;
+  }
+  console.log(`[agent] 面板要求 agent ${panelVersion}（当前 ${VERSION}），开始自更新…`);
+  try {
+    const body = await requestRaw('GET', '/api/agent/download');
+    const text = typeof body === 'string' ? body : String(body || '');
+    if (!text.includes('Edge Agent') && !text.includes('installOrReconfigure')) {
+      console.warn('[agent] 下载内容不像 agent，跳过');
+      return false;
+    }
+    if (!text.includes(`VERSION`) && !/const VERSION\s*=/.test(text)) {
+      console.warn('[agent] 下载内容缺少 VERSION，跳过');
+      return false;
+    }
+    const bak = selfPath + '.bak';
+    try {
+      fs.copyFileSync(selfPath, bak);
+    } catch {
+      /* */
+    }
+    fs.writeFileSync(selfPath, text, { mode: 0o755 });
+    console.log(`[agent] 已写入 ${selfPath}，即将退出由 systemd 重启（目标 ${panelVersion}）`);
+    // 给上报一点时间
+    setTimeout(() => process.exit(0), 500);
+    return true;
+  } catch (e) {
+    console.warn('[agent] 自更新失败:', e.message);
+    return false;
+  }
+}
+
+function requestRaw(method, apiPath) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(PANEL_URL + apiPath);
+    const lib = u.protocol === 'https:' ? https : http;
+    const req = lib.request(
+      {
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + u.search,
+        method,
+        headers: {
+          Authorization: `Bearer ${TOKEN}`,
+          'User-Agent': `edge-agent/${VERSION}`,
+        },
+        timeout: 120000,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          if (res.statusCode >= 400) {
+            return reject(new Error(`HTTP ${res.statusCode}: ${raw.slice(0, 200)}`));
+          }
+          resolve(raw);
+        });
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('请求超时'));
+    });
+    req.end();
+  });
+}
+
 
 function loadLocalState() {
   try {
@@ -892,6 +996,10 @@ async function tick() {
     status,
   };
   const res = await request('POST', '/api/agent/heartbeat', body);
+  // 面板版本更高时自动拉新 agent（systemd Restart=always）
+  if (res.panelVersion && (await maybeSelfUpdate(res.panelVersion))) {
+    return;
+  }
   const jobs = res.jobs || [];
   for (const job of jobs) {
     let result;

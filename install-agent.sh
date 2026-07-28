@@ -70,7 +70,7 @@ chmod 755 "${APP_DIR}/index.js"
 cat > "${APP_DIR}/package.json" <<EOF
 {
   "name": "wg-agent",
-  "version": "4.1.2",
+  "version": "4.1.5",
   "private": true,
   "main": "index.js"
 }

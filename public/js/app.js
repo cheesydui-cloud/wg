@@ -202,6 +202,24 @@ function topAlerts() {
       <button class="btn btn-sm btn-primary" data-nav-jump="topology">去拓扑</button>
     </div>`);
   }
+  const outdated = (state.nodes || []).filter(
+    (n) => n.online && (n.agentOutdated || (state.status?.outdatedAgents || []).some((x) => x.id === n.id))
+  );
+  // also from status list if nodes not yet enriched
+  const outdatedFromStatus = (state.status?.outdatedAgents || []).filter((x) =>
+    (state.nodes || []).some((n) => n.id === x.id && n.online)
+  );
+  if (isAgentMode() && (outdated.length || outdatedFromStatus.length)) {
+    const names = outdated.length
+      ? outdated.map((n) => `${n.name}(v${n.agentVersion || '?'})`).join('、')
+      : outdatedFromStatus.map((n) => `${n.name}(v${n.agentVersion || '?'})`).join('、');
+    parts.push(`<div class="alert warn">
+      <div><strong>落地 Agent 版本过旧</strong> · ${esc(names)} · 面板 v${esc(
+      state.status?.version || ''
+    )} · 会出现「脚本异常…回退」等旧文案。请点落地页「安装命令」重装，或等 Agent 自动更新后重启</div>
+      <button class="btn btn-sm btn-primary" data-nav-jump="server">去落地</button>
+    </div>`);
+  }
   const offlineNodes = (state.nodes || []).filter((n) => !n.online);
   if (isAgentMode() && offlineNodes.length) {
     parts.push(`<div class="alert warn">
@@ -1377,6 +1395,7 @@ async function renderServer() {
               ${n.isPrimary ? '<span class="badge ok">默认</span>' : ''}
               ${n.online ? '<span class="badge ok">在线</span>' : '<span class="badge warn">离线</span>'}
               ${n.dirty ? '<span class="badge warn">未应用</span>' : ''}
+              ${n.agentOutdated ? '<span class="badge warn" title="请重装 Agent 对齐面板版本">Agent 过旧</span>' : ''}
             </div>
             <div class="landing-row-meta">
               <span>mita <span class="mono">${esc(n.mita?.status || '-')}</span></span>
@@ -1387,7 +1406,9 @@ async function renderServer() {
             </div>
           </div>
           <div class="landing-row-body">
-            <div class="kv"><span>主机 / Agent</span><span class="mono">${esc(n.hostname || '-')} · v${esc(n.agentVersion || '-')}</span></div>
+            <div class="kv"><span>主机 / Agent</span><span class="mono">${esc(n.hostname || '-')} · v${esc(
+              n.agentVersion || '-'
+            )}${n.agentOutdated ? ' ⚠ 请点下方「安装命令」重装到 v' + esc(n.panelVersion || state.status?.version || '') : ''}</span></div>
             <div class="kv"><span>出网 IP</span><span class="mono">${esc(n.exitPublicIp || '-')}</span></div>
             <div class="inline-fields" style="margin-top:10px">
               <div>
@@ -2238,8 +2259,13 @@ function startJobPoll(nodeId) {
       const pending = job && (job.status === 'pending' || job.status === 'running');
       if (!pending || n >= 45) {
         stopJobPoll();
-        if (job?.status === 'done') toast(job.message || '任务完成', 'ok');
-        else if (job?.status === 'error' || job?.status === 'failed')
+        if (job?.status === 'done') {
+          let m = job.message || '任务完成';
+          if (/脚本异常.*回退成功/.test(m)) {
+            m = '落地/应用成功 · mita 已更新（请升级落地 Agent，避免旧提示）';
+          }
+          toast(m, 'ok');
+        } else if (job?.status === 'error' || job?.status === 'failed')
           toast(job.message || '任务失败', 'err');
         render();
       } else if (n % 2 === 0) {

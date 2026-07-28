@@ -1,12 +1,13 @@
 /**
- * 商家移动入口场景拓扑（v3）
+ * 商家 IX 前置场景拓扑（v3）
  *
- * 手机 → 移动入口(211) / 外部(114)
- *      → 沪日 IX 172.16.2.79
- *      → TCP 转发 → 美国家宽 mita
- *      → 出网 家宽 IP
+ * 电脑/客户端 → 商家 IX 前置入口(211 移动宽带 / 114 外部)
+ *             → 沪日 IX 172.16.2.79
+ *             → TCP 转发 → 落地家宽 mita
+ *             → 出网 家宽 IP
  *
  * 面板只管理，不在业务链上。
+ * 「移动入口」= 商家提供的移动宽带前置，不是手机。
  */
 
 const CM_DEFAULTS = {
@@ -17,22 +18,22 @@ const CM_DEFAULTS = {
   portMin: 7900,
   portMax: 7999,
   defaultPort: 7901,
-  provinceHint: '河南省',
+  provinceHint: '商家白名单省份（如有）',
 };
 
 function defaultTopology() {
   return {
-    profile: 'cm-ix-home', // 商家移动入口 → 沪日IX → 美国家宽
+    profile: 'cm-ix-home', // 客户端 → 商家IX前置 → 沪日IX → 落地家宽
     ingress: {
-      // 手机连接地址：优先移动入口（河南白名单友好）
-      active: 'mobile', // mobile | external | custom
+      // 客户端连接的商家前置地址（不是出网 IP、不是面板 IP）
+      active: 'external', // mobile | external | custom — 默认外部 114，可改移动宽带 211
       mobileHost: CM_DEFAULTS.mobileIngress,
       externalHost: CM_DEFAULTS.externalIngress,
       customHost: '',
       port: CM_DEFAULTS.defaultPort,
       protocol: 'TCP',
       provinceWhitelist: CM_DEFAULTS.provinceHint,
-      note: '商家移动入口有省份白名单；请用河南移动测，美国 VPS nc 超时不算失败',
+      note: '商家 IX 前置入口；电脑连这里。美国无关 VPS nc 超时可能因白名单，不算落地失败',
     },
     ix: {
       name: '沪日IX',
@@ -44,11 +45,11 @@ function defaultTopology() {
       homeReachableHost: '',
       homeReachablePort: CM_DEFAULTS.defaultPort,
       forwardConfigured: false,
-      note: '商家入口流量先到本机内网，再转发到家宽 mita',
+      note: '商家前置流量先到本机内网，再 TCP 转发到落地家宽 mita',
     },
     landing: {
       role: 'us-home', // us-home | ix-local
-      name: '美国家宽',
+      name: '落地家宽',
       note: 'Agent + mita 装在这里；出网 IP 应为家宽',
     },
     panel: {
@@ -149,9 +150,9 @@ function buildIxForwardScript(state) {
 
   const script = [
     '#!/usr/bin/env bash',
-    '# 沪日 IX → 美国家宽 TCP 转发（商家移动入口场景）',
+    '# 沪日 IX → 落地家宽 TCP 转发（商家 IX 前置场景）',
     `# 在 IX 本机 root 执行（内网 ${lanIp}）`,
-    `# 手机连 211/114:${listenPort} → 本机 → ${homeHost}:${homePort}`,
+    `# 电脑 → 商家前置 211/114:${listenPort} → 本机 → ${homeHost}:${homePort}`,
     'set -euo pipefail',
     `HOME_HOST=${JSON.stringify(homeHost)}`,
     `HOME_PORT=${homePort}`,
@@ -203,9 +204,9 @@ function buildIxForwardScript(state) {
     '',
     'echo "============================================"',
     'echo " 转发: :${LISTEN_PORT} → ${HOME_HOST}:${HOME_PORT}"',
-    'echo " 手机连: 211.136.162.184:${LISTEN_PORT} （河南移动优先）"',
-    'echo " 或: 114.111.176.37:${LISTEN_PORT}"',
-    'echo " 美国 VPS nc 超时可忽略（省份白名单）"',
+    'echo " 客户端连商家前置: 114.111.176.37:${LISTEN_PORT} 或 211.136.162.184:${LISTEN_PORT}"',
+    'echo " 路径: 电脑 → 商家IX前置 → 本IX → 落地家宽 mita"',
+    'echo " 无关 VPS nc 超时可能因白名单，请用你本机经商家前置测"',
     'echo "============================================"',
     '',
   ].join('\n');
@@ -228,7 +229,7 @@ function publicTopology(state) {
   const fwd = buildIxForwardScript(state);
   return {
     profile: t.profile,
-    pathLabel: '商家移动入口 → 沪日IX → 美国家宽 mita',
+    pathLabel: '电脑/客户端 → 商家IX前置 → 沪日IX → 落地家宽 mita',
     ingress: { ...t.ingress },
     ix: { ...t.ix },
     landing: { ...t.landing },
@@ -311,7 +312,7 @@ function diagnoseTopology(state, opts = {}) {
     id: 'topo_path',
     level: 'info',
     title: '拓扑路径',
-    detail: '手机 → 商家移动入口(211/114) → 沪日IX → 美国家宽 mita → 出网',
+    detail: '电脑/客户端 → 商家IX前置(211/114) → 沪日IX → 落地家宽 mita → 出网',
   });
 
   push({
@@ -321,20 +322,20 @@ function diagnoseTopology(state, opts = {}) {
     detail: '独立 VPS 只管理，不在业务链上',
   });
 
-  // 入站
+  // 入站 = 商家 IX 前置
   const inRange = portInMerchantRange(port);
   push({
     id: 'ingress',
     level: ep && inRange ? 'ok' : 'error',
-    title: '商家入站（手机连接地址）',
+    title: '商家 IX 前置入口（客户端连接地址）',
     detail: ep
-      ? `${ep} · 当前=${t.ingress.active} · 白名单=${t.ingress.provinceWhitelist || '—'}`
-      : '未配置入站',
+      ? `${ep} · 当前=${t.ingress.active} · ${t.ingress.provinceWhitelist || '—'}`
+      : '未配置前置入口',
     fix: !ep
-      ? '在拓扑页选择移动入口 211 或外部 114'
+      ? '在拓扑页选择外部 114 或移动宽带前置 211'
       : !inRange
         ? `端口须在商家段 ${CM_DEFAULTS.portMin}-${CM_DEFAULTS.portMax}（勿用 51820 等）`
-        : '用河南移动测；美国 VPS nc 超时可忽略',
+        : '用你本机经商家前置测；无关 VPS nc 超时可忽略',
   });
 
   // IX
@@ -354,10 +355,10 @@ function diagnoseTopology(state, opts = {}) {
   push({
     id: 'ix_forward',
     level: t.ix.forwardConfigured && home ? 'ok' : 'error',
-    title: 'IX → 家宽 TCP 转发',
+    title: 'IX → 落地家宽 TCP 转发',
     detail: t.ix.forwardConfigured
       ? `已标记配置 · :${port} → ${home}:${t.ix.homeReachablePort || port}`
-      : '未配置：商家入口流量到不了家宽 mita',
+      : '未配置：商家前置流量到不了落地家宽 mita',
     fix: t.ix.forwardConfigured
       ? ''
       : '拓扑页复制「IX 转发脚本」在沪日机 root 执行，再勾选已配置',
@@ -368,11 +369,11 @@ function diagnoseTopology(state, opts = {}) {
     push({
       id: 'landing_agent',
       level: agentOnline ? 'ok' : 'error',
-      title: '美国家宽 Agent',
+      title: '落地家宽 Agent',
       detail: agentOnline
         ? `在线${opts.hostname ? ' · ' + opts.hostname : ''}`
         : '离线：无法安装/更新 mita',
-      fix: agentOnline ? '' : '在家宽执行面板安装命令',
+      fix: agentOnline ? '' : '在落地家宽执行面板安装命令',
     });
   }
 
@@ -381,7 +382,7 @@ function diagnoseTopology(state, opts = {}) {
   push({
     id: 'landing_mita',
     level: running ? 'ok' : 'error',
-    title: '家宽 mita',
+    title: '落地家宽 mita',
     detail: running
       ? `RUNNING${mita.listening ? ' · 端口在听' : ''}`
       : report
@@ -402,8 +403,8 @@ function diagnoseTopology(state, opts = {}) {
       title: '出网 IP（只读）',
       detail: egress,
       fix: sameAsIngress
-        ? '出网 IP 不应等于入站 IP；检查是否指错机器'
-        : '手机连上后 ifconfig.me 应接近此 IP（家宽）',
+        ? '出网 IP 不应等于前置入口 IP；检查是否指错机器'
+        : '客户端连上后 ifconfig.me 应接近此 IP（家宽）',
     });
   }
 
@@ -411,7 +412,7 @@ function diagnoseTopology(state, opts = {}) {
     id: 'test_hint',
     level: 'info',
     title: '如何测通',
-    detail: `河南移动手机连 ${ep || '211.x:7901'}；IX/家宽 tcpdump -ni any tcp port ${port}`,
+    detail: `本机客户端连商家前置 ${ep || '114.x:7901'}；IX/家宽 tcpdump -ni any tcp port ${port}`,
   });
 
   const errors = items.filter((i) => i.level === 'error').length;
@@ -420,7 +421,7 @@ function diagnoseTopology(state, opts = {}) {
   if (errors) summary = `拓扑有 ${errors} 项必须处理（常见：IX 未转发）`;
   else if (warns) summary = `拓扑有 ${warns} 个警告`;
   if (running && t.ix.forwardConfigured && ep) {
-    summary = '链路配置齐全；请用河南移动手机测 mierus 连接';
+    summary = '链路配置齐全；用本机客户端连商家 IX 前置测 mierus';
   }
 
   return {

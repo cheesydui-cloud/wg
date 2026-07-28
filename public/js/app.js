@@ -119,7 +119,7 @@ function isAgentMode() {
 function exitLabel() {
   if (isAgentMode()) {
     const n = state.primaryNode || state.status?.primaryNode;
-    return `美国家宽 · ${n?.name || '落地机'}${n?.online ? ' · 在线' : ' · 离线'}`;
+    return `落地家宽 · ${n?.name || '落地机'}${n?.online ? ' · 在线' : ' · 离线'}`;
   }
   return '本机出口';
 }
@@ -134,7 +134,7 @@ function activeEp() {
 }
 
 function pathLabel() {
-  return topo().pathLabel || '商家移动入口 → 沪日IX → 美国家宽 mita';
+  return topo().pathLabel || '电脑/客户端 → 商家IX前置 → 沪日IX → 落地家宽 mita';
 }
 
 function topAlerts() {
@@ -159,7 +159,7 @@ function topAlerts() {
   }
   if (isAgentMode() && state.primaryNode && !state.primaryNode.online) {
     parts.push(`<div class="alert warn">
-      <div><strong>家宽 Agent 离线</strong> · 无法安装/更新 mita</div>
+      <div><strong>落地家宽 Agent 离线</strong> · 无法安装/更新 mita</div>
       <button class="btn btn-sm btn-primary" data-nav-jump="server">去安装</button>
     </div>`);
   }
@@ -186,7 +186,7 @@ function topAlerts() {
   }
   if (state.dirty) {
     parts.push(`<div class="alert warn">
-      <div><strong>有未应用的更改</strong> · 需下发到家宽 mita</div>
+      <div><strong>有未应用的更改</strong> · 需下发到落地家宽 mita</div>
       <div class="btn-row">
         <button class="btn btn-sm btn-ghost" id="banner-diagnose">诊断</button>
         <button class="btn btn-sm btn-success" id="banner-apply">应用配置</button>
@@ -241,7 +241,7 @@ function renderSetup() {
       <div class="auth-card">
         <div class="logo">M</div>
         <h1>初始化面板</h1>
-        <p class="muted">面板装<strong>独立 VPS</strong>只管理。<br/>路径：商家移动入口 → 沪日IX → 美国家宽 mita。</p>
+        <p class="muted">面板装<strong>独立 VPS</strong>只管理。<br/>路径：电脑 → 商家IX前置 → 沪日IX → 落地家宽 mita。</p>
         <label>用户名</label>
         <input class="field" id="su-user" value="admin" />
         <label>密码（至少 6 位）</label>
@@ -411,17 +411,17 @@ function pathBanner() {
   return `
     <div class="path-banner">
       <div class="path-flow">
-        <span class="path-node">手机</span>
+        <span class="path-node">电脑/客户端</span>
         <span class="path-arrow">→</span>
-        <span class="path-node on">商家入口<br/><small class="mono">${esc(ep || '211:7901')}</small></span>
+        <span class="path-node on">商家IX前置<br/><small class="mono">${esc(ep || '114:7901')}</small></span>
         <span class="path-arrow">→</span>
         <span class="path-node ${fwdOk ? 'on' : 'warn'}">沪日IX<br/><small>${fwdOk ? '转发已配' : '待转发'}</small></span>
         <span class="path-arrow">→</span>
-        <span class="path-node ${state.primaryNode?.online ? 'on' : ''}">美国家宽<br/><small>mita</small></span>
+        <span class="path-node ${state.primaryNode?.online ? 'on' : ''}">落地家宽<br/><small>mita</small></span>
         <span class="path-arrow">→</span>
         <span class="path-node">出网</span>
       </div>
-      <p class="field-hint" style="margin:8px 0 0">面板只管理，不在业务链上。端口须在 ${esc(t.merchantPortRange || '7900-7999')}；用<strong>河南移动</strong>测。</p>
+      <p class="field-hint" style="margin:8px 0 0">面板只管理，不在业务链上。端口须在 ${esc(t.merchantPortRange || '7900-7999')}。「移动入口」= 商家移动宽带前置，不是手机。</p>
     </div>`;
 }
 
@@ -434,7 +434,7 @@ function renderWizard() {
   app.innerHTML = shell(`
     <div class="page-header">
       <div>
-        <h2>新手引导 · 商家移动入口</h2>
+        <h2>新手引导 · 商家 IX 前置</h2>
         <p class="muted">${esc(pathLabel())}</p>
       </div>
       <button class="btn btn-ghost" id="wiz-skip">跳过</button>
@@ -455,29 +455,31 @@ function renderWizard() {
       <h3>确认真实链路</h3>
       ${pathBanner()}
       <div class="alert info" style="margin-top:12px"><div>
-        <strong>三台机器各司其职</strong>
+        <strong>路径与角色（不要搞反）</strong>
         <ul style="margin:8px 0 0;padding-left:18px;color:var(--text-2)">
-          <li><strong>面板</strong>：独立 VPS，只管理（你现在打开的就是）</li>
-          <li><strong>沪日 IX</strong>：商家入口流量先到这里，做 TCP 转发到家宽</li>
-          <li><strong>美国家宽</strong>：装 Agent + mita，真正出网</li>
+          <li><strong>你的电脑</strong>：跑 mieru 客户端，连商家前置 Endpoint</li>
+          <li><strong>商家 IX 前置</strong>：114/211 入口（移动宽带前置 ≠ 手机）</li>
+          <li><strong>沪日 IX</strong>：前置流量先到这里，TCP 转发到家宽</li>
+          <li><strong>落地家宽</strong>：装 Agent + mita，真正出网</li>
+          <li><strong>面板</strong>：独立 VPS，只管理</li>
         </ul>
       </div></div>
-      <p class="field-hint">不是 WireGuard。协议 <strong>mieru TCP</strong>。美国 VPS <code>nc 114:7901</code> 超时<strong>不算失败</strong>（省份白名单）。</p>
+      <p class="field-hint">不是 WireGuard。协议 <strong>mieru TCP</strong>。用你本机经商家前置测；无关 VPS <code>nc</code> 超时可忽略。</p>
       <div class="btn-row" style="margin-top:16px">
-        <button class="btn btn-primary" id="w-next">下一步：装家宽 Agent</button>
+        <button class="btn btn-primary" id="w-next">下一步：装落地家宽 Agent</button>
       </div>`;
     document.getElementById('w-next').onclick = async () => {
       try {
         const res = await api('/api/mode', {
           method: 'POST',
-          body: { mode: 'agent', template: 'cm', name: '美国家宽' },
+          body: { mode: 'agent', template: 'cm', name: '落地家宽' },
         });
         state.mode = 'agent';
         state.primaryNode = res.primaryNode;
         state.installCommand = res.installCommand;
         if (res.server) state.server = res.server;
         state.wizardStep = 2;
-        toast(res.message || '已选远程家宽');
+        toast(res.message || '已选远程落地家宽');
         render();
       } catch (e) {
         toast(e.message, 'err');
@@ -485,9 +487,9 @@ function renderWizard() {
     };
   } else if (step === 2) {
     body.innerHTML = `
-      <h3>在美国家宽 root 安装 Agent</h3>
+      <h3>在落地家宽 root 安装 Agent</h3>
       <div class="alert info"><div>
-        <strong>在家宽执行（不是 IX，不是面板）：</strong>
+        <strong>在落地家宽执行（不是 IX，不是面板）：</strong>
         <pre class="code-block" id="wiz-cmd">${esc(state.installCommand || '加载中…')}</pre>
         <div class="btn-row" style="margin-top:8px">
           <button class="btn btn-sm btn-primary" id="wiz-copy">复制安装命令</button>
@@ -541,16 +543,16 @@ function renderWizard() {
     };
   } else if (step === 3) {
     body.innerHTML = `
-      <h3>商家入口 + 沪日 IX 转发</h3>
-      <label>手机连接入口（优先移动 211）</label>
+      <h3>商家 IX 前置 + 沪日转发</h3>
+      <label>客户端连接的商家前置（不是手机）</label>
       <div class="choice-grid" style="margin-bottom:12px">
-        <button type="button" class="choice-card ${ing.active === 'mobile' || !ing.active ? 'selected' : ''}" data-act="mobile">
-          <strong>移动入口 211</strong>
-          <span class="mono">${esc(ing.mobileHost || '211.136.162.184')}</span>
-        </button>
-        <button type="button" class="choice-card ${ing.active === 'external' ? 'selected' : ''}" data-act="external">
-          <strong>外部入口 114</strong>
+        <button type="button" class="choice-card ${ing.active === 'external' || !ing.active ? 'selected' : ''}" data-act="external">
+          <strong>外部前置 114</strong>
           <span class="mono">${esc(ing.externalHost || '114.111.176.37')}</span>
+        </button>
+        <button type="button" class="choice-card ${ing.active === 'mobile' ? 'selected' : ''}" data-act="mobile">
+          <strong>移动宽带前置 211</strong>
+          <span class="mono">${esc(ing.mobileHost || '211.136.162.184')}</span>
         </button>
       </div>
       <div class="inline-fields">
@@ -574,7 +576,7 @@ function renderWizard() {
         <button class="btn btn-ghost" id="w-back">上一步</button>
         <button class="btn btn-primary" id="w-next">保存并下一步</button>
       </div>`;
-    let active = ing.active || 'mobile';
+    let active = ing.active || 'external';
     document.querySelectorAll('[data-act]').forEach((b) => {
       b.onclick = () => {
         active = b.dataset.act;
@@ -614,16 +616,16 @@ function renderWizard() {
   } else {
     body.innerHTML = `
       <h3>创建客户端用户</h3>
-      <p class="muted">登录名须英文/数字（如 u7af760）。中文写备注。小火箭「用户」栏填登录名，不要填「我的手机」。</p>
+      <p class="muted">登录名须英文/数字（如 u7af760）。中文写备注。客户端「用户」栏填登录名，不要填中文备注。</p>
       <label>登录用户名（可空自动生成）</label>
       <input class="field mono" id="w-user" placeholder="留空自动" />
       <label>备注（可选）</label>
-      <input class="field" id="w-note" placeholder="例如：我的手机" />
+      <input class="field" id="w-note" placeholder="例如：我的电脑" />
       <div class="btn-row" style="margin-top:16px">
         <button class="btn btn-ghost" id="w-back">上一步</button>
         <button class="btn btn-primary" id="w-finish">创建并完成</button>
       </div>
-      <p class="field-hint" style="margin-top:12px">完成后：① 家宽「一键落地」② IX 跑转发脚本 ③ 河南手机扫 211 链接</p>`;
+      <p class="field-hint" style="margin-top:12px">完成后：① 落地家宽「一键落地」② IX 跑转发脚本 ③ 本机客户端连商家前置 mierus</p>`;
     document.getElementById('w-back').onclick = () => {
       state.wizardStep = 3;
       render();
@@ -688,7 +690,7 @@ async function renderDashboard() {
         <div class="stat-value">${t.forward?.configured ? '已配置' : '未配置'}</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">家宽 mita</div>
+        <div class="stat-label">落地 mita</div>
         <div class="stat-value">${mita?.running ? 'RUNNING' : mita?.status || '未知'}</div>
       </div>
       <div class="stat-card">
@@ -698,12 +700,13 @@ async function renderDashboard() {
     </div>
     <div class="card" style="margin-top:16px">
       <h3>连接信息</h3>
-      <div class="kv"><span>优先入口（手机）</span><span class="mono">${esc(t.endpoints?.mobile || activeEp())}</span></div>
-      <div class="kv"><span>备用入口</span><span class="mono">${esc(t.endpoints?.external || '-')}</span></div>
+      <div class="kv"><span>商家前置（当前）</span><span class="mono">${esc(activeEp() || '-')}</span></div>
+      <div class="kv"><span>外部 114</span><span class="mono">${esc(t.endpoints?.external || '-')}</span></div>
+      <div class="kv"><span>移动宽带 211</span><span class="mono">${esc(t.endpoints?.mobile || '-')}</span></div>
       <div class="kv"><span>监听</span><span class="mono">${esc(s.protocol || 'TCP')} ${esc(s.listenPort || 7901)}</span></div>
       <div class="kv"><span>出网 IP（只读）</span><span class="mono">${esc(ov.exitPublicIp || state.primaryNode?.exitPublicIp || '-')}</span></div>
       <div class="kv"><span>最近应用</span><span>${esc(fmtTime(state.lastAppliedAt))}</span></div>
-      <p class="field-hint">路径：手机 mieru → 商家入口(TCP) → 沪日IX 转发 → 家宽 mita → 外网。</p>
+      <p class="field-hint">路径：电脑 mieru → 商家IX前置(TCP) → 沪日IX 转发 → 落地家宽 mita → 外网。</p>
     </div>
     <div class="card" style="margin-top:16px">
       <div class="card-head"><h3>客户端用户</h3>
@@ -751,7 +754,7 @@ async function renderTopology() {
     <div class="page-header">
       <div>
         <h2>拓扑</h2>
-        <p class="muted">商家移动入口 · 沪日 IX · 美国家宽</p>
+        <p class="muted">商家 IX 前置 · 沪日 IX · 落地家宽</p>
       </div>
       <div class="btn-row">
         <button class="btn btn-primary" id="topo-save">保存拓扑</button>
@@ -762,18 +765,18 @@ async function renderTopology() {
 
     <div class="card endpoint-card" style="margin-top:16px">
       <div class="card-head">
-        <h3>① 商家入站（手机连接）</h3>
+        <h3>① 商家 IX 前置（客户端连接）</h3>
         <span class="badge ${t.portInRange ? 'ok' : 'warn'}">端口段 ${esc(t.merchantPortRange || '7900-7999')}</span>
       </div>
-      <p class="field-hint">优先<strong>移动 211</strong>（河南白名单）。美国 VPS nc 超时可忽略。</p>
+      <p class="field-hint">「移动入口」= 商家<strong>移动宽带前置</strong>（211），不是你的手机。电脑客户端连这里。</p>
       <div class="choice-grid" style="margin:10px 0">
-        <button type="button" class="choice-card ${ing.active === 'mobile' || !ing.active ? 'selected' : ''}" data-act="mobile">
-          <strong>移动入口</strong>
-          <span class="mono">${esc(ing.mobileHost || '211.136.162.184')}</span>
-        </button>
-        <button type="button" class="choice-card ${ing.active === 'external' ? 'selected' : ''}" data-act="external">
-          <strong>外部入口</strong>
+        <button type="button" class="choice-card ${ing.active === 'external' || !ing.active ? 'selected' : ''}" data-act="external">
+          <strong>外部前置 114</strong>
           <span class="mono">${esc(ing.externalHost || '114.111.176.37')}</span>
+        </button>
+        <button type="button" class="choice-card ${ing.active === 'mobile' ? 'selected' : ''}" data-act="mobile">
+          <strong>移动宽带前置 211</strong>
+          <span class="mono">${esc(ing.mobileHost || '211.136.162.184')}</span>
         </button>
         <button type="button" class="choice-card ${ing.active === 'custom' ? 'selected' : ''}" data-act="custom">
           <strong>自定义</strong>
@@ -791,7 +794,7 @@ async function renderTopology() {
         </div>
         <div>
           <label>白名单提示</label>
-          <input class="field" id="t-province" value="${esc(ing.provinceWhitelist || '河南省')}" />
+          <input class="field" id="t-province" value="${esc(ing.provinceWhitelist || '商家白名单（如有）')}" />
         </div>
       </div>
       <div class="kv"><span>当前 Endpoint</span><span class="mono">${esc(activeEp())}</span></div>
@@ -832,7 +835,7 @@ async function renderTopology() {
     </div>
 
     <div class="card" style="margin-top:16px">
-      <h3>③ 美国家宽落地</h3>
+      <h3>③ 落地家宽</h3>
       <div class="kv"><span>Agent</span><span>${
         state.primaryNode?.online
           ? '<span class="badge ok">在线</span>'
@@ -850,7 +853,7 @@ async function renderTopology() {
   `);
   bindShell();
 
-  let active = ing.active || 'mobile';
+  let active = ing.active || 'external';
   document.querySelectorAll('[data-act]').forEach((b) => {
     b.onclick = () => {
       active = b.dataset.act;
@@ -945,7 +948,7 @@ async function renderServer() {
   app.innerHTML = shell(`
     <div class="page-header">
       <div>
-        <h2>落地机（美国家宽）</h2>
+        <h2>落地机（落地家宽）</h2>
         <p class="muted">Agent + mita 装在这里。入站地址请到「拓扑」配置。</p>
       </div>
       <div class="btn-row">
@@ -1027,7 +1030,7 @@ async function renderServer() {
     try {
       const res = await api('/api/mode', {
         method: 'POST',
-        body: { mode: 'agent', template: 'cm', name: '美国家宽' },
+        body: { mode: 'agent', template: 'cm', name: '落地家宽' },
       });
       state.installCommand = res.installCommand;
       toast(res.message || '已切换远程');
@@ -1124,7 +1127,7 @@ async function renderClients() {
       !activeEp()
         ? `<div class="alert warn"><div>尚未配置入站。请先到「拓扑」选择 211/114。</div>
           <button class="btn btn-sm btn-primary" data-nav-jump="topology">去拓扑</button></div>`
-        : `<div class="alert info"><div>当前 Endpoint：<code class="mono">${esc(activeEp())}</code> · 河南移动优先用 211 链接</div></div>`
+        : `<div class="alert info"><div>当前 Endpoint：<code class="mono">${esc(activeEp())}</code> · 电脑连商家 IX 前置</div></div>`
     }
     <div class="card">
       ${
@@ -1146,7 +1149,7 @@ async function renderClients() {
             )
             .join('')}
         </tbody></table>
-        <p class="field-hint" style="margin-top:10px">小火箭「用户」必须填<strong>登录用户名</strong>（如 u7af760），不能填备注「我的手机」。</p>`
+        <p class="field-hint" style="margin-top:10px">客户端「用户」必须填<strong>登录用户名</strong>（如 u7af760），不能填中文备注。</p>`
           : '<p class="muted">还没有用户，点「添加用户」</p>'
       }
     </div>
@@ -1182,13 +1185,13 @@ function openClientModal(client) {
   openModal({
     title: isEdit ? '编辑用户' : '添加用户',
     body: `
-      <label>登录用户名（小火箭「用户」栏，须英文/数字）</label>
+      <label>登录用户名（客户端「用户」栏，须英文/数字）</label>
       <input class="field mono" id="c-name" value="${esc(client?.name || '')}" placeholder="留空自动生成，如 u7af760" />
-      <p class="field-hint">不要填「我的手机」。中文名称请写备注。</p>
+      <p class="field-hint">不要填中文当登录名。显示名请写备注。</p>
       <label>密码${isEdit ? '（留空不改）' : ''}</label>
       <input class="field mono" id="c-pass" value="" placeholder="${isEdit ? '留空保持原密码' : '留空自动生成'}" />
       <label>备注 / 显示名（仅面板展示）</label>
-      <input class="field" id="c-note" value="${esc(client?.note || '')}" placeholder="例如：我的手机" />
+      <input class="field" id="c-note" value="${esc(client?.note || '')}" placeholder="例如：我的电脑" />
       ${
         isEdit
           ? `<label class="check-row"><input type="checkbox" id="c-regen" /> 重新生成密码</label>`
@@ -1243,16 +1246,16 @@ async function showClientQr(id) {
     openModal({
       title: `客户端 · ${data.name || ''}${data.note ? '（' + data.note + '）' : ''}`,
       body: `
-        <p class="field-hint center">${esc(data.tip || '河南移动优先 211')}</p>
+        <p class="field-hint center">${esc(data.tip || '电脑连商家 IX 前置 114/211')}</p>
         <div class="dual-qr">
           <div class="dual-qr-col">
-            <strong>移动入口 211（优先）</strong>
+            <strong>移动宽带前置 211</strong>
             <div class="qr-wrap"><img src="${data.qrMobile || data.qr}" alt="qr-mobile" /></div>
             <p class="mono center" style="font-size:11px;word-break:break-all">${esc(data.endpoints?.mobile || '')}</p>
             <button class="btn btn-sm btn-primary btn-block" id="qr-copy-m">复制 211 链接</button>
           </div>
           <div class="dual-qr-col">
-            <strong>外部入口 114（备用）</strong>
+            <strong>外部前置 114</strong>
             <div class="qr-wrap"><img src="${data.qrExternal || data.qr}" alt="qr-ext" /></div>
             <p class="mono center" style="font-size:11px;word-break:break-all">${esc(data.endpoints?.external || '')}</p>
             <button class="btn btn-sm btn-ghost btn-block" id="qr-copy-e">复制 114 链接</button>
@@ -1367,7 +1370,7 @@ async function renderSettings() {
     <div class="card" style="margin-top:16px">
       <h3>关于</h3>
       <p class="muted">版本 <strong>v${esc(state.status?.version || '')}</strong> · 协议 <strong>mieru / mita</strong></p>
-      <p class="field-hint">拓扑：商家移动入口 → 沪日IX → 美国家宽。面板装独立 VPS。WireGuard 在此线路不可用。</p>
+      <p class="field-hint">拓扑：电脑 → 商家IX前置 → 沪日IX → 落地家宽。面板装独立 VPS。WireGuard 在此线路不可用。</p>
       <a class="btn btn-sm btn-ghost" href="/api/export">导出 JSON</a>
     </div>
   `);
@@ -1418,7 +1421,7 @@ function startJobPoll() {
 
 async function applyConfig(confirmFirst = false) {
   if (confirmFirst) {
-    if (!confirm('将 mita 配置下发到美国家宽。继续？')) return;
+    if (!confirm('将 mita 配置下发到落地家宽。继续？')) return;
   }
   try {
     toast('正在下发…', 'warn');
@@ -1433,7 +1436,7 @@ async function applyConfig(confirmFirst = false) {
 }
 
 async function setupExit() {
-  if (!confirm('在美国家宽安装/配置 mita 并放行端口？不会改面板机/IX 网络。')) return;
+  if (!confirm('在落地家宽安装/配置 mita 并放行端口？不会改面板机/IX 网络。')) return;
   try {
     toast('正在一键落地…', 'warn');
     const res = await api('/api/exit/setup', { method: 'POST', body: {} });
@@ -1447,7 +1450,7 @@ async function setupExit() {
           <li>Agent 约 10 秒拉取任务</li>
           <li>在「拓扑」生成 IX 转发脚本并在沪日机 root 执行</li>
           <li>勾选「IX 转发已配置」</li>
-          <li>河南移动手机扫 <strong>211</strong> mierus 链接</li>
+          <li>本机客户端连商家前置 <strong>114/211</strong> mierus 链接</li>
         </ol>
         <div class="btn-row">
           <button class="btn btn-primary" id="ex-topo">去拓扑</button>

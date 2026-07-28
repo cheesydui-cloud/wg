@@ -130,7 +130,7 @@ app.get('/api/health', (req, res) => {
     version: require(path.join(ROOT, 'package.json')).version,
     protocol: 'mieru',
     profile: state.topology?.profile || 'cm-ix-home',
-    path: 'mobile-ingress → 沪日IX → 美国家宽',
+    path: 'client → merchant-ix-ingress → 沪日IX → home mita',
     uptime: process.uptime(),
   });
 });
@@ -300,8 +300,8 @@ app.put('/api/topology', (req, res) => {
   if (body.wizardDone !== undefined) state.wizardDone = Boolean(body.wizardDone);
   persist();
   const tips = [];
-  if (endpointChanged) tips.push('入站已更新，请重新复制客户端链接（优先 211 移动入口）');
-  if (serverConfChanged) tips.push('监听参数有变，请在家宽「应用配置/一键落地」');
+  if (endpointChanged) tips.push('前置入口已更新，请重新复制客户端链接（商家 IX 前置 114/211）');
+  if (serverConfChanged) tips.push('监听参数有变，请在落地家宽「应用配置/一键落地」');
   res.json({
     ok: true,
     topology: topology.publicTopology(state),
@@ -569,7 +569,7 @@ app.get('/api/clients/:id/config', async (req, res) => {
       qrExternal,
       config: JSON.stringify(clientJson, null, 2),
       tip: dual.tip,
-      path: '手机 → 商家移动入口 → 沪日IX → 美国家宽 mita',
+      path: '电脑/客户端 → 商家IX前置 → 沪日IX → 落地家宽 mita',
     });
   }
   res.json({
@@ -656,7 +656,7 @@ app.get('/api/exit/overview', async (req, res) => {
     listenPort: state.server.listenPort,
     dirty: isUnifiedDirty(),
     topology: topology.publicTopology(state),
-    path: '商家移动入口 → 沪日IX → 美国家宽',
+    path: '电脑/客户端 → 商家IX前置 → 沪日IX → 落地家宽',
   });
 });
 

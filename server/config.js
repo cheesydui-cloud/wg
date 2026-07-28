@@ -58,7 +58,7 @@ function defaultState() {
 }
 
 /**
- * → v5：商家移动入口 → 沪日IX → 美国家宽
+ * → v5：电脑/客户端 → 商家IX前置 → 沪日IX → 落地家宽
  */
 function migrateState(parsed) {
   const base = defaultState();

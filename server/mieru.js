@@ -230,7 +230,17 @@ function buildDualShareLinks(state, client, protocol) {
   const port = portForProtocol(s.listenPort, proto, mode);
   const mobile = shareLinkForHost(state, client, mobileHost, proto);
   const external = shareLinkForHost(state, client, externalHost, proto);
-  const preferred = active === 'external' ? external : mobile;
+  let preferredHost = mobileHost;
+  if (active === 'external') preferredHost = externalHost;
+  else if (active === 'custom') {
+    try {
+      const topology = require('./topology');
+      preferredHost = topology.activeIngressHost(state) || mobileHost;
+    } catch {
+      preferredHost = mobileHost;
+    }
+  }
+  const preferred = shareLinkForHost(state, client, preferredHost, proto);
   return {
     mobile,
     external,
@@ -239,9 +249,9 @@ function buildDualShareLinks(state, client, protocol) {
     endpoints: {
       mobile: `${mobileHost}:${port}`,
       external: `${externalHost}:${port}`,
-      active: `${active === 'external' ? externalHost : mobileHost}:${port}`,
+      active: `${preferredHost}:${port}`,
     },
-    tip: '河南移动优先扫 211；外部 114 作备用。美国 VPS nc 超时可忽略。',
+    tip: '电脑/客户端连商家 IX 前置：外部 114 或移动宽带前置 211（不是手机）。',
   };
 }
 
@@ -353,18 +363,18 @@ function diagnose(state, opts = {}) {
       id: 'need_rescan',
       level: 'warn',
       title: '连接参数已变',
-      detail: '入站/端口/密码改过，手机需更新分享链',
-      fix: '到「客户端」重新复制 mierus://（host 应为 211 或 114）',
+      detail: '入站/端口/密码改过，客户端需更新分享链',
+      fix: '到「客户端」重新复制 mierus://（host 应为商家前置 114 或 211）',
     });
   }
 
   const errors = items.filter((i) => i.level === 'error').length;
   const warns = items.filter((i) => i.level === 'warn').length;
   let summary = '配置看起来正常';
-  if (errors) summary = `发现 ${errors} 个必须处理的问题（优先看 IX 转发 + 家宽 mita）`;
+  if (errors) summary = `发现 ${errors} 个必须处理的问题（优先看 IX 转发 + 落地 mita）`;
   else if (warns) summary = `有 ${warns} 个警告`;
   if (running && users.length && ep.ok) {
-    summary = '配置就绪；用河南移动手机连 211 入口的 mierus 链接';
+    summary = '配置就绪；用本机客户端连商家 IX 前置的 mierus 链接';
   }
 
   return {

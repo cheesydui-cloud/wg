@@ -191,7 +191,8 @@ function topAlerts() {
   }
   if (state.status?.legacyWireGuard) {
     parts.push(`<div class="alert info">
-      <div><strong>已从 WireGuard 迁移到 mieru</strong> · 请用客户端页的 mierus 链接</div>
+      <div><strong>历史提示：曾从 WireGuard 迁到 mieru</strong> · 不是每次登录都在迁移，请用客户端页的 mierus 链接</div>
+      <button class="btn btn-sm btn-ghost" id="banner-legacy-dismiss" title="关闭此提示">知道了</button>
     </div>`);
   }
   const t = topo();
@@ -268,6 +269,16 @@ function bindTopAlerts() {
       await api('/api/clients/rescan-ack', { method: 'POST', body: {} });
       state.clientsNeedRescan = false;
       toast('已确认');
+      render();
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  });
+  document.getElementById('banner-legacy-dismiss')?.addEventListener('click', async () => {
+    try {
+      await api('/api/legacy-wg/dismiss', { method: 'POST', body: {} });
+      if (state.status) state.status.legacyWireGuard = false;
+      toast('已关闭迁移提示');
       render();
     } catch (e) {
       toast(e.message, 'err');
@@ -1400,7 +1411,8 @@ async function renderServer() {
             <div class="btn-row" style="margin-top:12px">
               <button class="btn btn-sm btn-primary" data-save-node="${n.id}" title="保存本机名称/端口/IX/可达地址">保存配置</button>
               <button class="btn btn-sm btn-success" data-exit-node="${n.id}" title="安装/启动 mita 并套用基础参数">一键落地</button>
-              <button class="btn btn-sm btn-success" data-apply-node="${n.id}" title="下发本机用户到 mita">应用配置</button>
+              <button class="btn btn-sm btn-success" data-apply-node="${n.id}" title="下发本机用户到 mita" ${userN ? '' : 'disabled'}>应用配置</button>
+              ${userN ? '' : '<span class="muted" style="font-size:12px">本落地 0 用户 · 先到客户端改绑再应用</span>'}
               <button class="btn btn-sm btn-secondary" data-cmd-node="${n.id}" title="复制 Agent 安装命令">安装命令</button>
               <button class="btn btn-sm btn-secondary" data-users-node="${n.id}" title="查看绑定到本落地的客户端">本机用户</button>
               ${n.isPrimary ? '' : `<button class="btn btn-sm btn-secondary" data-primary-node="${n.id}" title="未指定路由的用户落到此机">设为默认</button>`}

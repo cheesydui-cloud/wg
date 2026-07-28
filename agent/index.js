@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Edge Agent v4.1.3 — mieru / mita 落地（支持多落地 + 流量/套餐）
+ * Edge Agent v4.1.4 — mieru / mita 落地（支持多落地 + 流量/套餐）
  * 连接中心面板，拉取任务：安装/应用 mita、上报状态与用量
  *
  * 环境变量：
@@ -19,7 +19,7 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
-const VERSION = '4.1.3';
+const VERSION = '4.1.4';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';

@@ -397,6 +397,13 @@ app.get('/api/status', async (req, res) => {
   });
 });
 
+/** 关闭「已从 WireGuard 迁移」提示（仅清标记，不会重新迁移） */
+app.post('/api/legacy-wg/dismiss', (req, res) => {
+  state.legacyWireGuard = null;
+  persist();
+  res.json({ ok: true, message: '已关闭迁移提示' });
+});
+
 app.post('/api/setup', (req, res) => {
   if (!auth.needsSetup(state)) return res.status(400).json({ error: '已完成初始化' });
   const username = String(req.body?.username || auth.DEFAULT_USERNAME).trim() || auth.DEFAULT_USERNAME;
@@ -1047,13 +1054,21 @@ app.post('/api/nodes/:id/apply', (req, res) => {
   const node = nodes.findNode(state, req.params.id);
   if (!node) return res.status(404).json({ error: '节点不存在' });
   mieru.ensureMieruDefaults(state);
+  const bound = mieru.clientsForNode(state, node.id).filter((c) => c.enabled !== false);
+  if (!bound.length) {
+    return res.status(400).json({
+      ok: false,
+      code: 'NO_USERS',
+      error: `「${node.name}」还没有绑定用户。请到客户端把用户改绑到本落地，再点「应用本落地」`,
+    });
+  }
   const job = enqueueApply(node, 'mieru_apply');
   persist();
   res.json({
     ok: true,
     pending: true,
     job,
-    message: node.lastSeenAt ? `已下发应用到「${node.name}」` : '任务已创建，等待 Agent 上线',
+    message: node.lastSeenAt ? `已下发应用到「${node.name}」（${bound.length} 用户）` : '任务已创建，等待 Agent 上线',
     node: enrichNodePublic(node),
   });
 });
@@ -1062,13 +1077,23 @@ app.post('/api/nodes/:id/exit', (req, res) => {
   const node = nodes.findNode(state, req.params.id);
   if (!node) return res.status(404).json({ error: '节点不存在' });
   mieru.ensureMieruDefaults(state);
+  const bound = mieru.clientsForNode(state, node.id).filter((c) => c.enabled !== false);
+  if (!bound.length) {
+    return res.status(400).json({
+      ok: false,
+      code: 'NO_USERS',
+      error: `「${node.name}」没有绑定用户，无法一键落地。先到客户端把用户绑到本落地，再点「一键落地」`,
+    });
+  }
   const job = enqueueApply(node, 'exit');
   persist();
   res.json({
     ok: true,
     pending: true,
     job,
-    message: node.lastSeenAt ? `已下发一键落地到「${node.name}」` : '任务已创建，等待 Agent 上线',
+    message: node.lastSeenAt
+      ? `已下发一键落地到「${node.name}」（${bound.length} 用户）`
+      : '任务已创建，等待 Agent 上线',
     node: enrichNodePublic(node),
   });
 });
@@ -1082,6 +1107,14 @@ app.post('/api/apply', async (req, res) => {
     if (nodeId) {
       const node = nodes.findNode(state, nodeId);
       if (!node) return res.status(404).json({ ok: false, error: '节点不存在' });
+      const bound = mieru.clientsForNode(state, node.id).filter((c) => c.enabled !== false);
+      if (!bound.length) {
+        return res.status(400).json({
+          ok: false,
+          code: 'NO_USERS',
+          error: `「${node.name}」还没有绑定用户。请到客户端把用户改绑到本落地，再点「应用本落地」`,
+        });
+      }
       const job = enqueueApply(node, 'mieru_apply');
       persist();
       return res.json({
@@ -1089,7 +1122,7 @@ app.post('/api/apply', async (req, res) => {
         mode: 'agent',
         pending: true,
         job,
-        message: `已下发应用到「${node.name}」`,
+        message: `已下发应用到「${node.name}」（${bound.length} 用户）`,
         dirty: true,
       });
     }

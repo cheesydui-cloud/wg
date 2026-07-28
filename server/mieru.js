@@ -314,6 +314,20 @@ function looksLikeDomain(host) {
   return /^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$/.test(h) || h.includes('.');
 }
 
+/**
+ * 分享链 / 客户端里显示的节点名：备注优先，并带到期日
+ * 多数客户端（含小火箭）会用 URI #fragment 作为节点备注名
+ */
+function shareDisplayName(client) {
+  const note = String(client?.note || '').trim();
+  const name = String(client?.name || '').trim();
+  const expRaw = client?.package?.expireAt ? String(client.package.expireAt).trim() : '';
+  const exp = expRaw ? expRaw.slice(0, 10) : '';
+  const base = note || name || 'mieru';
+  if (exp) return `${base} · 到期${exp}`;
+  return base;
+}
+
 function shareLinkForHost(state, client, host, protocol, portOverride) {
   ensureMieruDefaults(state);
   const s = state.server;
@@ -337,7 +351,9 @@ function shareLinkForHost(state, client, host, protocol, portOverride) {
     'profile=default',
     `protocol=${proto}`,
   ].join('&');
-  return `mierus://${urlencode(client.name)}:${urlencode(client.password)}@${h}:${port}?${query}`;
+  // # 后为展示名：小火箭等导入后节点列表显示备注+到期（不影响鉴权）
+  const remark = shareDisplayName(client);
+  return `mierus://${urlencode(client.name)}:${urlencode(client.password)}@${h}:${port}?${query}#${urlencode(remark)}`;
 }
 
 function buildShareLink(state, client, protocol) {
@@ -413,7 +429,7 @@ function buildClientJson(state, client, protocol, hostOverride) {
   return {
     profiles: [
       {
-        profileName: client.name || 'default',
+        profileName: shareDisplayName(client),
         user: {
           name: client.name,
           password: client.password,
@@ -820,6 +836,7 @@ module.exports = {
   configHash,
   isDirty,
   markClean,
+  shareDisplayName,
   buildShareLink,
   buildDualShareLinks,
   shareLinkForHost,

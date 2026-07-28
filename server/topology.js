@@ -150,9 +150,19 @@ function buildIxForwardScript(state) {
 
   const script = [
     '#!/usr/bin/env bash',
-    '# 沪日 IX → 落地家宽 TCP 转发（商家 IX 前置场景）',
-    `# 在 IX 本机 root 执行（内网 ${lanIp}）`,
-    `# 电脑 → 商家前置 211/114:${listenPort} → 本机 → ${homeHost}:${homePort}`,
+    '# 沪日 IX → 落地家宽 TCP 转发（商家 IX 前置 · 已验证路径）',
+    `# 在 IX 本机 root 执行（内网 ${lanIp}，SSH 端口见面板）`,
+    `# 电脑 → 商家前置 114/211:${listenPort} → 本机 DNAT → ${homeHost}:${homePort} mita`,
+    '#',
+    '# 推荐整段执行（不要一行行粘贴到交互 shell）：',
+    '#   cat > /tmp/ix-forward.sh << \'SCRIPT_EOF\'',
+    '#   ...粘贴本文件全文...',
+    '#   SCRIPT_EOF',
+    '#   chmod +x /tmp/ix-forward.sh && bash /tmp/ix-forward.sh',
+    '#',
+    '# 成功后在 IX 上应能：',
+    `#   timeout 5 bash -c 'echo >/dev/tcp/${homeHost}/${homePort}' && echo OK`,
+    '# 家宽须 mita RUNNING 且监听端口；客户端仍连商家前置，勿连家宽公网 IP。',
     'set -euo pipefail',
     `HOME_HOST=${JSON.stringify(homeHost)}`,
     `HOME_PORT=${homePort}`,
@@ -218,7 +228,7 @@ function buildIxForwardScript(state) {
     homeHost,
     homePort,
     lanIp,
-    tip: '在沪日 IX root 执行；成功后面板勾选「IX 转发已配置」',
+    tip: '在沪日 IX root 整段执行；IX→家宽探测 OK 后面板勾选已配置',
   };
 }
 

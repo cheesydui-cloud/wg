@@ -1,7 +1,7 @@
 {
   "name": "wg-panel",
-  "version": "3.0.1",
-  "description": "mieru 拓扑出口面板：客户端 → 商家IX前置 → 沪日IX → 落地家宽 mita",
+  "version": "3.1.0",
+  "description": "mieru 拓扑出口面板稳定版：客户端 → 商家IX前置 → 沪日IX → 落地家宽 mita",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",

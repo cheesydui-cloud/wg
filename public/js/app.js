@@ -421,7 +421,7 @@ function pathBanner() {
         <span class="path-arrow">→</span>
         <span class="path-node">出网</span>
       </div>
-      <p class="field-hint" style="margin:8px 0 0">面板只管理，不在业务链上。端口须在 ${esc(t.merchantPortRange || '7900-7999')}。「移动入口」= 商家移动宽带前置，不是手机。</p>
+      <p class="field-hint" style="margin:8px 0 0">面板只管理，不在业务链上。端口 ${esc(t.merchantPortRange || '7900-7999')} · TCP mieru。「移动入口」= 商家移动宽带前置，不是手机。客户端连前置，勿连家宽公网。</p>
     </div>`;
 }
 
@@ -805,7 +805,7 @@ async function renderTopology() {
         <h3>② 沪日 IX 转发</h3>
         <span class="badge ${ix.forwardConfigured ? 'ok' : 'warn'}">${ix.forwardConfigured ? '已标记配置' : '未配置'}</span>
       </div>
-      <p class="field-hint">商家入口流量先到 IX 内网 <code class="mono">${esc(ix.lanIp || '172.16.2.79')}</code>，再 DNAT 到家宽 mita。</p>
+      <p class="field-hint">商家前置流量先到 IX 内网 <code class="mono">${esc(ix.lanIp || '172.16.2.79')}</code>，再 DNAT 到落地家宽 mita。客户端仍连 114/211，不连家宽公网。</p>
       <div class="inline-fields">
         <div>
           <label>IX 内网 IP</label>
@@ -816,13 +816,22 @@ async function renderTopology() {
           <input class="field mono" id="t-ix-ssh" value="${esc(ix.sshPort || 7900)}" />
         </div>
       </div>
-      <label>家宽对 IX 可达地址（公网或隧道）</label>
-      <input class="field mono" id="t-home" value="${esc(ix.homeReachableHost || '')}" placeholder="IX 能访问到的家宽地址" />
+      <label>家宽对 IX 可达地址（家宽公网 IP，IX 能访问到的）</label>
+      <input class="field mono" id="t-home" value="${esc(ix.homeReachableHost || '')}" placeholder="例如家宽公网 82.x.x.x" />
       <label style="margin-top:8px">家宽 mita 端口</label>
       <input class="field mono" id="t-home-port" value="${esc(ix.homeReachablePort || ing.port || 7901)}" />
+      <div class="alert info" style="margin-top:12px"><div>
+        <strong>已验证顺序</strong>
+        <ol style="margin:6px 0 0;padding-left:18px;color:var(--text-2);font-size:13px">
+          <li>落地家宽 <code>mita start</code>，确认 <code>ss -lntp | grep 7901</code> 在听</li>
+          <li>填家宽公网 IP → 生成脚本 → 在 IX <strong>整段</strong>执行（勿一行行贴）</li>
+          <li>IX 上 <code>timeout 5 bash -c 'echo &gt;/dev/tcp/家宽IP/7901' && echo OK</code></li>
+          <li>OK 后勾选下方并保存；电脑连商家前置 mierus</li>
+        </ol>
+      </div></div>
       <label class="check-row">
         <input type="checkbox" id="t-fwd-ok" ${ix.forwardConfigured ? 'checked' : ''} />
-        我已在 IX 执行转发脚本并确认生效
+        我已在 IX 整段执行脚本，且 IX→家宽探测为 OK
       </label>
       <div class="btn-row" style="margin-top:12px">
         <button class="btn btn-sm btn-primary" id="t-load-script">生成/刷新转发脚本</button>
@@ -830,7 +839,7 @@ async function renderTopology() {
         <a class="btn btn-sm btn-ghost" id="t-dl-script" href="/api/topology/forward-script?download=1">下载 .sh</a>
       </div>
       <pre class="code-block" id="t-script" style="margin-top:10px;max-height:220px;overflow:auto">${esc(
-        script || '（先填家宽可达地址并保存，再生成）'
+        script || '（先填家宽公网 IP 并点「生成/刷新转发脚本」）'
       )}</pre>
     </div>
 

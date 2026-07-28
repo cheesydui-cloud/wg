@@ -1,30 +1,33 @@
-# mieru 出口面板 v3.0
+# mieru 出口面板 v3.1
 
-中文、新手友好的 **mieru / mita 拓扑出口管理面板**。
+中文、新手友好的 **mieru / mita 拓扑出口管理面板**（稳定版）。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v3.0.1**
+当前版本：**v3.1.0**
 
-> **v3 面向商家 IX 前置约束**：端口 7900–7999、TCP mieru、沪日 IX 转发到落地家宽。  
-> **正确路径：你的电脑/客户端 → 商家 IX 前置 → 沪日 IX → 落地家宽。**  
-> 「移动入口」= 商家提供的**移动宽带前置**（如 211），**不是手机**。  
-> **v2 起默认协议是 mieru，不再是 WireGuard。** 最后一版 WireGuard 见 tag **v1.4.1**。
+> **正确路径（已打通验证）**  
+> **电脑/客户端 → 商家 IX 前置(114/211) → 沪日 IX(DNAT) → 落地家宽 mita → 出网**  
+>  
+> - 「移动入口」= 商家**移动宽带前置**（如 211），**不是手机**  
+> - 客户端 Endpoint = 商家前置，**不是**家宽公网 IP、不是面板 IP  
+> - 协议 **mieru TCP**；端口商家段 **7900–7999**  
+> - WireGuard 见 tag **v1.4.1**（本线路不用）
 
 ---
 
-## 真实拓扑（必读）
+## 架构
 
 ```
 电脑 / 客户端（NekoBox / 官方 mieru / 支持 mieru 的 App）
         │  TCP mierus://
         ▼
-  商家 IX 前置  外部 114.x  /  移动宽带前置 211.x   ← 客户端填这个（不是出网 IP）
+  商家 IX 前置   114.x（外部）/ 211.x（移动宽带前置）
         │
         ▼
-  沪日 IX（内网 172.16.x）                          ← TCP DNAT 转发到家宽
-        │
+  沪日 IX（内网如 172.16.2.79）     ← 面板生成 DNAT 脚本
+        │  TCP 转发到家宽公网:端口
         ▼
-  落地家宽 mita + Agent                             ← 真正出网
+  落地家宽 mita + Agent            ← 真正出网
         │
         ▼
   公网（出口 IP = 家宽）
@@ -32,95 +35,135 @@
 
 | 角色 | 装什么 | 注意 |
 |------|--------|------|
-| **你的电脑** | mieru 客户端 | 连商家前置 Endpoint |
-| **商家 IX 前置** | 商家提供 | 114 / 211，端口 7900–7999 |
-| **沪日 IX** | 转发脚本（不装 mita） | root 执行面板生成的 DNAT 脚本 |
-| **落地家宽** | Agent + mita | 「一键落地」；出网 IP 只读 |
-| **面板** | 本仓库 Web | **独立 VPS**，只管理，不在业务链上 |
+| **你的电脑** | mieru 客户端 | 连商家前置 114/211 |
+| **商家 IX 前置** | 商家提供 | 端口 7900–7999，TCP |
+| **沪日 IX** | 转发脚本（不装 mita） | root 整段执行脚本 |
+| **落地家宽** | Agent + mita | RUNNING 且监听端口 |
+| **面板** | 本仓库 | **独立 VPS**，只管理 |
 
-无关 VPS 对 114:7901 的 `nc` 超时可能因白名单，**不算落地失败**。请用**你本机**经商家前置测。
+无关 VPS 对前置 IP 的 `nc` 超时可能因白名单，**不算失败**。用本机经商家前置测。
 
 ---
 
-## 五步打通
+## 稳定版打通清单（按这个做）
 
-### 1. 独立 VPS 安装/升级面板
+### 1. 面板（独立 VPS）
 
 ```bash
-cd ~/wg   # 或你的安装目录
+cd ~/wg   # 或安装目录
 git pull
 sudo bash install.sh --update
 # 新装：sudo bash install.sh
 ```
 
-浏览器打开 `http://面板IP:51821`。
+打开 `http://面板IP:51821`，确认版本 **v3.1.0**。
 
-#### 忘记登录密码
+忘记密码：
 
 ```bash
-cd ~/wg && git pull
-sudo bash install.sh --reset-password '你的新密码'
+sudo bash install.sh --reset-password '新密码'
 ```
 
-### 2. 向导确认路径 → 落地家宽装 Agent
+### 2. 落地家宽：Agent + mita
 
-向导默认路径：**电脑 → 商家IX前置 → 沪日IX → 落地家宽**。  
-在**落地家宽** root 执行面板给出的 Agent 安装命令（不是 IX、不是面板机）。
+1. 面板向导/落地机 → 复制 Agent 安装命令 → **家宽 root** 执行  
+2. 面板确认 Agent **在线**  
+3. 拓扑端口 **7901**、协议 **TCP** → **一键落地**  
+4. 家宽确认：
 
-### 3. 拓扑页配置前置 + IX 转发
+```bash
+mita status          # 须 RUNNING
+ss -lntp | grep 7901 # 须 LISTEN
+# 若 STOPPED：
+mita start
+```
 
-- 前置选 **外部 114** 或 **移动宽带 211**，端口 **7900–7999**（如 7901），协议 **TCP**
-- 填写「家宽对 IX 可达地址」（家宽公网或隧道）
-- **生成并复制 IX 转发脚本** → 在**沪日 IX root** 执行
-- 勾选「IX 转发已配置」
+### 3. 拓扑：IX 转发
 
-### 4. 落地家宽一键落地 mita
+| 字段 | 填什么 |
+|------|--------|
+| 商家前置 | 114 或 211（客户端连这个） |
+| 端口 | 7901（商家段内） |
+| 家宽对 IX 可达地址 | **家宽公网 IP**（IX 能访问到的） |
+| 家宽 mita 端口 | 7901 |
 
-「落地机 / 概览」→ **一键落地** → 等 Agent 任务完成，`mita` = RUNNING。
+1. **生成/刷新转发脚本** → **复制脚本**  
+2. 沪日 IX root **整段**执行（不要一行行贴进交互 shell）：
 
-### 5. 本机客户端
+```bash
+cat > /tmp/ix-forward.sh << 'SCRIPT_EOF'
+# 粘贴面板复制的完整脚本
+SCRIPT_EOF
+chmod +x /tmp/ix-forward.sh
+bash /tmp/ix-forward.sh
+```
 
-- 「客户端」→ **114 / 211** 双链接（按商家给你用的前置选）
-- 登录名须英文/数字（如 `u7af760`），**不要**把中文备注填进用户栏
-- 验证：`ifconfig.me` ≈ 家宽出网 IP
+3. 在 **IX** 上探测：
+
+```bash
+timeout 5 bash -c 'echo >/dev/tcp/家宽公网IP/7901' && echo OK || echo FAIL
+```
+
+- **OK** → 面板勾选「IX 已执行且探测 OK」→ 保存  
+- **Connection refused** → 家宽 mita 没在听，回步骤 2  
+- **timeout** → IX 到不了家宽，查防火墙/IP 是否填对  
+
+### 4. 电脑客户端
+
+- 面板「客户端」→ 复制 **114 / 211** mierus 链接导入  
+- 登录名须英文/数字（如 `u7af760`），**不要**填中文备注当用户名  
+- Endpoint 必须是商家前置，**禁止**填家宽公网 IP  
+- 验证：`ifconfig.me` ≈ 家宽出网 IP  
 
 ---
 
-## 升级说明
+## 故障对照（已踩过的坑）
 
-### 2.x / 3.0.0 → 3.0.1
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| IX 探测 `Connection refused` | 家宽 mita STOPPED / 未听 7901 | `mita start`；`ss` 确认 |
+| IX 探测 timeout | 地址错或防火墙 | 填家宽公网；放行 TCP 7901 |
+| 脚本执行像没效果 | 一行行粘贴只写了注释 | 整段写入文件再 `bash` |
+| 客户端不通但家宽/IX 都 OK | Endpoint 填错 | 改连 114/211，不要连 82.x |
+| 美国 VPS nc 114 超时 | 商家白名单 | **忽略**；本机测 |
+| 小火箭连不上 | 用户填了「我的手机」 | 改填登录名 u7af760 |
 
-1. `git pull` 后 `sudo bash install.sh --update`
-2. 文案与路径纠正：第一跳是**电脑客户端**，不是手机
-3. 打开「拓扑」：补全 IX 家宽可达地址、跑转发脚本、勾选已配置
-4. 客户端重新复制商家前置 mierus 链接
-5. 落地家宽再点一次「一键落地 / 应用配置」
+---
 
-### 1.x → 3.x
+## 升级
 
-旧 WireGuard 归档；落地机重装 Agent；新建 mieru 用户。
+```bash
+cd ~/wg && git pull
+sudo bash install.sh --update
+```
+
+- **3.0.x → 3.1.0**：文案与稳定运维清单；路径模型不变  
+- **2.x → 3.1**：state v5 拓扑；补 IX 转发与勾选  
+- **1.x → 3.1**：WG 归档；重装 Agent；新建 mieru 用户  
+
+落地机建议重装/再执行一次 Agent 安装命令以对齐 agent 版本。
 
 ---
 
 ## 功能摘要
 
-- **拓扑页**：商家前置 114/211、商家端口段校验、IX 转发脚本、分层诊断
-- 远程 Agent 一键装 mita、用户与 `mierus://` 双前置二维码
-- 诊断：前置 / IX 转发 / Agent / mita / 出网 IP 分层展示
-- 登录加固、重置密码、改 Endpoint 后提示更新链接
+- 拓扑：商家前置 114/211、端口段、IX 转发脚本、分层诊断  
+- 远程 Agent：一键装/应用 mita、用户与双前置二维码  
+- 登录加固、重置密码、改前置后提示更新链接  
+- 面板只管理，业务链不经面板  
 
 ---
 
 ## 环境要求
 
-- 面板：Linux，Node.js 18+，TCP 51821（可改）
-- 落地家宽：Linux root，出网访问面板与 GitHub，监听 TCP 790x
-- IX：root，能访问家宽可达地址，可写 nft/iptables DNAT
-- 客户端：支持 mieru；连商家前置，不连出网 IP
+- 面板：Linux，Node.js 18+，TCP 51821  
+- 落地家宽：Linux root，出网访问面板与 GitHub，TCP 790x 监听  
+- IX：root，能访问家宽可达地址，nft/iptables DNAT  
+- 客户端：支持 mieru，连商家前置  
 
 ---
 
 ## 许可证
 
 MIT（面板）。  
-mita/mieru 上游为 GPL-3.0；OneClick 安装脚本见 `vendor/mieru-oneclick`。
+mita/mieru 上游 GPL-3.0；OneClick 见 `vendor/mieru-oneclick`。

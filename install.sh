@@ -9,7 +9,7 @@ set -euo pipefail
 #   sudo bash install.sh --reset-password '新密码'
 #
 # 默认登录用户名：admin
-# v3.1 稳定版：客户端 → 商家IX前置 → 沪日IX → 落地家宽 mita；协议 mieru
+# v4.0：多 IX · 多落地 · 用户路由 · 流量/期限；路径 客户端 → 商家IX前置 → IX → 落地家宽 mita
 # WireGuard 见 tag v1.4.1
 # 未指定 WG_PASSWORD 且首次安装时自动生成随机密码
 # --update 不会改登录密码；忘记密码请用 --reset-password

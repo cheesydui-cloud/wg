@@ -14,11 +14,42 @@ function ensureDataDir() {
   if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
 }
 
+function defaultClientPackage() {
+  return {
+    quotaMb: 0,
+    quotaDays: 30,
+    quotaMode: 'rolling',
+    expireAt: '',
+    bandwidthMbps: 0,
+  };
+}
+
+function defaultClientRoute(primaryNodeId = null) {
+  return {
+    landingNodeId: primaryNodeId || null,
+    ixId: null,
+    listenPort: null,
+    ingressActive: null,
+  };
+}
+
+function defaultClientUsage() {
+  return {
+    downloadBytes: 0,
+    uploadBytes: 0,
+    totalBytes: 0,
+    quotaUsedMb: null,
+    quotaLimitMb: null,
+    collectedAt: null,
+    source: null,
+  };
+}
+
 function defaultState() {
   return {
-    version: 5,
+    version: 6,
     protocol: 'mieru',
-    mode: 'agent', // v3 默认远程家宽落地
+    mode: 'agent',
     primaryNodeId: null,
     username: 'admin',
     passwordHash: null,
@@ -33,7 +64,7 @@ function defaultState() {
     server: {
       listenPort: 7901,
       protocol: 'TCP',
-      endpoint: '211.136.162.184:7901',
+      endpoint: '114.111.176.37:7901',
       mtu: 1400,
       multiplexing: 'MULTIPLEXING_LOW',
       trafficPattern: 'conservative',
@@ -51,14 +82,15 @@ function defaultState() {
     settings: {
       theme: 'auto',
       language: 'zh',
-      showAdvancedNodes: false,
+      showAdvancedNodes: true,
+      autoApplyEnforce: true,
     },
     legacyWireGuard: null,
   };
 }
 
 /**
- * → v5：电脑/客户端 → 商家IX前置 → 沪日IX → 落地家宽
+ * → v5 拓扑；→ v6 多 IX / 多落地 / 用户路由与套餐
  */
 function migrateState(parsed) {
   const base = defaultState();
@@ -70,20 +102,21 @@ function migrateState(parsed) {
     clients: Array.isArray(parsed.clients) ? parsed.clients : [],
     nodes: Array.isArray(parsed.nodes) ? parsed.nodes : [],
     topology: parsed.topology
-      ? {
+      ? topology.migrateLegacyTopology({
           ...base.topology,
           ...parsed.topology,
           ingress: { ...base.topology.ingress, ...(parsed.topology.ingress || {}) },
-          ix: { ...base.topology.ix, ...(parsed.topology.ix || {}) },
-          landing: { ...base.topology.landing, ...(parsed.topology.landing || {}) },
           panel: { ...base.topology.panel, ...(parsed.topology.panel || {}) },
-        }
+          ix: parsed.topology.ix,
+          landing: parsed.topology.landing,
+          ixes: parsed.topology.ixes,
+          landings: parsed.topology.landings,
+        })
       : base.topology,
   };
 
   const version = Number(parsed.version || 1);
 
-  // 旧 WG peers
   if (version < 4) {
     const oldClients = Array.isArray(parsed.clients) ? parsed.clients : [];
     const looksLikeWgPeers = oldClients.some((c) => c.privateKey || c.publicKey || c.address);
@@ -99,7 +132,6 @@ function migrateState(parsed) {
     }
   }
 
-  // mode / primary
   if (version < 4) {
     const nodes = state.nodes || [];
     let best = null;
@@ -120,7 +152,6 @@ function migrateState(parsed) {
     }
   }
 
-  state.version = 5;
   state.protocol = state.protocol === 'wireguard' ? 'wireguard' : 'mieru';
   if (!state.server.protocol) state.server.protocol = 'TCP';
   if (!state.server.listenPort) state.server.listenPort = 7901;
@@ -146,13 +177,53 @@ function migrateState(parsed) {
     else if (state.server.listenPort) state.topology.ingress.port = Number(state.server.listenPort) || 7901;
   }
 
-  // 合法化用户名（中文挪备注）在 ensure 时处理；这里先保证 topology 同步
+  // v6: bind landings to primary; ensure client route/package/usage
   topology.ensureTopology(state);
+  if (state.primaryNodeId && state.topology.landings[0] && !state.topology.landings[0].nodeId) {
+    state.topology.landings[0].nodeId = state.primaryNodeId;
+  }
+  // copy v3 ix homeReachable into default landing if needed
+  if (parsed.topology?.ix?.homeReachableHost) {
+    const L = state.topology.landings[0];
+    if (L && !L.homeReachableHost) {
+      L.homeReachableHost = String(parsed.topology.ix.homeReachableHost).trim();
+      L.homeReachablePort =
+        Number(parsed.topology.ix.homeReachablePort) || state.topology.ingress.port;
+    }
+    if (state.topology.ixes[0] && !state.topology.ixes[0].homeReachableHost) {
+      state.topology.ixes[0].homeReachableHost = String(parsed.topology.ix.homeReachableHost).trim();
+      state.topology.ixes[0].homeReachablePort =
+        Number(parsed.topology.ix.homeReachablePort) || state.topology.ingress.port;
+      state.topology.ixes[0].forwardConfigured = Boolean(parsed.topology.ix.forwardConfigured);
+    }
+  }
 
-  // v3 产品默认远程落地（已有 mode 则保留）
+  for (const c of state.clients) {
+    ensureClientFields(c, state.primaryNodeId);
+  }
+
   if (version < 5 && !parsed.mode) state.mode = 'agent';
+  if (state.settings.autoApplyEnforce === undefined) state.settings.autoApplyEnforce = true;
+  if (state.settings.showAdvancedNodes === undefined) state.settings.showAdvancedNodes = true;
 
+  state.version = 6;
   return state;
+}
+
+function ensureClientFields(c, primaryNodeId = null) {
+  if (!c.route || typeof c.route !== 'object') c.route = defaultClientRoute(primaryNodeId);
+  else {
+    c.route = {
+      ...defaultClientRoute(primaryNodeId),
+      ...c.route,
+      landingNodeId: c.route.landingNodeId || primaryNodeId || null,
+    };
+  }
+  if (!c.package || typeof c.package !== 'object') c.package = defaultClientPackage();
+  else c.package = { ...defaultClientPackage(), ...c.package };
+  if (!c.usage || typeof c.usage !== 'object') c.usage = defaultClientUsage();
+  else c.usage = { ...defaultClientUsage(), ...c.usage };
+  return c;
 }
 
 function loadState() {
@@ -167,9 +238,17 @@ function loadState() {
     const raw = fs.readFileSync(STATE_FILE, 'utf8');
     const parsed = JSON.parse(raw);
     const state = migrateState(parsed);
-    if (Number(parsed.version || 1) < 5) {
+    if (Number(parsed.version || 1) < 6) {
+      // backup before rewrite
+      try {
+        const bak = path.join(BACKUP_DIR, `state-v${parsed.version || 1}-${Date.now()}.json`);
+        fs.writeFileSync(bak, raw, 'utf8');
+        console.log(`[panel] 已备份旧 state → ${bak}`);
+      } catch (e) {
+        console.warn('[panel] 备份旧 state 失败:', e.message);
+      }
       saveState(state);
-      console.log(`[panel] 已迁移 state 到 v5 拓扑 · 模式 ${state.mode}`);
+      console.log(`[panel] 已迁移 state 到 v6 多落地/套餐 · 模式 ${state.mode}`);
     }
     return state;
   } catch (err) {
@@ -207,4 +286,8 @@ module.exports = {
   defaultState,
   migrateState,
   ensureDataDir,
+  ensureClientFields,
+  defaultClientPackage,
+  defaultClientRoute,
+  defaultClientUsage,
 };

@@ -5,6 +5,7 @@ const state = {
   server: null,
   topology: null,
   clients: [],
+  nodes: [],
   page: 'dashboard',
   wizardStep: 1,
   wizardDone: false,
@@ -15,6 +16,8 @@ const state = {
   installCommand: '',
   exitOverview: null,
   forwardScript: '',
+  selectedIxId: null,
+  selectedLandingId: null,
 };
 
 async function api(path, options = {}) {
@@ -157,10 +160,23 @@ function topAlerts() {
       <button class="btn btn-sm btn-primary" data-nav-jump="topology">去拓扑</button>
     </div>`);
   }
-  if (isAgentMode() && state.primaryNode && !state.primaryNode.online) {
+  const offlineNodes = (state.nodes || []).filter((n) => !n.online);
+  if (isAgentMode() && offlineNodes.length) {
+    parts.push(`<div class="alert warn">
+      <div><strong>${offlineNodes.length} 台落地 Agent 离线</strong> · ${esc(offlineNodes.map((n) => n.name).join('、'))}</div>
+      <button class="btn btn-sm btn-primary" data-nav-jump="server">去落地</button>
+    </div>`);
+  } else if (isAgentMode() && state.primaryNode && !state.primaryNode.online) {
     parts.push(`<div class="alert warn">
       <div><strong>落地家宽 Agent 离线</strong> · 无法安装/更新 mita</div>
       <button class="btn btn-sm btn-primary" data-nav-jump="server">去安装</button>
+    </div>`);
+  }
+  const blocked = (state.clients || []).filter((c) => c.statusFlags?.expired || c.statusFlags?.overQuota);
+  if (blocked.length) {
+    parts.push(`<div class="alert warn">
+      <div><strong>${blocked.length} 个用户到期/超额</strong></div>
+      <button class="btn btn-sm btn-primary" data-nav-jump="clients">去客户端</button>
     </div>`);
   }
   const job = state.primaryNode?.latestJob;
@@ -332,17 +348,19 @@ function shell(content) {
   const nav = [
     ['dashboard', '概览', '◈'],
     ['topology', '拓扑', '⇄'],
-    ['server', '落地机', '◎'],
+    ['server', '落地', '◎'],
     ['clients', '客户端', '◉'],
     ['diagnose', '诊断', '✎'],
     ['settings', '设置', '⚙'],
   ];
+  const onlineN = (state.nodes || []).filter((n) => n.online).length;
+  const totalN = (state.nodes || []).length || (state.primaryNode ? 1 : 0);
   return `
     <div class="layout">
       <aside class="sidebar">
         <div class="brand"><div class="logo sm">M</div><div>
           <div class="brand-title">mieru 面板</div>
-          <div class="brand-sub">v${esc(state.status?.version || '')} · 拓扑</div>
+          <div class="brand-sub">v${esc(state.status?.version || '')} · 多落地</div>
         </div></div>
         <nav class="nav">
           ${nav
@@ -356,7 +374,7 @@ function shell(content) {
             .join('')}
         </nav>
         <div class="sidebar-footer">
-          <div class="mode-pill ${isAgentMode() ? 'agent' : 'local'}">${esc(exitLabel())}</div>
+          <div class="mode-pill ${isAgentMode() ? 'agent' : 'local'}">${esc(exitLabel())}${totalN ? ` · ${onlineN}/${totalN}` : ''}</div>
           <button class="btn btn-sm btn-ghost btn-block" id="btn-logout">退出登录</button>
         </div>
       </aside>
@@ -383,16 +401,18 @@ function bindShell() {
 }
 
 async function refreshCore() {
-  const [status, server, clients, overview, topology] = await Promise.all([
+  const [status, server, clients, overview, topology, nodesRes] = await Promise.all([
     api('/api/status'),
     api('/api/server'),
     api('/api/clients'),
     api('/api/exit/overview').catch(() => null),
     api('/api/topology').catch(() => null),
+    api('/api/nodes').catch(() => null),
   ]);
   state.status = status;
   state.mode = status.mode || 'agent';
   state.primaryNode = status.primaryNode || null;
+  state.nodes = status.nodes || nodesRes?.nodes || overview?.nodes || [];
   state.server = server.server;
   state.topology = topology?.topology || server.topology || status.topology || null;
   state.forwardScript = topology?.forwardScript || '';
@@ -402,6 +422,22 @@ async function refreshCore() {
   state.clients = clients.clients || [];
   state.exitOverview = overview;
   state.lastAppliedAt = status.lastAppliedAt;
+}
+
+function nodeName(id) {
+  if (!id) return '默认落地';
+  const n = (state.nodes || []).find((x) => x.id === id);
+  return n?.name || id.slice(0, 8);
+}
+
+function ixesList() {
+  const t = topo();
+  return Array.isArray(t.ixes) && t.ixes.length ? t.ixes : t.ix ? [t.ix] : [];
+}
+
+function landingsList() {
+  const t = topo();
+  return Array.isArray(t.landings) && t.landings.length ? t.landings : [];
 }
 
 function pathBanner() {
@@ -667,6 +703,10 @@ async function renderDashboard() {
   const ov = state.exitOverview || {};
   const mita = ov.mita || state.primaryNode?.mita;
   const t = topo();
+  const nodes = state.nodes || [];
+  const onlineN = nodes.filter((n) => n.online).length;
+  const ixN = ixesList().length;
+  const blocked = state.clients.filter((c) => c.statusFlags?.expired || c.statusFlags?.overQuota).length;
   app.innerHTML = shell(`
     <div class="page-header">
       <div>
@@ -675,7 +715,7 @@ async function renderDashboard() {
       </div>
       <div class="btn-row">
         <button class="btn btn-success" id="dash-exit">一键落地</button>
-        <button class="btn btn-primary" id="dash-apply">应用配置</button>
+        <button class="btn btn-primary" id="dash-apply">应用全部</button>
         <button class="btn btn-ghost" id="dash-topo">拓扑</button>
       </div>
     </div>
@@ -686,16 +726,16 @@ async function renderDashboard() {
         <div class="stat-value small mono">${esc(activeEp() || '未填')}</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">IX 转发</div>
-        <div class="stat-value">${t.forward?.configured ? '已配置' : '未配置'}</div>
+        <div class="stat-label">IX / 落地</div>
+        <div class="stat-value">${ixN} / ${onlineN}/${nodes.length || 1}</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">落地 mita</div>
+        <div class="stat-label">默认 mita</div>
         <div class="stat-value">${mita?.running ? 'RUNNING' : mita?.status || '未知'}</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">用户数</div>
-        <div class="stat-value">${state.clients.length}</div>
+        <div class="stat-label">用户 / 套餐告警</div>
+        <div class="stat-value">${state.clients.length}${blocked ? ` · ${blocked}⚠` : ''}</div>
       </div>
     </div>
     <div class="card" style="margin-top:16px">
@@ -706,22 +746,53 @@ async function renderDashboard() {
       <div class="kv"><span>监听</span><span class="mono">${esc(s.protocol || 'TCP')} ${esc(s.listenPort || 7901)}</span></div>
       <div class="kv"><span>出网 IP（只读）</span><span class="mono">${esc(ov.exitPublicIp || state.primaryNode?.exitPublicIp || '-')}</span></div>
       <div class="kv"><span>最近应用</span><span>${esc(fmtTime(state.lastAppliedAt))}</span></div>
-      <p class="field-hint">路径：电脑 mieru → 商家IX前置(TCP) → 沪日IX 转发 → 落地家宽 mita → 外网。</p>
+      <p class="field-hint">路径：电脑 mieru → 商家IX前置(TCP) → IX 转发 → 落地家宽 mita → 外网。支持多 IX / 多落地 / 分用户路由。</p>
     </div>
+    ${
+      nodes.length
+        ? `<div class="card" style="margin-top:16px">
+      <div class="card-head"><h3>落地列表</h3>
+        <button class="btn btn-sm btn-ghost" data-nav-jump="server">管理</button>
+      </div>
+      <table><thead><tr><th>名称</th><th>状态</th><th>mita</th><th>用户</th><th>出网</th></tr></thead><tbody>
+        ${nodes
+          .map(
+            (n) => `<tr>
+          <td>${esc(n.name)}${n.isPrimary ? ' <span class="badge ok">默认</span>' : ''}</td>
+          <td>${n.online ? '<span class="badge ok">在线</span>' : '<span class="badge warn">离线</span>'}</td>
+          <td class="mono">${esc(n.mita?.status || '-')}</td>
+          <td>${n.clientCount ?? 0}</td>
+          <td class="mono">${esc(n.exitPublicIp || '-')}</td>
+        </tr>`
+          )
+          .join('')}
+      </tbody></table>
+    </div>`
+        : ''
+    }
     <div class="card" style="margin-top:16px">
       <div class="card-head"><h3>客户端用户</h3>
         <button class="btn btn-sm btn-primary" id="dash-add">添加</button>
       </div>
       ${
         state.clients.length
-          ? `<table><thead><tr><th>登录名</th><th>备注</th><th>状态</th><th></th></tr></thead><tbody>
+          ? `<table><thead><tr><th>登录名</th><th>落地</th><th>用量</th><th>状态</th><th></th></tr></thead><tbody>
           ${state.clients
             .map(
               (c) => `<tr>
-            <td class="mono">${esc(c.name)}</td>
-            <td>${esc(c.note || '-')}</td>
-            <td>${c.enabled !== false ? '<span class="badge ok">启用</span>' : '<span class="badge">停用</span>'}</td>
-            <td><button class="btn btn-sm btn-ghost" data-qr="${c.id}">211/114 链接</button></td>
+            <td class="mono">${esc(c.name)}${c.note ? `<div class="muted" style="font-size:11px">${esc(c.note)}</div>` : ''}</td>
+            <td>${esc(nodeName(c.route?.landingNodeId))}</td>
+            <td class="mono">${esc(c.usage?.totalHuman || '—')}</td>
+            <td>${
+              c.statusFlags?.expired
+                ? '<span class="badge warn">到期</span>'
+                : c.statusFlags?.overQuota
+                  ? '<span class="badge warn">超额</span>'
+                  : c.enabled !== false
+                    ? '<span class="badge ok">启用</span>'
+                    : '<span class="badge">停用</span>'
+            }</td>
+            <td><button class="btn btn-sm btn-ghost" data-qr="${c.id}">211/114</button></td>
           </tr>`
             )
             .join('')}
@@ -732,7 +803,7 @@ async function renderDashboard() {
   `);
   bindShell();
   document.getElementById('dash-exit').onclick = () => setupExit();
-  document.getElementById('dash-apply').onclick = () => applyConfig(true);
+  document.getElementById('dash-apply').onclick = () => applyConfig(true, { all: true });
   document.getElementById('dash-topo').onclick = () => {
     state.page = 'topology';
     render();
@@ -748,13 +819,21 @@ async function renderTopology() {
   await refreshCore().catch(() => {});
   const t = topo();
   const ing = t.ingress || {};
-  const ix = t.ix || {};
+  const ixes = ixesList();
+  const landings = landingsList();
+  let curIxId = state.selectedIxId || ixes[0]?.id;
+  let curLandingId = state.selectedLandingId || landings[0]?.id;
+  const ix = ixes.find((x) => x.id === curIxId) || ixes[0] || t.ix || {};
+  const landing = landings.find((L) => L.id === curLandingId) || landings[0] || {};
   const script = state.forwardScript || '';
+  const homeHost = landing.homeReachableHost || ix.homeReachableHost || '';
+  const homePort = landing.homeReachablePort || landing.listenPort || ix.homeReachablePort || ing.port || 7901;
+
   app.innerHTML = shell(`
     <div class="page-header">
       <div>
         <h2>拓扑</h2>
-        <p class="muted">商家 IX 前置 · 沪日 IX · 落地家宽</p>
+        <p class="muted">商家 IX 前置 · 多 IX · 多落地</p>
       </div>
       <div class="btn-row">
         <button class="btn btn-primary" id="topo-save">保存拓扑</button>
@@ -768,7 +847,7 @@ async function renderTopology() {
         <h3>① 商家 IX 前置（客户端连接）</h3>
         <span class="badge ${t.portInRange ? 'ok' : 'warn'}">端口段 ${esc(t.merchantPortRange || '7900-7999')}</span>
       </div>
-      <p class="field-hint">「移动入口」= 商家<strong>移动宽带前置</strong>（211），不是你的手机。电脑客户端连这里。</p>
+      <p class="field-hint">「移动入口」= 商家<strong>移动宽带前置</strong>（211），不是你的手机。电脑客户端连这里。多线路靠端口区分。</p>
       <div class="choice-grid" style="margin:10px 0">
         <button type="button" class="choice-card ${ing.active === 'external' || !ing.active ? 'selected' : ''}" data-act="external">
           <strong>外部前置 114</strong>
@@ -785,7 +864,7 @@ async function renderTopology() {
       </div>
       <div class="inline-fields">
         <div>
-          <label>端口</label>
+          <label>默认端口</label>
           <input class="field mono" id="t-port" value="${esc(ing.port || 7901)}" />
         </div>
         <div>
@@ -802,61 +881,109 @@ async function renderTopology() {
 
     <div class="card" style="margin-top:16px">
       <div class="card-head">
-        <h3>② 沪日 IX 转发</h3>
-        <span class="badge ${ix.forwardConfigured ? 'ok' : 'warn'}">${ix.forwardConfigured ? '已标记配置' : '未配置'}</span>
+        <h3>② IX 列表</h3>
+        <button class="btn btn-sm btn-primary" id="t-add-ix">添加 IX</button>
       </div>
-      <p class="field-hint">商家前置流量先到 IX 内网 <code class="mono">${esc(ix.lanIp || '172.16.2.79')}</code>，再 DNAT 到落地家宽 mita。客户端仍连 114/211，不连家宽公网。</p>
+      <p class="field-hint">可配置多台 IX。下方脚本按「选中 IX × 落地」生成 DNAT。</p>
       <div class="inline-fields">
         <div>
-          <label>IX 内网 IP</label>
+          <label>选择 IX</label>
+          <select class="field" id="t-ix-sel">
+            ${ixes
+              .map(
+                (x) =>
+                  `<option value="${esc(x.id)}" ${x.id === ix.id ? 'selected' : ''}>${esc(x.name)} · ${esc(x.lanIp || '')}</option>`
+              )
+              .join('')}
+          </select>
+        </div>
+        <div>
+          <label>名称</label>
+          <input class="field" id="t-ix-name" value="${esc(ix.name || '')}" />
+        </div>
+        <div>
+          <label>内网 IP</label>
           <input class="field mono" id="t-ix-lan" value="${esc(ix.lanIp || '172.16.2.79')}" />
         </div>
         <div>
-          <label>IX SSH 端口</label>
+          <label>SSH 端口</label>
           <input class="field mono" id="t-ix-ssh" value="${esc(ix.sshPort || 7900)}" />
         </div>
       </div>
-      <label>家宽对 IX 可达地址（家宽公网 IP，IX 能访问到的）</label>
-      <input class="field mono" id="t-home" value="${esc(ix.homeReachableHost || '')}" placeholder="例如家宽公网 82.x.x.x" />
-      <label style="margin-top:8px">家宽 mita 端口</label>
-      <input class="field mono" id="t-home-port" value="${esc(ix.homeReachablePort || ing.port || 7901)}" />
+      <label class="check-row">
+        <input type="checkbox" id="t-fwd-ok" ${ix.forwardConfigured ? 'checked' : ''} />
+        此 IX 已整段执行脚本且探测 OK
+      </label>
+      <div class="btn-row" style="margin-top:8px">
+        <button class="btn btn-sm btn-ghost" id="t-del-ix" ${ixes.length <= 1 ? 'disabled' : ''}>删除当前 IX</button>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-head">
+        <h3>③ 转发脚本（IX → 落地）</h3>
+        <span class="badge ${ix.forwardConfigured ? 'ok' : 'warn'}">${ix.forwardConfigured ? '已标记' : '未配置'}</span>
+      </div>
+      <div class="inline-fields">
+        <div>
+          <label>目标落地</label>
+          <select class="field" id="t-landing-sel">
+            ${landings
+              .map(
+                (L) =>
+                  `<option value="${esc(L.id)}" ${L.id === landing.id ? 'selected' : ''}>${esc(L.name)} · :${esc(L.listenPort || 7901)}</option>`
+              )
+              .join('') || '<option value="">（请先在落地页添加）</option>'}
+          </select>
+        </div>
+        <div>
+          <label>监听端口（前置侧）</label>
+          <input class="field mono" id="t-fwd-port" value="${esc(landing.listenPort || ing.port || 7901)}" />
+        </div>
+        <div>
+          <label>家宽可达地址</label>
+          <input class="field mono" id="t-home" value="${esc(homeHost)}" placeholder="家宽公网 IP" />
+        </div>
+        <div>
+          <label>家宽 mita 端口</label>
+          <input class="field mono" id="t-home-port" value="${esc(homePort)}" />
+        </div>
+      </div>
       <div class="alert info" style="margin-top:12px"><div>
         <strong>已验证顺序</strong>
         <ol style="margin:6px 0 0;padding-left:18px;color:var(--text-2);font-size:13px">
-          <li>落地家宽 <code>mita start</code>，确认 <code>ss -lntp | grep 7901</code> 在听</li>
-          <li>填家宽公网 IP → 生成脚本 → 在 IX <strong>整段</strong>执行（勿一行行贴）</li>
-          <li>IX 上 <code>timeout 5 bash -c 'echo &gt;/dev/tcp/家宽IP/7901' && echo OK</code></li>
-          <li>OK 后勾选下方并保存；电脑连商家前置 mierus</li>
+          <li>落地 mita RUNNING 且端口在听</li>
+          <li>生成脚本 → 在对应 IX <strong>整文件</strong>执行</li>
+          <li>IX 探测 OK 后勾选并保存</li>
+          <li>客户端连商家前置 114/211，勿连家宽公网</li>
         </ol>
       </div></div>
-      <label class="check-row">
-        <input type="checkbox" id="t-fwd-ok" ${ix.forwardConfigured ? 'checked' : ''} />
-        我已在 IX 整段执行脚本，且 IX→家宽探测为 OK
-      </label>
       <div class="btn-row" style="margin-top:12px">
         <button class="btn btn-sm btn-primary" id="t-load-script">生成/刷新转发脚本</button>
         <button class="btn btn-sm btn-ghost" id="t-copy-script" ${script ? '' : 'disabled'}>复制脚本</button>
         <a class="btn btn-sm btn-ghost" id="t-dl-script" href="/api/topology/forward-script?download=1">下载 .sh</a>
       </div>
       <pre class="code-block" id="t-script" style="margin-top:10px;max-height:220px;overflow:auto">${esc(
-        script || '（先填家宽公网 IP 并点「生成/刷新转发脚本」）'
+        script || '（先填家宽可达地址并生成）'
       )}</pre>
     </div>
 
     <div class="card" style="margin-top:16px">
-      <h3>③ 落地家宽</h3>
-      <div class="kv"><span>Agent</span><span>${
-        state.primaryNode?.online
-          ? '<span class="badge ok">在线</span>'
-          : '<span class="badge warn">离线</span>'
-      }</span></div>
-      <div class="kv"><span>主机</span><span class="mono">${esc(state.primaryNode?.hostname || '-')}</span></div>
-      <div class="kv"><span>mita</span><span class="mono">${esc(
-        state.primaryNode?.mita?.status || state.exitOverview?.mita?.status || '-'
-      )}</span></div>
+      <div class="card-head">
+        <h3>④ 落地速览</h3>
+        <button class="btn btn-sm btn-ghost" data-nav-jump="server">管理落地</button>
+      </div>
+      ${(state.nodes || [])
+        .map(
+          (n) => `<div class="kv">
+        <span>${esc(n.name)}${n.isPrimary ? ' · 默认' : ''}</span>
+        <span>${n.online ? '<span class="badge ok">在线</span>' : '<span class="badge warn">离线</span>'}
+          · mita ${esc(n.mita?.status || '-')} · 用户 ${n.clientCount ?? 0}</span>
+      </div>`
+        )
+        .join('') || '<p class="muted">暂无落地节点</p>'}
       <div class="btn-row" style="margin-top:10px">
-        <button class="btn btn-sm btn-success" id="t-exit">一键落地 mita</button>
-        <button class="btn btn-sm btn-ghost" data-nav-jump="server">落地机详情</button>
+        <button class="btn btn-sm btn-success" id="t-exit">默认落地 · 一键落地</button>
       </div>
     </div>
   `);
@@ -871,6 +998,33 @@ async function renderTopology() {
     };
   });
 
+  const collectIxes = () => {
+    const list = ixes.map((x) => ({ ...x }));
+    const idx = list.findIndex((x) => x.id === (document.getElementById('t-ix-sel')?.value || ix.id));
+    const target = list[idx >= 0 ? idx : 0];
+    if (target) {
+      target.name = val('t-ix-name') || target.name;
+      target.lanIp = val('t-ix-lan');
+      target.sshPort = Number(val('t-ix-ssh')) || 7900;
+      target.forwardConfigured = document.getElementById('t-fwd-ok')?.checked;
+      target.homeReachableHost = val('t-home') || target.homeReachableHost;
+      target.homeReachablePort = Number(val('t-home-port')) || target.homeReachablePort;
+    }
+    return list;
+  };
+
+  const collectLandings = () => {
+    const list = landings.map((L) => ({ ...L }));
+    const sel = document.getElementById('t-landing-sel')?.value;
+    const target = list.find((L) => L.id === sel) || list[0];
+    if (target) {
+      target.homeReachableHost = val('t-home');
+      target.homeReachablePort = Number(val('t-home-port')) || target.homeReachablePort;
+      target.listenPort = Number(val('t-fwd-port')) || target.listenPort;
+    }
+    return list;
+  };
+
   const saveTopo = async () => {
     const r = await api('/api/topology', {
       method: 'PUT',
@@ -882,13 +1036,8 @@ async function renderTopology() {
           provinceWhitelist: val('t-province'),
           protocol: 'TCP',
         },
-        ix: {
-          lanIp: val('t-ix-lan'),
-          sshPort: Number(val('t-ix-ssh')) || 7900,
-          homeReachableHost: val('t-home'),
-          homeReachablePort: Number(val('t-home-port')) || Number(val('t-port')) || 7901,
-          forwardConfigured: document.getElementById('t-fwd-ok')?.checked,
-        },
+        ixes: collectIxes(),
+        landings: collectLandings(),
       },
     });
     state.topology = r.topology;
@@ -898,11 +1047,75 @@ async function renderTopology() {
     return r;
   };
 
+  const scriptQs = () => {
+    const ixId = document.getElementById('t-ix-sel')?.value || '';
+    const landingId = document.getElementById('t-landing-sel')?.value || '';
+    const port = Number(val('t-fwd-port')) || '';
+    const q = new URLSearchParams();
+    if (ixId) q.set('ixId', ixId);
+    if (landingId) q.set('landingId', landingId);
+    if (port) q.set('port', String(port));
+    return q.toString();
+  };
+
+  document.getElementById('t-ix-sel')?.addEventListener('change', async () => {
+    state.selectedIxId = document.getElementById('t-ix-sel').value;
+    try {
+      await saveTopo();
+    } catch {
+      /* */
+    }
+    render();
+  });
+  document.getElementById('t-landing-sel')?.addEventListener('change', () => {
+    state.selectedLandingId = document.getElementById('t-landing-sel').value;
+    render();
+  });
+
+  document.getElementById('t-add-ix')?.addEventListener('click', async () => {
+    try {
+      const list = collectIxes();
+      list.push({
+        id: 'ix-' + Math.random().toString(16).slice(2, 8),
+        name: `IX-${list.length + 1}`,
+        lanIp: '172.16.2.79',
+        sshPort: 7900,
+        forwardConfigured: false,
+        homeReachableHost: '',
+        homeReachablePort: Number(val('t-port')) || 7901,
+      });
+      await api('/api/topology', { method: 'PUT', body: { ixes: list } });
+      state.selectedIxId = list[list.length - 1].id;
+      toast('已添加 IX');
+      await refreshCore();
+      render();
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  });
+
+  document.getElementById('t-del-ix')?.addEventListener('click', async () => {
+    if (ixes.length <= 1) return;
+    if (!confirm('删除当前 IX？')) return;
+    try {
+      const id = document.getElementById('t-ix-sel')?.value;
+      const list = collectIxes().filter((x) => x.id !== id);
+      await api('/api/topology', { method: 'PUT', body: { ixes: list } });
+      state.selectedIxId = list[0]?.id;
+      toast('已删除');
+      await refreshCore();
+      render();
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  });
+
   document.getElementById('topo-save').onclick = async () => {
     try {
       const r = await saveTopo();
       toast(r.tip || '已保存');
-      const topoRes = await api('/api/topology');
+      const qs = scriptQs();
+      const topoRes = await api('/api/topology' + (qs ? '?' + qs : ''));
       state.forwardScript = topoRes.forwardScript || '';
       state.topology = topoRes.topology;
       render();
@@ -914,9 +1127,12 @@ async function renderTopology() {
   document.getElementById('t-load-script').onclick = async () => {
     try {
       await saveTopo();
-      const topoRes = await api('/api/topology');
+      const qs = scriptQs();
+      const topoRes = await api('/api/topology' + (qs ? '?' + qs : ''));
       state.forwardScript = topoRes.forwardScript || '';
       state.topology = topoRes.topology;
+      const a = document.getElementById('t-dl-script');
+      if (a) a.href = '/api/topology/forward-script?download=1&' + qs;
       if (!topoRes.forwardScript) {
         toast(topoRes.forwardError || '请先填家宽可达地址', 'err');
       } else {
@@ -931,7 +1147,8 @@ async function renderTopology() {
   document.getElementById('t-copy-script').onclick = async () => {
     try {
       if (!state.forwardScript) {
-        const topoRes = await api('/api/topology');
+        const qs = scriptQs();
+        const topoRes = await api('/api/topology' + (qs ? '?' + qs : ''));
         state.forwardScript = topoRes.forwardScript || '';
       }
       await copyText(state.forwardScript);
@@ -941,6 +1158,9 @@ async function renderTopology() {
     }
   };
 
+  const dl = document.getElementById('t-dl-script');
+  if (dl) dl.href = '/api/topology/forward-script?download=1&' + scriptQs();
+
   document.getElementById('t-exit').onclick = () => setupExit();
   document.getElementById('topo-diag').onclick = () => {
     state.page = 'diagnose';
@@ -948,22 +1168,23 @@ async function renderTopology() {
   };
 }
 
-/* ========== 落地机 ========== */
+/* ========== 落地 ========== */
 async function renderServer() {
   await refreshCore().catch(() => {});
   const s = state.server || {};
   const agent = isAgentMode();
-  const node = state.primaryNode;
+  const nodes = state.nodes || [];
+  const landings = landingsList();
   app.innerHTML = shell(`
     <div class="page-header">
       <div>
-        <h2>落地机（落地家宽）</h2>
-        <p class="muted">Agent + mita 装在这里。入站地址请到「拓扑」配置。</p>
+        <h2>落地</h2>
+        <p class="muted">多台家宽 Agent + mita。入站到「拓扑」配置。</p>
       </div>
       <div class="btn-row">
-        <button class="btn btn-primary" id="srv-save">保存 mita 参数</button>
-        <button class="btn btn-success" id="srv-exit">一键落地</button>
-        <button class="btn btn-ghost" id="srv-apply">应用配置</button>
+        <button class="btn btn-primary" id="srv-add">添加落地</button>
+        <button class="btn btn-success" id="srv-apply-all">应用全部</button>
+        <button class="btn btn-ghost" id="srv-save">保存全局 mita 参数</button>
       </div>
     </div>
 
@@ -976,39 +1197,60 @@ async function renderServer() {
         <button class="btn btn-sm ${agent ? 'btn-primary' : 'btn-ghost'}" id="mode-agent">远程家宽 Agent</button>
         <button class="btn btn-sm ${!agent ? 'btn-primary' : 'btn-ghost'}" id="mode-local">面板本机（不推荐）</button>
       </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h3>落地节点</h3>
       ${
-        agent
-          ? `<div class="agent-box">
-        <div class="kv"><span>状态</span><span>${
-          node?.online ? '<span class="badge ok">在线</span>' : '<span class="badge warn">离线</span>'
-        }</span></div>
-        <div class="kv"><span>主机</span><span class="mono">${esc(node?.hostname || '-')}</span></div>
-        <div class="kv"><span>Agent</span><span class="mono">${esc(node?.agentVersion || '-')}</span></div>
-        <div class="kv"><span>mita</span><span class="mono">${esc(
-          node?.mita?.status || node?.lastReport?.mita?.status || '-'
-        )}</span></div>
-        <div class="kv"><span>出网 IP</span><span class="mono">${esc(
-          node?.exitPublicIp || state.exitOverview?.exitPublicIp || '-'
-        )}</span></div>
-        <label style="margin-top:10px">家宽安装命令（root）</label>
-        <pre class="code-block" id="srv-cmd">${esc(state.installCommand || '点击加载…')}</pre>
-        <div class="btn-row">
-          <button class="btn btn-sm btn-primary" id="srv-copy">复制</button>
-          <button class="btn btn-sm btn-ghost" id="srv-load-cmd">刷新命令</button>
-          <button class="btn btn-sm btn-ghost" id="srv-rotate">轮换 Token</button>
-        </div>
-      </div>`
-          : ''
+        nodes.length
+          ? nodes
+              .map((n) => {
+                const L = landings.find((x) => x.nodeId === n.id) || {};
+                return `<div class="card" style="margin:10px 0;padding:12px;border:1px solid var(--border)">
+          <div class="card-head">
+            <strong>${esc(n.name)}</strong>
+            <span>${n.isPrimary ? '<span class="badge ok">默认</span> ' : ''}${
+                  n.online ? '<span class="badge ok">在线</span>' : '<span class="badge warn">离线</span>'
+                }${n.dirty ? ' <span class="badge warn">未应用</span>' : ''}</span>
+          </div>
+          <div class="kv"><span>主机 / Agent</span><span class="mono">${esc(n.hostname || '-')} · ${esc(n.agentVersion || '-')}</span></div>
+          <div class="kv"><span>mita</span><span class="mono">${esc(n.mita?.status || '-')}</span></div>
+          <div class="kv"><span>出网 IP</span><span class="mono">${esc(n.exitPublicIp || '-')}</span></div>
+          <div class="kv"><span>用户数</span><span>${n.clientCount ?? 0}</span></div>
+          <div class="inline-fields" style="margin-top:8px">
+            <div>
+              <label>监听端口</label>
+              <input class="field mono" id="n-port-${n.id}" value="${esc(L.listenPort || n.listenPort || 7901)}" />
+            </div>
+            <div>
+              <label>家宽可达地址</label>
+              <input class="field mono" id="n-home-${n.id}" value="${esc(L.homeReachableHost || '')}" placeholder="IX 能访问的家宽 IP" />
+            </div>
+          </div>
+          <div class="btn-row" style="margin-top:10px">
+            <button class="btn btn-sm btn-primary" data-save-node="${n.id}">保存</button>
+            <button class="btn btn-sm btn-success" data-exit-node="${n.id}">一键落地</button>
+            <button class="btn btn-sm btn-ghost" data-apply-node="${n.id}">应用配置</button>
+            <button class="btn btn-sm btn-ghost" data-cmd-node="${n.id}">安装命令</button>
+            ${n.isPrimary ? '' : `<button class="btn btn-sm btn-ghost" data-primary-node="${n.id}">设为默认</button>`}
+            <button class="btn btn-sm btn-ghost" data-rotate-node="${n.id}">轮换 Token</button>
+            ${nodes.length > 1 ? `<button class="btn btn-sm btn-ghost" data-del-node="${n.id}">删除</button>` : ''}
+          </div>
+          <pre class="code-block" id="cmd-${n.id}" style="display:none;margin-top:8px"></pre>
+        </div>`;
+              })
+              .join('')
+          : '<p class="muted">还没有落地。点「添加落地」或切换远程模式。</p>'
       }
     </div>
 
     <div class="card" style="margin-top:16px">
-      <h3>mita 参数</h3>
+      <h3>全局 mita 默认参数</h3>
       <div class="kv"><span>当前入站 Endpoint</span><span class="mono">${esc(activeEp() || '未配置')}</span></div>
       <p class="field-hint"><a href="#" id="srv-to-topo">到「拓扑」修改 211/114 与 IX 转发</a></p>
       <div class="inline-fields">
         <div>
-          <label>监听端口</label>
+          <label>默认监听端口</label>
           <input class="field mono" id="s-port" value="${esc(s.listenPort || 7901)}" />
         </div>
         <div>
@@ -1024,7 +1266,7 @@ async function renderServer() {
           <input class="field mono" id="s-mtu" value="${esc(s.mtu ?? 1400)}" />
         </div>
       </div>
-      <p class="field-hint">商家入口场景请保持 <strong>TCP</strong>，端口 7900–7999。</p>
+      <p class="field-hint">商家入口场景请保持 <strong>TCP</strong>，端口 7900–7999。各落地可单独覆盖监听端口。</p>
     </div>
   `);
   bindShell();
@@ -1059,38 +1301,112 @@ async function renderServer() {
     }
   };
 
-  const loadCmd = async () => {
+  document.getElementById('srv-add')?.addEventListener('click', async () => {
+    const name = prompt('落地名称', `落地-${(state.nodes || []).length + 1}`);
+    if (name === null) return;
     try {
-      const r = await api('/api/primary/install-command');
-      state.installCommand = r.installCommand;
-      const pre = document.getElementById('srv-cmd');
-      if (pre) pre.textContent = r.installCommand;
-    } catch (e) {
-      toast(e.message, 'err');
-    }
-  };
-  document.getElementById('srv-load-cmd')?.addEventListener('click', loadCmd);
-  document.getElementById('srv-copy')?.addEventListener('click', async () => {
-    try {
-      if (!state.installCommand) await loadCmd();
-      await copyText(state.installCommand);
-      toast('已复制');
-    } catch (e) {
-      toast(e.message, 'err');
-    }
-  });
-  document.getElementById('srv-rotate')?.addEventListener('click', async () => {
-    if (!confirm('轮换 Token 后需重装 Agent。继续？')) return;
-    try {
-      const r = await api('/api/primary/token', { method: 'POST', body: {} });
-      state.installCommand = r.installCommand;
-      document.getElementById('srv-cmd').textContent = r.installCommand;
-      toast('已轮换');
+      const r = await api('/api/nodes', {
+        method: 'POST',
+        body: { name: name || undefined, template: 'cm' },
+      });
+      toast('已创建落地');
+      openModal({
+        title: '安装 Agent',
+        body: `<p>在新落地家宽 root 执行：</p><pre class="code-block">${esc(r.installCommand)}</pre>
+          <button class="btn btn-sm btn-primary" id="new-copy">复制命令</button>`,
+        actions: `<button class="btn btn-primary" data-close>关闭</button>`,
+      });
+      document.getElementById('new-copy')?.addEventListener('click', async () => {
+        await copyText(r.installCommand);
+        toast('已复制');
+      });
+      await refreshCore();
+      render();
     } catch (e) {
       toast(e.message, 'err');
     }
   });
-  if (agent) loadCmd();
+
+  document.querySelectorAll('[data-save-node]').forEach((b) => {
+    b.onclick = async () => {
+      const id = b.dataset.saveNode;
+      try {
+        await api(`/api/nodes/${id}`, {
+          method: 'PUT',
+          body: {
+            listenPort: Number(document.getElementById(`n-port-${id}`)?.value) || 7901,
+            homeReachableHost: document.getElementById(`n-home-${id}`)?.value?.trim() || '',
+          },
+        });
+        toast('已保存');
+        render();
+      } catch (e) {
+        toast(e.message, 'err');
+      }
+    };
+  });
+  document.querySelectorAll('[data-apply-node]').forEach((b) => {
+    b.onclick = () => applyConfig(true, { nodeId: b.dataset.applyNode });
+  });
+  document.querySelectorAll('[data-exit-node]').forEach((b) => {
+    b.onclick = () => setupExit(b.dataset.exitNode);
+  });
+  document.querySelectorAll('[data-cmd-node]').forEach((b) => {
+    b.onclick = async () => {
+      const id = b.dataset.cmdNode;
+      try {
+        const r = await api(`/api/nodes/${id}/install-command`);
+        const pre = document.getElementById(`cmd-${id}`);
+        if (pre) {
+          pre.style.display = 'block';
+          pre.textContent = r.installCommand;
+        }
+        await copyText(r.installCommand);
+        toast('安装命令已复制');
+      } catch (e) {
+        toast(e.message, 'err');
+      }
+    };
+  });
+  document.querySelectorAll('[data-rotate-node]').forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm('轮换 Token 后需重装 Agent。继续？')) return;
+      try {
+        const r = await api(`/api/nodes/${b.dataset.rotateNode}/token`, { method: 'POST', body: {} });
+        toast('已轮换，请复制新安装命令');
+        const pre = document.getElementById(`cmd-${b.dataset.rotateNode}`);
+        if (pre) {
+          pre.style.display = 'block';
+          pre.textContent = r.installCommand;
+        }
+      } catch (e) {
+        toast(e.message, 'err');
+      }
+    };
+  });
+  document.querySelectorAll('[data-primary-node]').forEach((b) => {
+    b.onclick = async () => {
+      try {
+        await api(`/api/nodes/${b.dataset.primaryNode}`, { method: 'PUT', body: { setPrimary: true } });
+        toast('已设为默认落地');
+        render();
+      } catch (e) {
+        toast(e.message, 'err');
+      }
+    };
+  });
+  document.querySelectorAll('[data-del-node]').forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm('删除该落地？绑定用户将改到默认落地。')) return;
+      try {
+        await api(`/api/nodes/${b.dataset.delNode}?force=1`, { method: 'DELETE' });
+        toast('已删除');
+        render();
+      } catch (e) {
+        toast(e.message, 'err');
+      }
+    };
+  });
 
   document.getElementById('srv-save').onclick = async () => {
     try {
@@ -1114,58 +1430,71 @@ async function renderServer() {
       toast(e.message, 'err');
     }
   };
-  document.getElementById('srv-exit').onclick = () => setupExit();
-  document.getElementById('srv-apply').onclick = () => applyConfig(true);
+  document.getElementById('srv-apply-all').onclick = () => applyConfig(true, { all: true });
 }
 
 /* ========== 客户端 ========== */
 async function renderClients() {
   await refreshCore().catch(() => {});
+  const nodes = state.nodes || [];
   app.innerHTML = shell(`
     <div class="page-header">
       <div>
         <h2>客户端</h2>
-        <p class="muted">复制 <strong>mierus://</strong>（211 优先 / 114 备用）。不是 WireGuard。</p>
+        <p class="muted">路由到指定落地 · 流量/到期套餐 · mierus 双入口</p>
       </div>
       <div class="btn-row">
         <button class="btn btn-primary" id="c-add">添加用户</button>
-        <button class="btn btn-success" id="c-apply">应用配置</button>
+        <button class="btn btn-success" id="c-apply">应用全部</button>
       </div>
     </div>
     ${
       !activeEp()
         ? `<div class="alert warn"><div>尚未配置入站。请先到「拓扑」选择 211/114。</div>
           <button class="btn btn-sm btn-primary" data-nav-jump="topology">去拓扑</button></div>`
-        : `<div class="alert info"><div>当前 Endpoint：<code class="mono">${esc(activeEp())}</code> · 电脑连商家 IX 前置</div></div>`
+        : `<div class="alert info"><div>默认 Endpoint：<code class="mono">${esc(activeEp())}</code> · 用户可绑不同落地/端口</div></div>`
     }
     <div class="card">
       ${
         state.clients.length
-          ? `<table><thead><tr><th>登录用户名</th><th>密码</th><th>备注</th><th>状态</th><th></th></tr></thead><tbody>
+          ? `<div style="overflow:auto"><table><thead><tr>
+              <th>登录名</th><th>落地</th><th>端口</th><th>用量</th><th>到期</th><th>配额</th><th>状态</th><th></th>
+            </tr></thead><tbody>
           ${state.clients
-            .map(
-              (c) => `<tr>
-            <td class="mono"><strong>${esc(c.name)}</strong></td>
-            <td class="mono">${esc(c.password)}</td>
-            <td>${esc(c.note || '-')}</td>
-            <td>${c.enabled !== false ? '<span class="badge ok">启用</span>' : '<span class="badge">停用</span>'}</td>
+            .map((c) => {
+              const st = c.statusFlags || {};
+              const badge = st.expired
+                ? '<span class="badge warn">到期</span>'
+                : st.overQuota
+                  ? '<span class="badge warn">超额</span>'
+                  : c.enabled !== false
+                    ? '<span class="badge ok">启用</span>'
+                    : '<span class="badge">停用</span>';
+              return `<tr>
+            <td class="mono"><strong>${esc(c.name)}</strong>${c.note ? `<div class="muted" style="font-size:11px">${esc(c.note)}</div>` : ''}</td>
+            <td>${esc(nodeName(c.route?.landingNodeId))}</td>
+            <td class="mono">${esc(c.route?.listenPort || '默认')}</td>
+            <td class="mono">${esc(c.usage?.totalHuman || '—')}${c.usage?.collectedAt ? `<div class="muted" style="font-size:10px">${esc(fmtTime(c.usage.collectedAt))}</div>` : ''}</td>
+            <td class="mono">${esc(c.package?.expireAt ? String(c.package.expireAt).slice(0, 10) : '不限')}</td>
+            <td class="mono">${c.package?.quotaMb ? esc(c.package.quotaMb) + ' MB' : '不限'}</td>
+            <td>${badge}</td>
             <td class="btn-row">
-              <button class="btn btn-sm btn-primary" data-qr="${c.id}">211/114</button>
+              <button class="btn btn-sm btn-primary" data-qr="${c.id}">链接</button>
               <button class="btn btn-sm btn-ghost" data-edit="${c.id}">编辑</button>
               <button class="btn btn-sm btn-ghost" data-del="${c.id}">删除</button>
             </td>
-          </tr>`
-            )
+          </tr>`;
+            })
             .join('')}
-        </tbody></table>
-        <p class="field-hint" style="margin-top:10px">客户端「用户」必须填<strong>登录用户名</strong>（如 u7af760），不能填中文备注。</p>`
+        </tbody></table></div>
+        <p class="field-hint" style="margin-top:10px">客户端「用户」填登录名（英文/数字）。流量为落地 mita 快照，非计费级精确。</p>`
           : '<p class="muted">还没有用户，点「添加用户」</p>'
       }
     </div>
   `);
   bindShell();
   document.getElementById('c-add').onclick = () => openClientModal();
-  document.getElementById('c-apply').onclick = () => applyConfig(true);
+  document.getElementById('c-apply').onclick = () => applyConfig(true, { all: true });
   document.querySelectorAll('[data-qr]').forEach((b) => {
     b.onclick = () => showClientQr(b.dataset.qr);
   });
@@ -1191,19 +1520,48 @@ async function renderClients() {
 
 function openClientModal(client) {
   const isEdit = Boolean(client);
+  const nodes = state.nodes || [];
+  const landingOpts = nodes
+    .map(
+      (n) =>
+        `<option value="${esc(n.id)}" ${
+          (client?.route?.landingNodeId || state.primaryNode?.id) === n.id ? 'selected' : ''
+        }>${esc(n.name)}${n.isPrimary ? '（默认）' : ''}</option>`
+    )
+    .join('');
   openModal({
     title: isEdit ? '编辑用户' : '添加用户',
     body: `
-      <label>登录用户名（客户端「用户」栏，须英文/数字）</label>
-      <input class="field mono" id="c-name" value="${esc(client?.name || '')}" placeholder="留空自动生成，如 u7af760" />
-      <p class="field-hint">不要填中文当登录名。显示名请写备注。</p>
+      <label>登录用户名（须英文/数字）</label>
+      <input class="field mono" id="c-name" value="${esc(client?.name || '')}" placeholder="留空自动生成" />
       <label>密码${isEdit ? '（留空不改）' : ''}</label>
-      <input class="field mono" id="c-pass" value="" placeholder="${isEdit ? '留空保持原密码' : '留空自动生成'}" />
-      <label>备注 / 显示名（仅面板展示）</label>
+      <input class="field mono" id="c-pass" value="" placeholder="${isEdit ? '留空保持' : '留空自动'}" />
+      <label>备注</label>
       <input class="field" id="c-note" value="${esc(client?.note || '')}" placeholder="例如：我的电脑" />
+      <label>绑定落地</label>
+      <select class="field" id="c-landing">${landingOpts || '<option value="">默认</option>'}</select>
+      <label>专用端口（空=落地默认）</label>
+      <input class="field mono" id="c-port" value="${esc(client?.route?.listenPort || '')}" placeholder="7901" />
+      <div class="inline-fields">
+        <div>
+          <label>流量配额 MB（0=不限）</label>
+          <input class="field mono" id="c-quota" value="${esc(client?.package?.quotaMb ?? 0)}" />
+        </div>
+        <div>
+          <label>配额天数</label>
+          <input class="field mono" id="c-qdays" value="${esc(client?.package?.quotaDays ?? 30)}" />
+        </div>
+      </div>
+      <label>到期日（YYYY-MM-DD，空=不限）</label>
+      <input class="field mono" id="c-expire" value="${esc(
+        client?.package?.expireAt ? String(client.package.expireAt).slice(0, 10) : ''
+      )}" placeholder="2026-12-31" />
       ${
         isEdit
-          ? `<label class="check-row"><input type="checkbox" id="c-regen" /> 重新生成密码</label>`
+          ? `<label class="check-row"><input type="checkbox" id="c-enabled" ${
+              client.enabled !== false ? 'checked' : ''
+            } /> 启用</label>
+             <label class="check-row"><input type="checkbox" id="c-regen" /> 重新生成密码</label>`
           : ''
       }
     `,
@@ -1214,26 +1572,29 @@ function openClientModal(client) {
   });
   document.getElementById('c-save').onclick = async () => {
     try {
+      const body = {
+        name: val('c-name') || client?.name,
+        note: val('c-note'),
+        route: {
+          landingNodeId: val('c-landing') || null,
+          listenPort: val('c-port') ? Number(val('c-port')) : null,
+        },
+        package: {
+          quotaMb: Number(val('c-quota')) || 0,
+          quotaDays: Number(val('c-qdays')) || 30,
+          expireAt: val('c-expire') || '',
+        },
+      };
+      if (val('c-pass')) body.password = val('c-pass');
       if (isEdit) {
-        const body = {
-          name: val('c-name') || client.name,
-          note: val('c-note'),
-          regeneratePassword: document.getElementById('c-regen')?.checked,
-        };
-        if (val('c-pass')) body.password = val('c-pass');
+        body.regeneratePassword = document.getElementById('c-regen')?.checked;
+        body.enabled = document.getElementById('c-enabled')?.checked;
         await api(`/api/clients/${client.id}`, { method: 'PUT', body });
         toast('已保存');
         closeModal();
         render();
       } else {
-        const r = await api('/api/clients', {
-          method: 'POST',
-          body: {
-            name: val('c-name'),
-            password: val('c-pass'),
-            note: val('c-note'),
-          },
-        });
+        const r = await api('/api/clients', { method: 'POST', body });
         toast('已创建');
         closeModal();
         await refreshCore();
@@ -1368,9 +1729,28 @@ async function renderDiagnose() {
 
 /* ========== 设置 ========== */
 async function renderSettings() {
+  const auto = state.status?.settings?.autoApplyEnforce !== false;
+  const nodes = state.nodes || [];
   app.innerHTML = shell(`
     <div class="page-header"><div><h2>设置</h2></div></div>
     <div class="card">
+      <h3>套餐强制</h3>
+      <label class="check-row">
+        <input type="checkbox" id="set-auto" ${auto ? 'checked' : ''} />
+        到期/超额自动停用并下发到落地（默认开）
+      </label>
+      <label style="margin-top:10px">默认落地</label>
+      <select class="field" id="set-primary">
+        ${nodes
+          .map(
+            (n) =>
+              `<option value="${esc(n.id)}" ${n.isPrimary ? 'selected' : ''}>${esc(n.name)}</option>`
+          )
+          .join('')}
+      </select>
+      <button class="btn btn-primary" id="set-save" style="margin-top:10px">保存设置</button>
+    </div>
+    <div class="card" style="margin-top:16px">
       <h3>修改密码</h3>
       <label>当前密码</label><input class="field" type="password" id="pw-old" />
       <label>新密码</label><input class="field" type="password" id="pw-new" />
@@ -1378,12 +1758,28 @@ async function renderSettings() {
     </div>
     <div class="card" style="margin-top:16px">
       <h3>关于</h3>
-      <p class="muted">版本 <strong>v${esc(state.status?.version || '')}</strong> · 协议 <strong>mieru / mita</strong></p>
-      <p class="field-hint">拓扑：电脑 → 商家IX前置 → 沪日IX → 落地家宽。面板装独立 VPS。WireGuard 在此线路不可用。</p>
+      <p class="muted">版本 <strong>v${esc(state.status?.version || '')}</strong> · 协议 <strong>mieru / mita</strong> · 多落地多 IX</p>
+      <p class="field-hint">路径：电脑 → 商家IX前置 → IX → 落地家宽。面板装独立 VPS。升级前请备份 data/state.json。</p>
       <a class="btn btn-sm btn-ghost" href="/api/export">导出 JSON</a>
     </div>
   `);
   bindShell();
+  document.getElementById('set-save').onclick = async () => {
+    try {
+      await api('/api/settings', {
+        method: 'PUT',
+        body: {
+          autoApplyEnforce: document.getElementById('set-auto')?.checked,
+          primaryNodeId: val('set-primary') || undefined,
+        },
+      });
+      toast('设置已保存');
+      await refreshCore();
+      render();
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  };
   document.getElementById('pw-save').onclick = async () => {
     try {
       await api('/api/password', {
@@ -1428,13 +1824,23 @@ function startJobPoll() {
   }, 4000);
 }
 
-async function applyConfig(confirmFirst = false) {
+async function applyConfig(confirmFirst = false, opts = {}) {
   if (confirmFirst) {
-    if (!confirm('将 mita 配置下发到落地家宽。继续？')) return;
+    const tip = opts.nodeId
+      ? '将 mita 配置下发到该落地。继续？'
+      : opts.all
+        ? '将配置下发到全部落地。继续？'
+        : '将 mita 配置下发到默认落地。继续？';
+    if (!confirm(tip)) return;
   }
   try {
     toast('正在下发…', 'warn');
-    const res = await api('/api/apply', { method: 'POST', body: {} });
+    const body = {};
+    if (opts.nodeId) body.nodeId = opts.nodeId;
+    if (opts.all) body.all = true;
+    const res = opts.nodeId
+      ? await api(`/api/nodes/${opts.nodeId}/apply`, { method: 'POST', body: {} })
+      : await api('/api/apply', { method: 'POST', body });
     toast(res.message || '完成', res.ok ? 'ok' : 'err');
     if (res.pending) startJobPoll();
     await refreshCore();
@@ -1444,11 +1850,13 @@ async function applyConfig(confirmFirst = false) {
   }
 }
 
-async function setupExit() {
+async function setupExit(nodeId) {
   if (!confirm('在落地家宽安装/配置 mita 并放行端口？不会改面板机/IX 网络。')) return;
   try {
     toast('正在一键落地…', 'warn');
-    const res = await api('/api/exit/setup', { method: 'POST', body: {} });
+    const res = nodeId
+      ? await api(`/api/nodes/${nodeId}/exit`, { method: 'POST', body: {} })
+      : await api('/api/exit/setup', { method: 'POST', body: {} });
     toast(res.message || '完成', res.ok ? 'ok' : 'err');
     if (res.pending) startJobPoll();
     openModal({
@@ -1457,7 +1865,7 @@ async function setupExit() {
         <p>${esc(res.message || '')}</p>
         <ol class="field-hint" style="padding-left:18px">
           <li>Agent 约 10 秒拉取任务</li>
-          <li>在「拓扑」生成 IX 转发脚本并在沪日机 root 执行</li>
+          <li>在「拓扑」生成 IX 转发脚本并在对应 IX root 整文件执行</li>
           <li>勾选「IX 转发已配置」</li>
           <li>本机客户端连商家前置 <strong>114/211</strong> mierus 链接</li>
         </ol>
@@ -1537,6 +1945,7 @@ async function boot() {
     if (!status.loggedIn) return renderLogin();
     state.mode = status.mode || 'agent';
     state.primaryNode = status.primaryNode;
+    state.nodes = status.nodes || [];
     state.wizardDone = status.wizardDone;
     state.topology = status.topology || null;
     await refreshCore();

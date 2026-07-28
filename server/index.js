@@ -16,6 +16,7 @@ const {
   loadState,
   saveState,
   ensureDataDir,
+  ensureClientFields,
 } = require('./config');
 const auth = require('./auth');
 const mieru = require('./mieru');
@@ -28,6 +29,10 @@ let state = loadState();
 nodes.ensureNodes(state);
 topology.ensureTopology(state);
 mieru.ensureMieruDefaults(state);
+// ensure default landing bound
+if (state.primaryNodeId && state.topology.landings[0] && !state.topology.landings[0].nodeId) {
+  state.topology.landings[0].nodeId = state.primaryNodeId;
+}
 persist();
 
 if (!state.username) {
@@ -55,19 +60,40 @@ function clientIp(req) {
   );
 }
 
+function hasher() {
+  return {
+    configHash: (fake) => {
+      // fake may be {server, clients} from node or full state
+      if (fake && fake.clients && fake.server && !fake.topology) {
+        return mieru.configHash({ server: fake.server, clients: fake.clients, primaryNodeId: state.primaryNodeId });
+      }
+      return mieru.configHash(fake || state);
+    },
+  };
+}
+
 function markDirtyUnified() {
   if (state.mode === 'agent') {
-    const node = nodes.getPrimaryNode(state);
-    if (node) nodes.markNodeDirty(node);
+    nodes.markAllNodesDirty(state);
   }
+}
+
+function markDirtyForClient(client) {
+  if (state.mode !== 'agent') return;
+  const nid = mieru.clientLandingNodeId(client, state) || state.primaryNodeId;
+  if (nid) nodes.markDirtyForLanding(state, nid);
+  else markDirtyUnified();
 }
 
 function isUnifiedDirty() {
   if (state.mode === 'agent') {
-    const primary = nodes.getPrimaryNode(state);
-    return primary ? nodes.isNodeDirty(primary, { configHash: mieru.configHash }) : mieru.isDirty(state);
+    return nodes.ensureNodes(state).some((n) => nodes.isNodeDirty(n, hasher()));
   }
   return mieru.isDirty(state);
+}
+
+function anyNodeDirty() {
+  return isUnifiedDirty();
 }
 
 function publicServer(s) {
@@ -81,33 +107,37 @@ function publicServer(s) {
   };
 }
 
+function enrichNodePublic(node) {
+  if (!node) return null;
+  const userCount = mieru.clientsForNode(state, node.id).length;
+  const pub = nodes.publicNode(node, { hasher: hasher(), userCount });
+  const jobs = node.jobs || [];
+  const latest = jobs[0] || null;
+  pub.latestJob = latest
+    ? {
+        id: latest.id,
+        type: latest.type,
+        status: latest.status,
+        message: latest.result?.message || '',
+        createdAt: latest.createdAt,
+        finishedAt: latest.finishedAt,
+      }
+    : null;
+  pub.isPrimary = state.primaryNodeId === node.id;
+  return pub;
+}
+
 function publicModeInfo() {
   const primary = nodes.getPrimaryNode(state);
-  const pub = primary ? nodes.publicNode(primary) : null;
-  if (pub && primary) {
-    pub.dirty = nodes.isNodeDirty(primary, { configHash: mieru.configHash });
-    const jobs = primary.jobs || [];
-    const latest = jobs[0] || null;
-    pub.latestJob = latest
-      ? {
-          id: latest.id,
-          type: latest.type,
-          status: latest.status,
-          message: latest.result?.message || '',
-          createdAt: latest.createdAt,
-          finishedAt: latest.finishedAt,
-        }
-      : null;
-    const report = primary.lastReport || {};
-    pub.mita = report.mita || null;
-    pub.exitPublicIp = report.exitPublicIp || null;
-  }
+  const pub = primary ? enrichNodePublic(primary) : null;
   return {
     mode: state.mode || 'local',
     protocol: state.protocol || 'mieru',
     primaryNodeId: state.primaryNodeId || null,
     primaryNode: pub,
+    nodes: nodes.ensureNodes(state).map((n) => enrichNodePublic(n)),
     showAdvancedNodes: Boolean(state.settings?.showAdvancedNodes),
+    autoApplyEnforce: state.settings?.autoApplyEnforce !== false,
     clientsNeedRescan: Boolean(state.clientsNeedRescan),
   };
 }
@@ -117,6 +147,152 @@ function panelBaseUrl(req) {
   const proto = req.headers['x-forwarded-proto'] || 'http';
   return `${proto}://${host}`.replace(/\/$/, '');
 }
+
+function applyRoutePackageBody(client, body) {
+  ensureClientFields(client, state.primaryNodeId);
+  if (body.route && typeof body.route === 'object') {
+    const r = body.route;
+    if (r.landingNodeId !== undefined) {
+      client.route.landingNodeId = r.landingNodeId || state.primaryNodeId || null;
+    }
+    if (r.ixId !== undefined) client.route.ixId = r.ixId || null;
+    if (r.listenPort !== undefined) {
+      client.route.listenPort = r.listenPort ? Number(r.listenPort) : null;
+    }
+    if (r.ingressActive !== undefined) {
+      client.route.ingressActive = r.ingressActive || null;
+    }
+  }
+  // flat fields convenience
+  if (body.landingNodeId !== undefined) {
+    client.route.landingNodeId = body.landingNodeId || state.primaryNodeId || null;
+  }
+  if (body.listenPort !== undefined) {
+    client.route.listenPort = body.listenPort ? Number(body.listenPort) : null;
+  }
+  if (body.ixId !== undefined) client.route.ixId = body.ixId || null;
+
+  if (body.package && typeof body.package === 'object') {
+    const p = body.package;
+    if (p.quotaMb !== undefined) client.package.quotaMb = Math.max(0, Number(p.quotaMb) || 0);
+    if (p.quotaDays !== undefined) client.package.quotaDays = Math.max(0, Number(p.quotaDays) || 0);
+    if (p.quotaMode !== undefined) {
+      client.package.quotaMode = p.quotaMode === 'calendar' ? 'calendar' : 'rolling';
+    }
+    if (p.expireAt !== undefined) client.package.expireAt = String(p.expireAt || '').trim();
+    if (p.bandwidthMbps !== undefined) {
+      client.package.bandwidthMbps = Math.max(0, Number(p.bandwidthMbps) || 0);
+    }
+  }
+  if (body.quotaMb !== undefined) client.package.quotaMb = Math.max(0, Number(body.quotaMb) || 0);
+  if (body.expireAt !== undefined) client.package.expireAt = String(body.expireAt || '').trim();
+  if (body.quotaDays !== undefined) client.package.quotaDays = Math.max(0, Number(body.quotaDays) || 0);
+}
+
+function buildBundleForNode(node) {
+  mieru.ensureMieruDefaults(state);
+  topology.ensureTopology(state);
+  const landing = topology.getLandingByNodeId(state, node.id);
+  const listenPort =
+    Number(landing?.listenPort) ||
+    Number(node.server?.listenPort) ||
+    Number(state.server.listenPort) ||
+    7901;
+
+  // sync node.server listenPort from landing
+  node.server = {
+    ...(node.server || {}),
+    ...state.server,
+    listenPort,
+    protocol: state.server.protocol || 'TCP',
+  };
+
+  const users = mieru.usersForBundle(state, node.id);
+  const enabled = users.filter((u) => u.enabled !== false);
+  const fakeClients = enabled.map((u) => ({
+    id: u.id,
+    name: u.name,
+    password: u.password,
+    enabled: true,
+  }));
+  // if no enabled users, still allow empty? mita needs users — throw at build
+  const fake = {
+    server: { ...state.server, listenPort, protocol: node.server.protocol },
+    clients: fakeClients.length
+      ? fakeClients
+      : [
+          // fallback: if node has zero users, include a placeholder disabled path
+          // buildServerConfig will throw NO_USERS which is correct
+        ],
+    primaryNodeId: node.id,
+  };
+
+  let serverConfig;
+  try {
+    serverConfig = mieru.buildServerConfig({
+      server: fake.server,
+      clients: fake.clients,
+      primaryNodeId: node.id,
+    });
+  } catch (err) {
+    // rethrow
+    throw err;
+  }
+  const hash = crypto
+    .createHash('sha256')
+    .update(JSON.stringify({ serverConfig, users: users.map((u) => ({ n: u.name, e: u.enabled, p: u.package })) }))
+    .digest('hex');
+
+  return {
+    protocol: 'mieru',
+    nodeId: node.id,
+    server: {
+      listenPort,
+      protocol: mieru.normalizeProtocol(fake.server.protocol),
+      endpoint: fake.server.endpoint || '',
+      mtu: fake.server.mtu,
+      multiplexing: fake.server.multiplexing,
+    },
+    users,
+    serverConfig,
+    configHash: hash,
+  };
+}
+
+function enqueueApply(node, type = 'mieru_apply') {
+  nodes.markNodeDirty(node);
+  return nodes.enqueueJob(node, type, {});
+}
+
+function runEnforce() {
+  const { changed, nodeIds } = mieru.enforcePackages(state);
+  if (!changed.length) return { changed: [], applied: [] };
+  const auto = state.settings?.autoApplyEnforce !== false;
+  const applied = [];
+  for (const nid of nodeIds) {
+    const node = nodes.findNode(state, nid);
+    if (!node) continue;
+    nodes.markNodeDirty(node);
+    if (auto && state.mode === 'agent') {
+      enqueueApply(node, 'mieru_apply');
+      applied.push(nid);
+    }
+  }
+  persist();
+  if (changed.length) {
+    console.log(`[panel] 套餐强制停用 ${changed.length} 用户 · 落地 ${nodeIds.join(',') || '-'}`);
+  }
+  return { changed, applied };
+}
+
+// periodic enforce
+setInterval(() => {
+  try {
+    runEnforce();
+  } catch (e) {
+    console.warn('[panel] enforce error:', e.message);
+  }
+}, 60 * 1000);
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -130,7 +306,8 @@ app.get('/api/health', (req, res) => {
     version: require(path.join(ROOT, 'package.json')).version,
     protocol: 'mieru',
     profile: state.topology?.profile || 'cm-ix-home',
-    path: 'client → merchant-ix-ingress → 沪日IX → home mita',
+    path: 'client → merchant-ix-ingress → IX → home mita',
+    multiLanding: true,
     uptime: process.uptime(),
   });
 });
@@ -146,7 +323,6 @@ app.get('/install-mita.sh', (req, res) => {
 });
 
 app.get('/api/status', async (req, res) => {
-  // 注意：/api/status 在 auth 中间件里放行，不会挂 req.user；必须自己读 cookie
   const token = req.cookies?.wg_session || req.headers['x-session-token'];
   const loggedIn = auth.isAuthed(token);
   const modeInfo = publicModeInfo();
@@ -166,10 +342,17 @@ app.get('/api/status', async (req, res) => {
     mode: modeInfo.mode,
     primaryNodeId: modeInfo.primaryNodeId,
     primaryNode: loggedIn ? modeInfo.primaryNode : undefined,
+    nodes: loggedIn ? modeInfo.nodes : undefined,
     clientsNeedRescan: loggedIn ? Boolean(state.clientsNeedRescan) : false,
     server: loggedIn ? publicServer(state.server) : undefined,
     topology: loggedIn ? topology.publicTopology(state) : undefined,
     legacyWireGuard: loggedIn ? Boolean(state.legacyWireGuard) : false,
+    settings: loggedIn
+      ? {
+          autoApplyEnforce: state.settings?.autoApplyEnforce !== false,
+          showAdvancedNodes: Boolean(state.settings?.showAdvancedNodes),
+        }
+      : undefined,
   });
 });
 
@@ -268,12 +451,16 @@ app.get('/api/server', (req, res) => {
 
 app.get('/api/topology', (req, res) => {
   topology.ensureTopology(state);
-  const fwd = topology.buildIxForwardScript(state);
+  const ixId = req.query.ixId || undefined;
+  const landingId = req.query.landingId || undefined;
+  const port = req.query.port ? Number(req.query.port) : undefined;
+  const fwd = topology.buildIxForwardScript(state, { ixId, landingId, port });
   res.json({
     topology: topology.publicTopology(state),
     forwardScript: fwd.ok ? fwd.script : '',
     forwardError: fwd.error || '',
     server: publicServer(state.server),
+    nodes: nodes.ensureNodes(state).map((n) => enrichNodePublic(n)),
   });
 });
 
@@ -287,7 +474,6 @@ app.put('/api/topology', (req, res) => {
     }
   })();
   const { endpointChanged } = topology.applyTopologyPatch(state, body);
-  // 监听端口变更会影响 mita
   let serverConfChanged = false;
   try {
     serverConfChanged = prevHash !== mieru.configHash(state);
@@ -301,7 +487,7 @@ app.put('/api/topology', (req, res) => {
   persist();
   const tips = [];
   if (endpointChanged) tips.push('前置入口已更新，请重新复制客户端链接（商家 IX 前置 114/211）');
-  if (serverConfChanged) tips.push('监听参数有变，请在落地家宽「应用配置/一键落地」');
+  if (serverConfChanged) tips.push('监听参数有变，请在落地「应用配置/一键落地」');
   res.json({
     ok: true,
     topology: topology.publicTopology(state),
@@ -315,10 +501,17 @@ app.put('/api/topology', (req, res) => {
 });
 
 app.get('/api/topology/forward-script', (req, res) => {
-  const fwd = topology.buildIxForwardScript(state);
+  const fwd = topology.buildIxForwardScript(state, {
+    ixId: req.query.ixId,
+    landingId: req.query.landingId,
+    port: req.query.port ? Number(req.query.port) : undefined,
+  });
   if (!fwd.ok) return res.status(400).json({ error: fwd.error, script: '' });
   if (req.query.download === '1') {
-    res.setHeader('Content-Disposition', 'attachment; filename="ix-forward-7901.sh"');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="ix-forward-${fwd.listenPort || 7901}.sh"`
+    );
     res.type('text/x-shellscript');
     return res.send(fwd.script);
   }
@@ -354,7 +547,6 @@ app.put('/api/server', (req, res) => {
     s.endpoint = `${String(s.endpoint).trim()}:${s.listenPort}`;
   }
 
-  // 反写 topology（兼容旧 API）
   topology.ensureTopology(state);
   if (body.listenPort !== undefined) state.topology.ingress.port = s.listenPort;
   if (body.protocol !== undefined) state.topology.ingress.protocol = s.protocol;
@@ -394,15 +586,6 @@ app.put('/api/server', (req, res) => {
 
   if (serverConfChanged) {
     markDirtyUnified();
-  } else if (state.mode === 'agent') {
-    const node = nodes.getPrimaryNode(state);
-    if (node && node.lastAppliedHash) {
-      try {
-        if (mieru.configHash(state) === node.lastAppliedHash) node._dirtyFlag = false;
-      } catch {
-        /* */
-      }
-    }
   }
 
   persist();
@@ -432,11 +615,37 @@ app.post('/api/clients/rescan-ack', (req, res) => {
 app.get('/api/clients', (req, res) => {
   mieru.ensureMieruDefaults(state);
   res.json({
-    clients: state.clients.map((c) => mieru.publicClient(c)),
+    clients: state.clients.map((c) => mieru.publicClient(c, state)),
     dirty: isUnifiedDirty(),
     clientsNeedRescan: Boolean(state.clientsNeedRescan),
     mode: state.mode,
     protocol: 'mieru',
+    nodes: nodes.ensureNodes(state).map((n) => ({
+      id: n.id,
+      name: n.name,
+      online: nodes.isNodeOnline(n),
+      isPrimary: n.id === state.primaryNodeId,
+    })),
+    ixes: (state.topology?.ixes || []).map((x) => ({ id: x.id, name: x.name })),
+  });
+});
+
+app.get('/api/clients/usage', (req, res) => {
+  mieru.ensureMieruDefaults(state);
+  res.json({
+    clients: state.clients.map((c) => {
+      const p = mieru.publicClient(c, state);
+      return {
+        id: p.id,
+        name: p.name,
+        note: p.note,
+        enabled: p.enabled,
+        usage: p.usage,
+        package: p.package,
+        statusFlags: p.statusFlags,
+        landingNodeId: p.route.landingNodeId,
+      };
+    }),
   });
 });
 
@@ -444,7 +653,6 @@ app.post('/api/clients', (req, res) => {
   const body = req.body || {};
   let name = (body.name || '').trim();
   const note = (body.note || '').trim();
-  // 中文备注不能当 mita 登录名
   if (name && !mieru.isValidMieruUsername(name)) {
     return res.status(400).json({
       error: '登录用户名只能用英文/数字/._-（例如 u7af760）。「我的手机」请填到备注',
@@ -463,12 +671,15 @@ app.post('/api/clients', (req, res) => {
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
+  ensureClientFields(client, state.primaryNodeId);
+  applyRoutePackageBody(client, body);
+  if (!client.route.landingNodeId) client.route.landingNodeId = state.primaryNodeId;
   state.clients.push(client);
   state.wizardDone = true;
-  markDirtyUnified();
+  markDirtyForClient(client);
   persist();
   res.status(201).json({
-    client: mieru.publicClient(client),
+    client: mieru.publicClient(client, state),
     dirty: true,
     mode: state.mode,
   });
@@ -478,6 +689,8 @@ app.put('/api/clients/:id', (req, res) => {
   const c = state.clients.find((x) => x.id === req.params.id);
   if (!c) return res.status(404).json({ error: '用户不存在' });
   const body = req.body || {};
+  const prevLanding = mieru.clientLandingNodeId(c, state);
+
   if (body.name !== undefined) {
     const name = String(body.name).trim();
     if (!name) return res.status(400).json({ error: '用户名不能为空' });
@@ -504,10 +717,22 @@ app.put('/api/clients/:id', (req, res) => {
   }
   if (body.enabled !== undefined) c.enabled = Boolean(body.enabled);
   if (body.note !== undefined) c.note = String(body.note);
+  applyRoutePackageBody(c, body);
   c.updatedAt = new Date().toISOString();
-  markDirtyUnified();
+
+  const nextLanding = mieru.clientLandingNodeId(c, state);
+  markDirtyForClient(c);
+  if (prevLanding && prevLanding !== nextLanding) {
+    nodes.markDirtyForLanding(state, prevLanding);
+  }
+  if (body.route?.listenPort || body.listenPort) state.clientsNeedRescan = true;
+
   persist();
-  res.json({ client: mieru.publicClient(c), dirty: true, clientsNeedRescan: state.clientsNeedRescan });
+  res.json({
+    client: mieru.publicClient(c, state),
+    dirty: true,
+    clientsNeedRescan: state.clientsNeedRescan,
+  });
 });
 
 app.delete('/api/clients/:id', (req, res) => {
@@ -519,9 +744,9 @@ app.delete('/api/clients/:id', (req, res) => {
   }
   const idx = state.clients.findIndex((x) => x.id === req.params.id);
   const [removed] = state.clients.splice(idx, 1);
-  markDirtyUnified();
+  markDirtyForClient(removed);
   persist();
-  res.json({ ok: true, removed: mieru.publicClient(removed), dirty: true });
+  res.json({ ok: true, removed: mieru.publicClient(removed, state), dirty: true });
 });
 
 app.get('/api/clients/:id/config', async (req, res) => {
@@ -538,7 +763,9 @@ app.get('/api/clients/:id/config', async (req, res) => {
     const preferHost =
       dual.active === 'external'
         ? dual.endpoints.external.split(':')[0]
-        : dual.endpoints.mobile.split(':')[0];
+        : dual.active === 'custom'
+          ? dual.endpoints.active.split(':')[0]
+          : dual.endpoints.mobile.split(':')[0];
     clientJson = mieru.buildClientJson(state, c, proto, preferHost);
   } catch (err) {
     return res.status(400).json({ error: err.message, code: err.code });
@@ -560,7 +787,7 @@ app.get('/api/clients/:id/config', async (req, res) => {
     return res.json({
       name: c.name,
       note: c.note || '',
-      endpoint: state.server.endpoint,
+      endpoint: dual.endpoints.active,
       endpoints: dual.endpoints,
       shareLink,
       shareLinks: { mobile: dual.mobile, external: dual.external, preferred: dual.preferred },
@@ -569,18 +796,202 @@ app.get('/api/clients/:id/config', async (req, res) => {
       qrExternal,
       config: JSON.stringify(clientJson, null, 2),
       tip: dual.tip,
-      path: '电脑/客户端 → 商家IX前置 → 沪日IX → 落地家宽 mita',
+      route: mieru.publicClient(c, state).route,
+      path: '电脑/客户端 → 商家IX前置 → IX → 落地家宽 mita',
     });
   }
   res.json({
     name: c.name,
     note: c.note || '',
-    endpoint: state.server.endpoint,
+    endpoint: dual.endpoints.active,
     endpoints: dual.endpoints,
     shareLink,
     shareLinks: { mobile: dual.mobile, external: dual.external, preferred: dual.preferred },
     client: clientJson,
     tip: dual.tip,
+    route: mieru.publicClient(c, state).route,
+  });
+});
+
+// ---------- Nodes / Landings ----------
+
+app.get('/api/nodes', (req, res) => {
+  topology.ensureTopology(state);
+  res.json({
+    nodes: nodes.ensureNodes(state).map((n) => enrichNodePublic(n)),
+    primaryNodeId: state.primaryNodeId,
+    landings: state.topology.landings,
+    mode: state.mode,
+  });
+});
+
+app.post('/api/nodes', (req, res) => {
+  const body = req.body || {};
+  const { node, token } = nodes.createNode(state, {
+    name: body.name || `落地-${nodes.ensureNodes(state).length + 1}`,
+    note: body.note || '',
+    template: body.template || 'cm',
+  });
+  if (body.listenPort) node.server.listenPort = Number(body.listenPort) || 7901;
+  // add landing meta
+  topology.ensureTopology(state);
+  const landing = topology.defaultLanding({
+    id: topology.newId('landing'),
+    nodeId: node.id,
+    name: node.name,
+    listenPort: node.server.listenPort,
+    homeReachableHost: body.homeReachableHost || '',
+    homeReachablePort: body.homeReachablePort || node.server.listenPort,
+  });
+  state.topology.landings.push(landing);
+  if (!state.primaryNodeId) {
+    state.primaryNodeId = node.id;
+    state.mode = 'agent';
+  }
+  const base = panelBaseUrl(req);
+  const installCmd = nodes.installCommand({
+    panelUrl: base,
+    token,
+    name: node.name,
+  });
+  persist();
+  res.status(201).json({
+    ok: true,
+    node: enrichNodePublic(node),
+    token,
+    installCommand: installCmd,
+    landing,
+  });
+});
+
+app.put('/api/nodes/:id', (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  const body = req.body || {};
+  if (body.name !== undefined) node.name = String(body.name || node.name);
+  if (body.note !== undefined) node.note = String(body.note || '');
+  if (body.listenPort !== undefined) {
+    node.server.listenPort = Number(body.listenPort) || node.server.listenPort;
+    nodes.markNodeDirty(node);
+  }
+  // update landing meta
+  topology.ensureTopology(state);
+  let landing = topology.getLandingByNodeId(state, node.id);
+  if (!landing && body.createLanding !== false) {
+    landing = topology.defaultLanding({
+      id: topology.newId('landing'),
+      nodeId: node.id,
+      name: node.name,
+      listenPort: node.server.listenPort,
+    });
+    state.topology.landings.push(landing);
+  }
+  if (landing) {
+    if (body.homeReachableHost !== undefined) {
+      landing.homeReachableHost = String(body.homeReachableHost || '').trim();
+    }
+    if (body.homeReachablePort !== undefined) {
+      landing.homeReachablePort = topology.clampPort(body.homeReachablePort, node.server.listenPort);
+    }
+    if (body.listenPort !== undefined) landing.listenPort = Number(body.listenPort) || landing.listenPort;
+    if (body.name !== undefined) landing.name = node.name;
+  }
+  if (body.setPrimary) {
+    state.primaryNodeId = node.id;
+    state.mode = 'agent';
+  }
+  persist();
+  res.json({ ok: true, node: enrichNodePublic(node), landing });
+});
+
+app.delete('/api/nodes/:id', (req, res) => {
+  const id = req.params.id;
+  const bound = (state.clients || []).filter((c) => mieru.clientLandingNodeId(c, state) === id);
+  if (bound.length && !req.query.force) {
+    return res.status(400).json({
+      error: `仍有 ${bound.length} 个用户绑定此落地，请先改绑或加 ?force=1`,
+      boundUsers: bound.map((c) => c.name),
+    });
+  }
+  if (bound.length) {
+    for (const c of bound) {
+      c.route.landingNodeId = state.primaryNodeId === id ? null : state.primaryNodeId;
+      ensureClientFields(c, state.primaryNodeId);
+    }
+  }
+  topology.ensureTopology(state);
+  state.topology.landings = state.topology.landings.filter((L) => L.nodeId !== id);
+  if (!state.topology.landings.length) {
+    state.topology.landings = [
+      topology.defaultLanding({ nodeId: state.primaryNodeId === id ? null : state.primaryNodeId }),
+    ];
+  }
+  const removed = nodes.deleteNode(state, id);
+  if (!removed) return res.status(404).json({ error: '节点不存在' });
+  persist();
+  res.json({ ok: true, removed: { id: removed.id, name: removed.name } });
+});
+
+app.get('/api/nodes/:id/install-command', (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  if (!node.tokenPlain) {
+    return res.status(400).json({ error: 'Token 不可见，请轮换 Token', needRotate: true });
+  }
+  const base = req.query.panelUrl || panelBaseUrl(req);
+  res.json({
+    installCommand: nodes.installCommand({
+      panelUrl: base,
+      token: node.tokenPlain,
+      name: node.name,
+    }),
+    node: enrichNodePublic(node),
+  });
+});
+
+app.post('/api/nodes/:id/token', (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  const token = nodes.rotateNodeToken(node);
+  const base = panelBaseUrl(req);
+  persist();
+  res.json({
+    ok: true,
+    installCommand: nodes.installCommand({
+      panelUrl: base,
+      token,
+      name: node.name,
+    }),
+  });
+});
+
+app.post('/api/nodes/:id/apply', (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  mieru.ensureMieruDefaults(state);
+  const job = enqueueApply(node, 'mieru_apply');
+  persist();
+  res.json({
+    ok: true,
+    pending: true,
+    job,
+    message: node.lastSeenAt ? `已下发应用到「${node.name}」` : '任务已创建，等待 Agent 上线',
+    node: enrichNodePublic(node),
+  });
+});
+
+app.post('/api/nodes/:id/exit', (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  mieru.ensureMieruDefaults(state);
+  const job = enqueueApply(node, 'exit');
+  persist();
+  res.json({
+    ok: true,
+    pending: true,
+    job,
+    message: node.lastSeenAt ? `已下发一键落地到「${node.name}」` : '任务已创建，等待 Agent 上线',
+    node: enrichNodePublic(node),
   });
 });
 
@@ -589,30 +1000,52 @@ app.get('/api/clients/:id/config', async (req, res) => {
 app.post('/api/apply', async (req, res) => {
   mieru.ensureMieruDefaults(state);
   if (state.mode === 'agent') {
-    const node = nodes.getPrimaryNode(state);
-    if (!node) {
-      return res.status(400).json({ ok: false, error: '远程模式但没有主节点，请先安装 Agent' });
+    const nodeId = req.body?.nodeId;
+    if (nodeId) {
+      const node = nodes.findNode(state, nodeId);
+      if (!node) return res.status(404).json({ ok: false, error: '节点不存在' });
+      const job = enqueueApply(node, 'mieru_apply');
+      persist();
+      return res.json({
+        ok: true,
+        mode: 'agent',
+        pending: true,
+        job,
+        message: `已下发应用到「${node.name}」`,
+        dirty: true,
+      });
     }
-    nodes.syncPrimaryFromState(state);
-    nodes.markNodeDirty(node);
-    const job = nodes.enqueueJob(node, 'mieru_apply', {});
+    // all dirty or primary
+    const all = req.body?.all === true;
+    const targets = all
+      ? nodes.ensureNodes(state).filter((n) => nodes.isNodeDirty(n, hasher()) || true)
+      : (() => {
+          const p = nodes.getPrimaryNode(state);
+          return p ? [p] : [];
+        })();
+    if (!targets.length) {
+      return res.status(400).json({ ok: false, error: '远程模式但没有节点，请先安装 Agent' });
+    }
+    const jobs = [];
+    for (const node of targets) {
+      jobs.push(enqueueApply(node, 'mieru_apply'));
+    }
     persist();
     return res.json({
       ok: true,
       mode: 'agent',
       pending: true,
-      job,
-      message: node.lastSeenAt
-        ? '已下发「应用 mita 配置」到落地机'
-        : '任务已创建，但 Agent 尚未上线',
+      jobs,
+      message: all
+        ? `已下发应用到 ${targets.length} 个落地`
+        : `已下发「应用 mita 配置」到默认落地`,
       dirty: true,
     });
   }
-  // local：提示需在本机有 mita；面板尽量不直接装（root 环境）
   return res.status(400).json({
     ok: false,
     error: '本机模式请在本机 root 执行 mita 安装，或切换为远程落地机模式',
-    tip: '推荐：出口服务器 → 远程落地机 → 一键落地',
+    tip: '推荐：落地页 → 远程落地机 → 一键落地',
   });
 });
 
@@ -624,11 +1057,10 @@ app.post('/api/exit/setup', async (req, res) => {
       error: '一键落地请使用远程落地机模式（家宽装 Agent）',
     });
   }
-  const node = nodes.getPrimaryNode(state);
-  if (!node) return res.status(400).json({ ok: false, error: '没有主节点' });
-  nodes.syncPrimaryFromState(state);
-  nodes.markNodeDirty(node);
-  const job = nodes.enqueueJob(node, 'exit', {});
+  const nodeId = req.body?.nodeId;
+  const node = nodeId ? nodes.findNode(state, nodeId) : nodes.getPrimaryNode(state);
+  if (!node) return res.status(400).json({ ok: false, error: '没有落地节点' });
+  const job = enqueueApply(node, 'exit');
   persist();
   res.json({
     ok: true,
@@ -636,9 +1068,9 @@ app.post('/api/exit/setup', async (req, res) => {
     pending: true,
     job,
     message: node.lastSeenAt
-      ? '已下发「一键落地」：安装/配置 mita 并放行端口'
+      ? `已下发「一键落地」到 ${node.name}`
       : '任务已创建，等待 Agent 上线',
-    node: nodes.publicNode(node),
+    node: enrichNodePublic(node),
   });
 });
 
@@ -656,13 +1088,20 @@ app.get('/api/exit/overview', async (req, res) => {
     listenPort: state.server.listenPort,
     dirty: isUnifiedDirty(),
     topology: topology.publicTopology(state),
-    path: '电脑/客户端 → 商家IX前置 → 沪日IX → 落地家宽',
+    nodes: nodes.ensureNodes(state).map((n) => enrichNodePublic(n)),
+    path: '电脑/客户端 → 商家IX前置 → IX → 落地家宽',
   });
 });
 
 app.get('/api/diagnose', async (req, res) => {
   try {
     const primary = nodes.getPrimaryNode(state);
+    const nodePubs = nodes.ensureNodes(state).map((n) => ({
+      id: n.id,
+      online: nodes.isNodeOnline(n),
+      hostname: n.hostname,
+      lastReport: n.lastReport,
+    }));
     const result = mieru.diagnose(state, {
       mode: state.mode || 'local',
       report: primary?.lastReport || null,
@@ -671,10 +1110,12 @@ app.get('/api/diagnose', async (req, res) => {
       agentVersion: primary?.agentVersion,
       clientsNeedRescan: Boolean(state.clientsNeedRescan),
       dirty: isUnifiedDirty(),
+      nodes: nodePubs,
     });
     result.clientsNeedRescan = Boolean(state.clientsNeedRescan);
     result.dirty = isUnifiedDirty();
     result.topology = topology.publicTopology(state);
+    result.nodes = nodes.ensureNodes(state).map((n) => enrichNodePublic(n));
     if (primary) {
       const jobs = primary.jobs || [];
       const latest = jobs[0] || null;
@@ -695,7 +1136,7 @@ app.get('/api/diagnose', async (req, res) => {
   }
 });
 
-// ---------- Mode ----------
+// ---------- Mode / settings ----------
 
 app.get('/api/mode', (req, res) => {
   res.json(publicModeInfo());
@@ -718,9 +1159,12 @@ app.post('/api/mode', (req, res) => {
     name: req.body?.name || '落地出口',
     template: req.body?.template || 'cm',
   });
-  // mieru 默认端口
   if (!state.server.listenPort) state.server.listenPort = 7901;
   state.server.protocol = state.server.protocol || 'TCP';
+  topology.ensureTopology(state);
+  if (state.topology.landings[0] && !state.topology.landings[0].nodeId) {
+    state.topology.landings[0].nodeId = node.id;
+  }
   nodes.syncPrimaryFromState(state);
   const base = panelBaseUrl(req);
   const installCmd = nodes.installCommand({
@@ -736,6 +1180,27 @@ app.post('/api/mode', (req, res) => {
     ...publicModeInfo(),
     server: publicServer(state.server),
   });
+});
+
+app.put('/api/settings', (req, res) => {
+  const body = req.body || {};
+  if (!state.settings) state.settings = {};
+  if (body.autoApplyEnforce !== undefined) {
+    state.settings.autoApplyEnforce = Boolean(body.autoApplyEnforce);
+  }
+  if (body.showAdvancedNodes !== undefined) {
+    state.settings.showAdvancedNodes = Boolean(body.showAdvancedNodes);
+  }
+  if (body.theme !== undefined) state.settings.theme = body.theme;
+  if (body.primaryNodeId) {
+    const n = nodes.findNode(state, body.primaryNodeId);
+    if (n) {
+      state.primaryNodeId = n.id;
+      state.mode = 'agent';
+    }
+  }
+  persist();
+  res.json({ ok: true, settings: state.settings, ...publicModeInfo() });
 });
 
 app.get('/api/primary/install-command', (req, res) => {
@@ -777,7 +1242,9 @@ app.get('/api/export', (req, res) => {
     protocol: state.protocol,
     mode: state.mode,
     server: publicServer(state.server),
-    clients: state.clients.map((c) => mieru.publicClient(c)),
+    clients: state.clients.map((c) => mieru.publicClient(c, state)),
+    topology: topology.publicTopology(state),
+    nodes: nodes.ensureNodes(state).map((n) => enrichNodePublic(n)),
     exportedAt: new Date().toISOString(),
   });
 });
@@ -817,10 +1284,18 @@ app.post('/api/agent/heartbeat', (req, res) => {
     meta: body.meta,
     status: body.status,
   });
+  // merge usage
+  if (body.status?.usage) {
+    try {
+      mieru.mergeUsageFromReport(state, node.id, body.status.usage);
+      runEnforce();
+    } catch (e) {
+      console.warn('[panel] usage merge failed:', e.message);
+    }
+  }
   nodes.reclaimStaleJobs(node);
   const pending = nodes.getPendingJobs(node, 3);
   nodes.leaseJobs(node, pending);
-  // 主节点同步
   if (state.mode === 'agent' && state.primaryNodeId === node.id) {
     nodes.syncStateFromPrimary(state, node);
   }
@@ -839,36 +1314,14 @@ app.get('/api/agent/bundle', (req, res) => {
     nodes.syncPrimaryFromState(state);
   }
   mieru.ensureMieruDefaults(state);
-  // 用统一 state 构建（用户在 state.clients）
-  const fake = {
-    server: { ...state.server, ...(node.server || {}) },
-    clients: state.clients,
-  };
-  let serverConfig;
+  let bundle;
   try {
-    serverConfig = mieru.buildServerConfig(fake);
+    bundle = buildBundleForNode(node);
   } catch (err) {
     return res.status(400).json({ error: err.message, code: err.code });
   }
-  const hash = mieru.configHash(fake);
-  const bundle = {
-    protocol: 'mieru',
-    server: {
-      listenPort: Number(fake.server.listenPort) || 7901,
-      protocol: mieru.normalizeProtocol(fake.server.protocol),
-      endpoint: fake.server.endpoint || '',
-      mtu: fake.server.mtu,
-      multiplexing: fake.server.multiplexing,
-    },
-    users: (fake.clients || []).map((c) => ({
-      id: c.id,
-      name: c.name,
-      password: c.password,
-      enabled: c.enabled !== false,
-    })),
-    serverConfig,
-    configHash: hash,
-  };
+  // mirror users onto node.clients for dirty hash helpers
+  node.clients = mieru.clientsForNode(state, node.id);
   persist();
   res.json(bundle);
 });
@@ -887,14 +1340,22 @@ app.post('/api/agent/job-result', (req, res) => {
   const job = nodes.completeJob(node, jobId, { ok, message, detail });
   if (!job) return res.status(404).json({ error: '任务不存在' });
 
-  if (ok && (job.type === 'apply' || job.type === 'exit' || job.type === 'mieru_apply' || job.type === 'mieru_install')) {
-    const hash = detail?.configHash || (() => {
-      try {
-        return mieru.configHash(state);
-      } catch {
-        return null;
-      }
-    })();
+  if (
+    ok &&
+    (job.type === 'apply' ||
+      job.type === 'exit' ||
+      job.type === 'mieru_apply' ||
+      job.type === 'mieru_install')
+  ) {
+    const hash =
+      detail?.configHash ||
+      (() => {
+        try {
+          return buildBundleForNode(node).configHash;
+        } catch {
+          return null;
+        }
+      })();
     if (hash) nodes.markNodeClean(node, hash);
     if (state.mode === 'agent' && state.primaryNodeId === node.id) {
       if (hash) {
@@ -913,7 +1374,7 @@ app.get('*', (req, res) => {
 });
 
 app.listen(PORT, HOST, () => {
-  console.log(`\n  出口管理面板已启动（mieru）`);
+  console.log(`\n  出口管理面板已启动（mieru v4 多落地）`);
   console.log(`  版本: ${require(path.join(ROOT, 'package.json')).version}`);
   console.log(`  地址: http://${HOST === '0.0.0.0' ? '服务器IP' : HOST}:${PORT}`);
   console.log(`  数据: ${DATA_DIR}`);

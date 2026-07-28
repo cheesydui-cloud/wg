@@ -1,12 +1,13 @@
 {
   "name": "wg-panel",
-  "version": "3.1.0",
-  "description": "mieru 拓扑出口面板稳定版：客户端 → 商家IX前置 → 沪日IX → 落地家宽 mita",
+  "version": "4.0.0",
+  "description": "mieru 多落地出口面板：多 IX · 多落地 · 用户路由 · 流量/期限",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
-    "reset-password": "node scripts/reset-password.js"
+    "reset-password": "node scripts/reset-password.js",
+    "smoke": "node scripts/smoke-v4.js"
   },
   "engines": {
     "node": ">=18"

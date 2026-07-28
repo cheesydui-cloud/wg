@@ -63,7 +63,6 @@ function joinEndpoint(host, port) {
 }
 
 function isValidMieruUsername(name) {
-  // mita/mieru 用户名：字母数字下划线短横线，避免中文显示名误当登录名
   return /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(String(name || ''));
 }
 
@@ -76,17 +75,20 @@ function ensureMieruDefaults(state) {
   if (!s.multiplexing) s.multiplexing = DEFAULT_MULTIPLEXING;
   if (!s.trafficPattern) s.trafficPattern = 'conservative';
   if (!Array.isArray(state.clients)) state.clients = [];
-  // 拓扑同步 endpoint（商家入口）
   try {
     const topology = require('./topology');
+    const { ensureClientFields } = require('./config');
     topology.ensureTopology(state);
     if (state.server.endpoint) s.endpoint = state.server.endpoint;
+    for (const c of state.clients) {
+      ensureClientFields(c, state.primaryNodeId);
+    }
   } catch {
-    /* topology optional at boot */
+    /* optional at boot */
   }
-  // 至少一个用户
   if (state.clients.length === 0) {
-    state.clients.push({
+    const { ensureClientFields } = require('./config');
+    const c = {
       id: crypto.randomUUID(),
       name: randomUsername(),
       password: randomPassword(18),
@@ -94,11 +96,12 @@ function ensureMieruDefaults(state) {
       note: '默认用户',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-    });
+    };
+    ensureClientFields(c, state.primaryNodeId);
+    state.clients.push(c);
   }
   for (const c of state.clients) {
     if (!c.password) c.password = randomPassword(18);
-    // 中文/空格等不能当 mita 登录名：挪到 note，换合法 name
     if (!c.name || !isValidMieruUsername(c.name)) {
       const bad = c.name;
       if (bad && !c.note) c.note = String(bad);
@@ -109,14 +112,45 @@ function ensureMieruDefaults(state) {
   return state;
 }
 
-function enabledUsers(state) {
-  return (state.clients || []).filter((c) => c.enabled !== false && c.name && c.password);
+function clientLandingNodeId(client, state) {
+  return client?.route?.landingNodeId || state?.primaryNodeId || null;
 }
 
-/** mita 服务端 apply 用 JSON */
-function buildServerConfig(state) {
+function clientListenPort(client, state, node) {
+  if (client?.route?.listenPort) return Number(client.route.listenPort);
+  try {
+    const topology = require('./topology');
+    const landing = topology.getLandingByNodeId(state, clientLandingNodeId(client, state));
+    if (landing?.listenPort) return Number(landing.listenPort);
+  } catch {
+    /* */
+  }
+  if (node?.server?.listenPort) return Number(node.server.listenPort);
+  return Number(state?.server?.listenPort) || 7901;
+}
+
+function clientsForNode(state, nodeId) {
   ensureMieruDefaults(state);
-  const s = state.server;
+  const primary = state.primaryNodeId;
+  return (state.clients || []).filter((c) => {
+    const lid = clientLandingNodeId(c, state);
+    if (lid) return lid === nodeId;
+    // unbound → primary only
+    return nodeId === primary;
+  });
+}
+
+function enabledUsers(state, nodeId = null) {
+  const list = nodeId ? clientsForNode(state, nodeId) : state.clients || [];
+  return list.filter((c) => c.enabled !== false && c.name && c.password);
+}
+
+/** mita 服务端 apply 用 JSON；可按 nodeId 过滤用户与端口 */
+function buildServerConfig(state, opts = {}) {
+  ensureMieruDefaults(state);
+  const nodeId = opts.nodeId || null;
+  const s = { ...state.server, ...(opts.server || {}) };
+  if (opts.listenPort) s.listenPort = opts.listenPort;
   const mode = normalizeProtocol(s.protocol);
   const portBindings = [];
   for (const proto of protocolsForMode(mode)) {
@@ -125,7 +159,7 @@ function buildServerConfig(state) {
       protocol: proto,
     });
   }
-  const users = enabledUsers(state).map((c) => ({
+  const users = enabledUsers(state, nodeId).map((c) => ({
     name: c.name,
     password: c.password,
   }));
@@ -142,8 +176,8 @@ function buildServerConfig(state) {
   };
 }
 
-function configHash(state) {
-  const content = JSON.stringify(buildServerConfig(state));
+function configHash(state, opts = {}) {
+  const content = JSON.stringify(buildServerConfig(state, opts));
   return crypto.createHash('sha256').update(content).digest('hex');
 }
 
@@ -169,14 +203,23 @@ function urlencode(s) {
   );
 }
 
-function endpointHost(state) {
+function endpointHost(state, client = null) {
+  try {
+    const topology = require('./topology');
+    topology.ensureTopology(state);
+    const active = client?.route?.ingressActive || null;
+    const h = topology.activeIngressHost(state, active || undefined);
+    if (h) return h;
+  } catch {
+    /* */
+  }
   const s = state.server || {};
   const ep = parseEndpoint(s.endpoint);
   if (ep.ok && ep.host) return ep.host;
   return '';
 }
 
-function shareLinkForHost(state, client, host, protocol) {
+function shareLinkForHost(state, client, host, protocol, portOverride) {
   ensureMieruDefaults(state);
   const s = state.server;
   const h = String(host || '').trim();
@@ -187,7 +230,8 @@ function shareLinkForHost(state, client, host, protocol) {
   }
   const mode = normalizeProtocol(s.protocol);
   const proto = String(protocol || protocolsForMode(mode)[0]).toUpperCase();
-  const port = portForProtocol(s.listenPort, proto, mode);
+  const listenPort = portOverride || clientListenPort(client, state);
+  const port = portForProtocol(listenPort, proto, mode);
   const mtu = Number(s.mtu) || DEFAULT_MTU;
   const multiplexing = s.multiplexing || DEFAULT_MULTIPLEXING;
   const query = [
@@ -201,51 +245,52 @@ function shareLinkForHost(state, client, host, protocol) {
   return `mierus://${urlencode(client.name)}:${urlencode(client.password)}@${h}:${port}?${query}`;
 }
 
-/** mierus:// 分享链（默认用当前 active 入站） */
 function buildShareLink(state, client, protocol) {
-  return shareLinkForHost(state, client, endpointHost(state), protocol);
+  return shareLinkForHost(state, client, endpointHost(state, client), protocol);
 }
 
-/** 双入口链接：移动 211 / 外部 114 */
 function buildDualShareLinks(state, client, protocol) {
   ensureMieruDefaults(state);
   const s = state.server;
   let mobileHost = '211.136.162.184';
   let externalHost = '114.111.176.37';
-  let active = 'mobile';
+  let active = client?.route?.ingressActive || 'external';
   try {
     const topology = require('./topology');
     topology.ensureTopology(state);
     const t = state.topology;
     mobileHost = t.ingress.mobileHost || mobileHost;
     externalHost = t.ingress.externalHost || externalHost;
-    active = t.ingress.active || 'mobile';
+    if (!client?.route?.ingressActive) active = t.ingress.active || 'external';
   } catch {
-    const ep = endpointHost(state);
+    const ep = endpointHost(state, client);
     if (ep === externalHost) active = 'external';
     else if (ep && ep !== mobileHost) active = 'custom';
   }
   const mode = normalizeProtocol(s.protocol);
   const proto = String(protocol || protocolsForMode(mode)[0]).toUpperCase();
-  const port = portForProtocol(s.listenPort, proto, mode);
-  const mobile = shareLinkForHost(state, client, mobileHost, proto);
-  const external = shareLinkForHost(state, client, externalHost, proto);
+  const listenPort = clientListenPort(client, state);
+  const port = portForProtocol(listenPort, proto, mode);
+  const mobile = shareLinkForHost(state, client, mobileHost, proto, listenPort);
+  const external = shareLinkForHost(state, client, externalHost, proto, listenPort);
   let preferredHost = mobileHost;
   if (active === 'external') preferredHost = externalHost;
   else if (active === 'custom') {
     try {
       const topology = require('./topology');
-      preferredHost = topology.activeIngressHost(state) || mobileHost;
+      preferredHost = topology.activeIngressHost(state, 'custom') || mobileHost;
     } catch {
       preferredHost = mobileHost;
     }
   }
-  const preferred = shareLinkForHost(state, client, preferredHost, proto);
+  const preferred = shareLinkForHost(state, client, preferredHost, proto, listenPort);
   return {
     mobile,
     external,
     preferred,
     active,
+    listenPort: port,
+    landingNodeId: clientLandingNodeId(client, state),
     endpoints: {
       mobile: `${mobileHost}:${port}`,
       external: `${externalHost}:${port}`,
@@ -255,11 +300,10 @@ function buildDualShareLinks(state, client, protocol) {
   };
 }
 
-/** 官方 mieru 客户端 JSON */
 function buildClientJson(state, client, protocol, hostOverride) {
   ensureMieruDefaults(state);
   const s = state.server;
-  const host = String(hostOverride || endpointHost(state) || '').trim();
+  const host = String(hostOverride || endpointHost(state, client) || '').trim();
   if (!host) {
     const err = new Error('请先填写客户端连接地址（商家入站 IP）');
     err.code = 'NO_ENDPOINT';
@@ -267,7 +311,8 @@ function buildClientJson(state, client, protocol, hostOverride) {
   }
   const mode = normalizeProtocol(s.protocol);
   const proto = String(protocol || protocolsForMode(mode)[0]).toUpperCase();
-  const port = portForProtocol(s.listenPort, proto, mode);
+  const listenPort = clientListenPort(client, state);
+  const port = portForProtocol(listenPort, proto, mode);
   return {
     profiles: [
       {
@@ -298,7 +343,22 @@ function buildClientJson(state, client, protocol, hostOverride) {
   };
 }
 
-function publicClient(c) {
+function formatBytes(n) {
+  const v = Number(n) || 0;
+  if (v < 1024) return `${v} B`;
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`;
+  if (v < 1024 * 1024 * 1024) return `${(v / 1024 / 1024).toFixed(1)} MB`;
+  return `${(v / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function publicClient(c, state = null) {
+  const pkg = c.package || {};
+  const usage = c.usage || {};
+  const route = c.route || {};
+  const expired = Boolean(pkg.expireAt && new Date(pkg.expireAt).getTime() < Date.now());
+  const quotaMb = Number(pkg.quotaMb) || 0;
+  const totalBytes = Number(usage.totalBytes) || 0;
+  const overQuota = quotaMb > 0 && totalBytes >= quotaMb * 1024 * 1024;
   return {
     id: c.id,
     name: c.name,
@@ -308,7 +368,128 @@ function publicClient(c) {
     label: c.note || c.name,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
+    route: {
+      landingNodeId: route.landingNodeId || state?.primaryNodeId || null,
+      ixId: route.ixId || null,
+      listenPort: route.listenPort || null,
+      ingressActive: route.ingressActive || null,
+    },
+    package: {
+      quotaMb: quotaMb,
+      quotaDays: Number(pkg.quotaDays) || 30,
+      quotaMode: pkg.quotaMode || 'rolling',
+      expireAt: pkg.expireAt || '',
+      bandwidthMbps: Number(pkg.bandwidthMbps) || 0,
+    },
+    usage: {
+      downloadBytes: Number(usage.downloadBytes) || 0,
+      uploadBytes: Number(usage.uploadBytes) || 0,
+      totalBytes,
+      totalHuman: formatBytes(totalBytes),
+      quotaUsedMb: usage.quotaUsedMb,
+      quotaLimitMb: usage.quotaLimitMb,
+      collectedAt: usage.collectedAt || null,
+      source: usage.source || null,
+    },
+    statusFlags: {
+      expired,
+      overQuota,
+      blocked: c.enabled === false || expired || overQuota,
+    },
   };
+}
+
+/**
+ * 检查到期/超额，返回变更的 client ids 与受影响 nodeIds
+ */
+function enforcePackages(state) {
+  ensureMieruDefaults(state);
+  const now = Date.now();
+  const changed = [];
+  const nodeIds = new Set();
+  for (const c of state.clients || []) {
+    const pkg = c.package || {};
+    let disable = false;
+    let reason = '';
+    if (pkg.expireAt) {
+      const t = new Date(pkg.expireAt).getTime();
+      if (!Number.isNaN(t) && t < now) {
+        disable = true;
+        reason = 'expired';
+      }
+    }
+    const quotaMb = Number(pkg.quotaMb) || 0;
+    if (quotaMb > 0) {
+      const total = Number(c.usage?.totalBytes) || 0;
+      if (total >= quotaMb * 1024 * 1024) {
+        disable = true;
+        reason = reason || 'quota';
+      }
+    }
+    if (disable && c.enabled !== false) {
+      c.enabled = false;
+      c.updatedAt = new Date().toISOString();
+      c._enforceReason = reason;
+      changed.push(c.id);
+      const nid = clientLandingNodeId(c, state);
+      if (nid) nodeIds.add(nid);
+    }
+  }
+  return { changed, nodeIds: [...nodeIds] };
+}
+
+/**
+ * 从 agent status.usage 合并到 clients
+ */
+function mergeUsageFromReport(state, nodeId, usage) {
+  if (!usage || !Array.isArray(usage.users)) return 0;
+  const byName = new Map();
+  for (const u of usage.users) {
+    if (u?.name) byName.set(String(u.name), u);
+  }
+  const quotaByName = new Map();
+  if (Array.isArray(usage.quotas)) {
+    for (const q of usage.quotas) {
+      if (q?.name) quotaByName.set(String(q.name), q);
+    }
+  }
+  let n = 0;
+  const bound = clientsForNode(state, nodeId);
+  for (const c of bound) {
+    const u = byName.get(c.name);
+    if (!u) continue;
+    const download = Number(u.downloadBytes) || Number(u.download) || 0;
+    const upload = Number(u.uploadBytes) || Number(u.upload) || 0;
+    let total = Number(u.totalBytes) || Number(u.total) || download + upload;
+    // human strings like "1.2 GB"
+    if (!total && u.raw) {
+      const m = String(u.raw).match(/([\d.]+)\s*(KiB|MiB|GiB|KB|MB|GB|B)/i);
+      if (m) {
+        const num = parseFloat(m[1]);
+        const unit = m[2].toUpperCase();
+        const mul =
+          unit.startsWith('G') ? 1024 * 1024 * 1024 :
+          unit.startsWith('M') ? 1024 * 1024 :
+          unit.startsWith('K') ? 1024 : 1;
+        total = Math.round(num * mul);
+      }
+    }
+    c.usage = {
+      ...(c.usage || {}),
+      downloadBytes: download,
+      uploadBytes: upload,
+      totalBytes: total,
+      collectedAt: usage.collectedAt || new Date().toISOString(),
+      source: usage.source || 'mita-cli',
+    };
+    const q = quotaByName.get(c.name);
+    if (q) {
+      c.usage.quotaUsedMb = q.usedMB != null ? Number(q.usedMB) : c.usage.quotaUsedMb;
+      c.usage.quotaLimitMb = q.limitMB != null ? Number(q.limitMB) : c.usage.quotaLimitMb;
+    }
+    n += 1;
+  }
+  return n;
 }
 
 function diagnose(state, opts = {}) {
@@ -321,7 +502,6 @@ function diagnose(state, opts = {}) {
   const ep = parseEndpoint(s.endpoint);
   const users = enabledUsers(state);
 
-  // 分层拓扑诊断（商家入口 → IX → 家宽）
   try {
     const topology = require('./topology');
     const topo = topology.diagnoseTopology(state, opts);
@@ -340,10 +520,44 @@ function diagnose(state, opts = {}) {
     level: users.length ? 'ok' : 'error',
     title: '客户端用户',
     detail: users.length
-      ? `${users.length} 个启用（登录名须英文/数字，勿用「我的手机」）`
+      ? `${users.length} 个启用（登录名须英文/数字）`
       : '没有用户',
     fix: users.length ? '' : '在「客户端」添加用户',
   });
+
+  // package / route issues
+  for (const c of state.clients || []) {
+    if (!clientLandingNodeId(c, state) && mode === 'agent') {
+      push({
+        id: `route_${c.id}`,
+        level: 'warn',
+        title: `用户未绑落地 · ${c.name}`,
+        detail: '将默认使用主落地',
+        fix: '在客户端编辑里选择落地',
+      });
+    }
+    const pkg = c.package || {};
+    if (pkg.expireAt && new Date(pkg.expireAt).getTime() < Date.now()) {
+      push({
+        id: `expire_${c.id}`,
+        level: c.enabled === false ? 'info' : 'warn',
+        title: `用户已到期 · ${c.name}`,
+        detail: pkg.expireAt,
+        fix: c.enabled === false ? '' : '将自动停用并下发',
+      });
+    }
+    const quotaMb = Number(pkg.quotaMb) || 0;
+    const total = Number(c.usage?.totalBytes) || 0;
+    if (quotaMb > 0 && total >= quotaMb * 1024 * 1024) {
+      push({
+        id: `quota_${c.id}`,
+        level: c.enabled === false ? 'info' : 'warn',
+        title: `用户超额 · ${c.name}`,
+        detail: `${formatBytes(total)} / ${quotaMb} MB`,
+        fix: c.enabled === false ? '' : '将自动停用并下发',
+      });
+    }
+  }
 
   const mita = report?.mita || {};
   const running = Boolean(mita.running) || /RUNNING/i.test(String(mita.status || ''));
@@ -395,6 +609,23 @@ function diagnose(state, opts = {}) {
   };
 }
 
+/** 构建下发给 agent 的用户包（含 package 供设配额） */
+function usersForBundle(state, nodeId) {
+  return clientsForNode(state, nodeId).map((c) => ({
+    id: c.id,
+    name: c.name,
+    password: c.password,
+    enabled: c.enabled !== false,
+    package: {
+      quotaMb: Number(c.package?.quotaMb) || 0,
+      quotaDays: Number(c.package?.quotaDays) || 30,
+      quotaMode: c.package?.quotaMode || 'rolling',
+      expireAt: c.package?.expireAt || '',
+      bandwidthMbps: Number(c.package?.bandwidthMbps) || 0,
+    },
+  }));
+}
+
 module.exports = {
   DEFAULT_MTU,
   DEFAULT_PROTOCOL,
@@ -406,6 +637,9 @@ module.exports = {
   joinEndpoint,
   ensureMieruDefaults,
   enabledUsers,
+  clientsForNode,
+  clientLandingNodeId,
+  clientListenPort,
   buildServerConfig,
   configHash,
   isDirty,
@@ -419,4 +653,8 @@ module.exports = {
   portForProtocol,
   protocolsForMode,
   endpointHost,
+  enforcePackages,
+  mergeUsageFromReport,
+  usersForBundle,
+  formatBytes,
 };

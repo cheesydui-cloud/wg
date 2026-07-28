@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Edge Agent v3.1.0 — mieru / mita 落地（落地家宽）
- * 连接中心面板，拉取任务：安装/应用 mita、上报状态
+ * Edge Agent v4.0.0 — mieru / mita 落地（支持多落地 + 流量/套餐）
+ * 连接中心面板，拉取任务：安装/应用 mita、上报状态与用量
  *
  * 环境变量：
  *   WG_PANEL_URL       面板地址
@@ -19,7 +19,7 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
-const VERSION = '3.1.0';
+const VERSION = '4.0.0';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';
@@ -27,6 +27,7 @@ const INTERVAL = Math.max(5, Number(process.env.WG_AGENT_INTERVAL || 10));
 const DATA_DIR = process.env.WG_AGENT_DATA || '/var/lib/wg-agent';
 const STATE_FILE = path.join(DATA_DIR, 'agent-state.json');
 const MITA_SCRIPT = process.env.MITA_INSTALL_SCRIPT || path.join(DATA_DIR, 'install-mita.sh');
+const USAGE_EVERY_MS = Math.max(30, Number(process.env.WG_AGENT_USAGE_SEC || 60)) * 1000;
 
 if (!PANEL_URL || !TOKEN) {
   console.error('[agent] 需要环境变量 WG_PANEL_URL 与 WG_AGENT_TOKEN');
@@ -111,7 +112,10 @@ async function run(bin, args, opts = {}) {
     const { stdout, stderr } = await execFileAsync(bin, args, {
       timeout: opts.timeout || 60000,
       maxBuffer: 8 * 1024 * 1024,
-      env: { ...process.env, PATH: process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' },
+      env: {
+        ...process.env,
+        PATH: process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+      },
     });
     return { ok: true, stdout: (stdout || '').trim(), stderr: (stderr || '').trim() };
   } catch (err) {
@@ -162,17 +166,9 @@ async function detectEgress() {
 }
 
 function findMitaBin() {
-  const candidates = ['mita', '/usr/bin/mita', '/usr/local/bin/mita'];
+  const candidates = ['/usr/local/bin/mita', '/usr/bin/mita', 'mita'];
   for (const c of candidates) {
-    try {
-      if (c === 'mita') {
-        // which
-      }
-      const p = c.includes('/') ? c : null;
-      if (p && fs.existsSync(p)) return p;
-    } catch {
-      /* */
-    }
+    if (c.includes('/') && fs.existsSync(c)) return c;
   }
   return 'mita';
 }
@@ -183,18 +179,8 @@ async function mitaStatus() {
   const text = `${st.stdout}\n${st.stderr}`;
   const running = /RUNNING/i.test(text);
   const idle = /IDLE/i.test(text);
-  // 监听端口
   let listening = false;
   let listenPorts = [];
-  const ss = await run('ss', ['-lntu']);
-  if (ss.ok) {
-    for (const line of ss.stdout.split('\n')) {
-      const m = line.match(/:(\d+)\s/);
-      if (m && /LISTEN|UNCONN/i.test(line)) {
-        // 粗略：后面用配置端口比对
-      }
-    }
-  }
   let version = '';
   const ver = await run(bin, ['version'], { timeout: 8000 });
   if (ver.ok) version = ver.stdout.split('\n')[0] || '';
@@ -212,10 +198,129 @@ async function mitaStatus() {
   };
 }
 
+/** best-effort parse human sizes */
+function parseSizeToBytes(s) {
+  if (s == null) return 0;
+  if (typeof s === 'number' && Number.isFinite(s)) return s;
+  const str = String(s).trim();
+  if (/^\d+$/.test(str)) return Number(str);
+  const m = str.match(/([\d.]+)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)?/i);
+  if (!m) return 0;
+  const num = parseFloat(m[1]);
+  const unit = (m[2] || 'B').toUpperCase();
+  const map = {
+    B: 1,
+    KIB: 1024,
+    MIB: 1024 ** 2,
+    GIB: 1024 ** 3,
+    TIB: 1024 ** 4,
+    KB: 1000,
+    MB: 1000 ** 2,
+    GB: 1000 ** 3,
+    TB: 1000 ** 4,
+  };
+  return Math.round(num * (map[unit] || 1));
+}
+
+/**
+ * Collect per-user usage via mita CLI (best-effort, never throws to caller critically)
+ */
+async function collectUsage() {
+  const bin = findMitaBin();
+  const out = {
+    collectedAt: new Date().toISOString(),
+    users: [],
+    quotas: [],
+    source: 'mita-cli',
+    available: false,
+    raw: '',
+  };
+  try {
+    const usersR = await run(bin, ['get', 'users'], { timeout: 20000 });
+    const quotasR = await run(bin, ['get', 'quotas'], { timeout: 20000 });
+    const textU = `${usersR.stdout || ''}\n${usersR.stderr || ''}`;
+    const textQ = `${quotasR.stdout || ''}\n${quotasR.stderr || ''}`;
+    out.raw = (textU + '\n' + textQ).slice(0, 4000);
+
+    // try JSON
+    try {
+      const j = JSON.parse(usersR.stdout || '');
+      const arr = Array.isArray(j) ? j : j.users || j.UserStats || [];
+      if (Array.isArray(arr) && arr.length) {
+        for (const u of arr) {
+          const name = u.name || u.Name || u.user || u.User;
+          if (!name) continue;
+          const downloadBytes = parseSizeToBytes(
+            u.downloadBytes ?? u.DownloadBytes ?? u.download ?? u.Download ?? 0
+          );
+          const uploadBytes = parseSizeToBytes(
+            u.uploadBytes ?? u.UploadBytes ?? u.upload ?? u.Upload ?? 0
+          );
+          const totalBytes =
+            parseSizeToBytes(u.totalBytes ?? u.TotalBytes ?? u.total ?? u.Total) ||
+            downloadBytes + uploadBytes;
+          out.users.push({ name: String(name), downloadBytes, uploadBytes, totalBytes });
+        }
+      }
+    } catch {
+      // text parse: lines with username and numbers
+      for (const line of textU.split('\n')) {
+        // e.g. "user xxx  download 1.2GiB upload 3.4MiB"
+        const m = line.match(
+          /(?:user[:\s]+)?([A-Za-z0-9._-]{1,32}).*?(?:down(?:load)?[:\s]+([\d.]+\s*\w+))?.*?(?:up(?:load)?[:\s]+([\d.]+\s*\w+))?/i
+        );
+        if (!m) continue;
+        const name = m[1];
+        if (/^(user|name|total|----|mita)/i.test(name)) continue;
+        const downloadBytes = parseSizeToBytes(m[2] || 0);
+        const uploadBytes = parseSizeToBytes(m[3] || 0);
+        // simpler: any "name ... 123MiB"
+        const sizes = [...line.matchAll(/([\d.]+)\s*(KiB|MiB|GiB|KB|MB|GB|B)/gi)].map((x) =>
+          parseSizeToBytes(x[0])
+        );
+        let total = downloadBytes + uploadBytes;
+        if (!total && sizes.length) total = sizes[sizes.length - 1];
+        if (name && (total || downloadBytes || uploadBytes || /user/i.test(line))) {
+          out.users.push({
+            name,
+            downloadBytes,
+            uploadBytes,
+            totalBytes: total,
+            raw: line.slice(0, 200),
+          });
+        }
+      }
+    }
+
+    try {
+      const j = JSON.parse(quotasR.stdout || '');
+      const arr = Array.isArray(j) ? j : j.quotas || [];
+      for (const q of arr) {
+        const name = q.name || q.Name || q.user;
+        if (!name) continue;
+        out.quotas.push({
+          name: String(name),
+          limitMB: q.limitMB ?? q.megabytes ?? q.limit ?? null,
+          usedMB: q.usedMB ?? q.used ?? null,
+          days: q.days ?? null,
+          mode: q.mode || null,
+        });
+      }
+    } catch {
+      /* ignore text quotas */
+    }
+
+    out.available = out.users.length > 0 || usersR.ok;
+  } catch (err) {
+    out.error = err.message;
+    out.available = false;
+  }
+  return out;
+}
+
 async function ensureInstallScript() {
   ensureDir(DATA_DIR);
   if (fs.existsSync(MITA_SCRIPT) && fs.statSync(MITA_SCRIPT).size > 1000) return MITA_SCRIPT;
-  // 从面板拉取
   try {
     const u = new URL('/install-mita.sh', PANEL_URL);
     const lib = u.protocol === 'https:' ? https : http;
@@ -250,7 +355,6 @@ async function applyMitaConfig(serverJson) {
   if (!apply.ok) {
     return { ok: false, message: `mita apply 失败: ${apply.stderr || apply.stdout}` };
   }
-  // reload 或 start
   let start = await run(bin, ['reload'], { timeout: 20000 });
   if (!start.ok) {
     await run(bin, ['stop'], { timeout: 15000 });
@@ -264,9 +368,42 @@ async function applyMitaConfig(serverJson) {
   };
 }
 
+async function applyUserPackages(users, script) {
+  const notes = [];
+  for (const u of users || []) {
+    if (!u?.name || u.enabled === false) continue;
+    const pkg = u.package || {};
+    const quotaMb = Number(pkg.quotaMb) || 0;
+    const quotaDays = Number(pkg.quotaDays) || 30;
+    const quotaMode = pkg.quotaMode === 'calendar' ? 'calendar' : 'rolling';
+    const expireAt = String(pkg.expireAt || '').trim();
+    try {
+      if (quotaMb > 0) {
+        const r = await runShell(
+          `bash ${JSON.stringify(script)} --user-set-quota -y --user ${JSON.stringify(u.name)} --quota-mb ${quotaMb} --quota-days ${quotaDays} --quota-mode ${quotaMode}`,
+          { timeout: 60000 }
+        );
+        notes.push(`quota ${u.name}: ${r.ok ? 'ok' : 'fail'}`);
+      }
+      if (expireAt) {
+        // accept ISO date → YYYY-MM-DD
+        let exp = expireAt;
+        if (/^\d{4}-\d{2}-\d{2}T/.test(expireAt)) exp = expireAt.slice(0, 10);
+        const r = await runShell(
+          `bash ${JSON.stringify(script)} --user-set-expire -y --user ${JSON.stringify(u.name)} --expire ${JSON.stringify(exp)}`,
+          { timeout: 60000 }
+        );
+        notes.push(`expire ${u.name}: ${r.ok ? 'ok' : 'fail'}`);
+      }
+    } catch (e) {
+      notes.push(`${u.name}: ${e.message}`);
+    }
+  }
+  return notes;
+}
+
 async function installOrReconfigure(bundle) {
   const s = bundle.server || {};
-  // 只同步合法 ASCII 用户名（中文备注不能进 mita）
   const users = (bundle.users || []).filter(
     (u) =>
       u.enabled !== false &&
@@ -286,13 +423,10 @@ async function installOrReconfigure(bundle) {
   const protocol = String(s.protocol || 'TCP').toUpperCase();
   const script = await ensureInstallScript();
 
-  // 是否已安装 mita
   const st0 = await mitaStatus();
   const action = st0.installed && (st0.running || st0.idle || st0.ok) ? 'reconfigure' : 'install';
 
-  // 1) 优先：官方 mita apply 全量配置（所有用户一次写对）
   if (bundle.serverConfig) {
-    // 过滤 serverConfig 里的非法用户
     const cfg = JSON.parse(JSON.stringify(bundle.serverConfig));
     if (Array.isArray(cfg.users)) {
       cfg.users = cfg.users.filter(
@@ -308,6 +442,7 @@ async function installOrReconfigure(bundle) {
     const ap = await applyMitaConfig(cfg);
     if (ap.ok) {
       await openFirewall(port, protocol);
+      const pkgNotes = await applyUserPackages(bundle.users, script);
       return {
         ok: true,
         message: `已同步 mita（${cfg.users.length} 用户）· RUNNING`,
@@ -316,13 +451,13 @@ async function installOrReconfigure(bundle) {
           mita: ap.mita,
           configHash: bundle.configHash,
           users: cfg.users.map((u) => u.name),
+          packageNotes: pkgNotes,
         },
       };
     }
     console.warn('[agent] apply-full 失败，回退 OneClick:', ap.message);
   }
 
-  // 2) 回退：OneClick 装/重配主用户
   const args = [
     script,
     action === 'install' ? '--install' : '--reconfigure',
@@ -353,6 +488,7 @@ async function installOrReconfigure(bundle) {
   }
 
   await openFirewall(port, protocol);
+  const pkgNotes = await applyUserPackages(bundle.users, script);
   const st = await mitaStatus();
   return {
     ok: st.running || r.ok,
@@ -365,6 +501,7 @@ async function installOrReconfigure(bundle) {
       configHash: bundle.configHash,
       scriptOk: r.ok,
       users: users.map((u) => u.name),
+      packageNotes: pkgNotes,
       scriptTail: ((r.stdout || '') + '\n' + (r.stderr || '')).slice(-2000),
     },
   };
@@ -373,17 +510,20 @@ async function installOrReconfigure(bundle) {
 async function openFirewall(port, protocol) {
   const p = Number(port) || 7901;
   const proto = String(protocol || 'TCP').toLowerCase();
-  // 尽力放行，失败不致命
   await runShell(`ufw allow ${p}/${proto} 2>/dev/null || true`);
   await runShell(
     `firewall-cmd --permanent --add-port=${p}/${proto} 2>/dev/null && firewall-cmd --reload 2>/dev/null || true`
   );
   if (proto === 'tcp' || proto === 'both') {
-    await runShell(`iptables -C INPUT -p tcp --dport ${p} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${p} -j ACCEPT 2>/dev/null || true`);
+    await runShell(
+      `iptables -C INPUT -p tcp --dport ${p} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${p} -j ACCEPT 2>/dev/null || true`
+    );
   }
   if (proto === 'udp' || proto === 'both') {
     const up = proto === 'both' ? p + 1 : p;
-    await runShell(`iptables -C INPUT -p udp --dport ${up} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${up} -j ACCEPT 2>/dev/null || true`);
+    await runShell(
+      `iptables -C INPUT -p udp --dport ${up} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${up} -j ACCEPT 2>/dev/null || true`
+    );
   }
 }
 
@@ -404,11 +544,30 @@ async function collectStatus() {
     }
   }
 
-  // 端口是否在听
   const ss = await run('ss', ['-lntu']);
   if (ss.ok && local.listenPort) {
     const re = new RegExp(`:${local.listenPort}\\s`);
     mita.listening = re.test(ss.stdout);
+  }
+
+  let usage = local.lastUsage || null;
+  const lastUsageAt = local.usageAt || 0;
+  if (mita.installed && Date.now() - lastUsageAt > USAGE_EVERY_MS) {
+    try {
+      usage = await collectUsage();
+      local.lastUsage = usage;
+      local.usageAt = Date.now();
+      saveLocalState(local);
+    } catch (e) {
+      usage = {
+        available: false,
+        error: e.message,
+        collectedAt: new Date().toISOString(),
+        users: [],
+        quotas: [],
+        source: 'mita-cli',
+      };
+    }
   }
 
   return {
@@ -418,12 +577,18 @@ async function collectStatus() {
     exitPublicIp,
     hostname: os.hostname(),
     time: new Date().toISOString(),
+    usage: usage || { available: false, users: [], quotas: [], source: 'mita-cli' },
   };
 }
 
 async function handleJob(job) {
   console.log(`[agent] 执行任务 ${job.type} (${job.id})`);
-  if (job.type === 'apply' || job.type === 'exit' || job.type === 'mieru_install' || job.type === 'mieru_apply') {
+  if (
+    job.type === 'apply' ||
+    job.type === 'exit' ||
+    job.type === 'mieru_install' ||
+    job.type === 'mieru_apply'
+  ) {
     const bundle = await request('GET', '/api/agent/bundle');
     const local = loadLocalState();
     if (bundle.server?.listenPort) {
@@ -487,7 +652,7 @@ async function tick() {
 
 async function main() {
   ensureDir(DATA_DIR);
-  console.log(`[agent] v${VERSION} (mieru)`);
+  console.log(`[agent] v${VERSION} (mieru multi-landing)`);
   console.log(`[agent] 面板: ${PANEL_URL}`);
   console.log(`[agent] 轮询: ${INTERVAL}s`);
 
@@ -502,7 +667,6 @@ async function main() {
     console.error('[agent] 连接面板失败:', err.message);
   }
 
-  // 预拉 install 脚本
   try {
     await ensureInstallScript();
     console.log('[agent] install-mita.sh 就绪');

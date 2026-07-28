@@ -47,10 +47,11 @@ function isNodeOnline(node) {
   return Boolean(node?.lastSeenAt && Date.now() - new Date(node.lastSeenAt).getTime() < ONLINE_MS);
 }
 
-function publicNode(node, { includeToken = false } = {}) {
+function publicNode(node, { includeToken = false, hasher = null, userCount = null } = {}) {
   if (!node) return null;
   const online = isNodeOnline(node);
   reclaimStaleJobs(node);
+  const report = node.lastReport || {};
   const out = {
     id: node.id,
     name: node.name,
@@ -61,15 +62,18 @@ function publicNode(node, { includeToken = false } = {}) {
     hostname: node.hostname || '',
     agentVersion: node.agentVersion || '',
     meta: node.meta || {},
-    lastReport: node.lastReport || null,
-    clientCount: (node.clients || []).length,
+    lastReport: report,
+    clientCount: userCount != null ? userCount : (node.clients || []).length,
     endpoint: node.server?.endpoint || '',
     listenPort: Number(node.server?.listenPort) || 7901,
     protocol: node.server?.protocol || 'TCP',
-    dirty: isNodeDirty(node, null),
+    dirty: isNodeDirty(node, hasher),
     lastAppliedAt: node.lastAppliedAt || null,
     pendingJobs: (node.jobs || []).filter((j) => j.status === 'pending' || j.status === 'running')
       .length,
+    mita: report.mita || null,
+    exitPublicIp: report.exitPublicIp || null,
+    usageAvailable: Boolean(report.usage?.available),
   };
   if (includeToken && node.tokenPlain) out.token = node.tokenPlain;
   return out;
@@ -358,7 +362,7 @@ function touchNode(node, report = {}) {
 }
 
 /**
- * 兼容旧调用；v2 实际 bundle 由 server/index.js 用 mieru 构建
+ * 兼容旧调用；v4 实际 bundle 由 server/index.js 用 mieru 按节点过滤用户
  */
 function buildAgentBundle(node, hasher) {
   const fakeState = { server: node.server || {}, clients: node.clients || [] };
@@ -386,9 +390,32 @@ function buildAgentBundle(node, hasher) {
       name: c.name,
       password: c.password,
       enabled: c.enabled !== false,
+      package: c.package || null,
     })),
     configHash,
   };
+}
+
+/** 标记指定落地 dirty */
+function markDirtyForLanding(state, nodeId) {
+  if (!nodeId) return null;
+  const node = findNode(state, nodeId);
+  if (node) markNodeDirty(node);
+  return node;
+}
+
+/** 所有节点 dirty（全局 server 变更） */
+function markAllNodesDirty(state) {
+  for (const n of ensureNodes(state)) markNodeDirty(n);
+}
+
+function listPublicNodes(state, hasher = null, userCountFn = null) {
+  return ensureNodes(state).map((n) =>
+    publicNode(n, {
+      hasher,
+      userCount: userCountFn ? userCountFn(n.id) : null,
+    })
+  );
 }
 
 function installCommand({ panelUrl, token, name }) {
@@ -431,4 +458,7 @@ module.exports = {
   defaultNodeServer,
   hashToken,
   isNodeOnline,
+  markDirtyForLanding,
+  markAllNodesDirty,
+  listPublicNodes,
 };

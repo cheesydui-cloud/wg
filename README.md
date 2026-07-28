@@ -3,7 +3,7 @@
 中文、新手友好的 **mieru / mita 拓扑出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v4.2.0**（落地/IX 显示名不被 Agent 覆盖 · 健康检查/装机加固）
+当前版本：**v4.2.1**（固定面板升级命令）
 
 - 每台 IX 独立商家前置（IP/域名）与端口段
 - 拓扑 = IX 工作台；落地列表点开详情；客户端按落地分组
@@ -31,6 +31,10 @@
 | **兼容 v3.1** | 单前置 / 单 IX / 单落地自动迁成一条路由，Endpoint 保留 |
 
 路径保持不变。业务流量不经面板。
+
+### v4.2.1
+
+- **固定面板升级命令**：`scripts/upgrade-panel.sh`（curl 一条完成 pull + 同步 `/opt/wg-panel` + 重启）。不要只 `git pull`。
 
 ### v4.2.0
 
@@ -133,14 +137,20 @@
 
 ### 1. 面板（独立 VPS）
 
+**升级（固定这一条，不要只 git pull）：**
+
 ```bash
-cd ~/wg   # 或安装目录
-git pull
-sudo bash install.sh --update
-# 新装：sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/cheesydui-cloud/wg/main/scripts/upgrade-panel.sh | sudo bash
 ```
 
-打开 `http://面板IP:51821`，确认版本 **v4.2.0**。
+新装（仅首次）：
+
+```bash
+git clone https://github.com/cheesydui-cloud/wg.git ~/wg
+cd ~/wg && sudo bash install.sh
+```
+
+打开 `http://面板IP:51821`，确认版本 **v4.2.1**。
 
 忘记密码：
 
@@ -227,18 +237,39 @@ timeout 5 bash -c 'echo >/dev/tcp/家宽公网IP/7901' && echo OK || echo FAIL
 
 ---
 
-## 升级
+## 升级（固定命令）
+
+**面板机 root 只跑这一条**（自动 pull + 同步到 `/opt/wg-panel` + 重启 `wg-panel`，保留 data/密码）：
 
 ```bash
-cd ~/wg && git pull
-sudo bash install.sh --update
+curl -fsSL https://raw.githubusercontent.com/cheesydui-cloud/wg/main/scripts/upgrade-panel.sh | sudo bash
 ```
 
-- **3.1 → 4.0**：state 自动迁 v6（备份到 `data/backups/`）；单路径兼容  
-- **2.x → 4.0**：补拓扑 + 多落地字段  
-- **1.x → 4.0**：WG 归档；重装 Agent；新建 mieru 用户  
+等价本地写法（仓库已 clone 时）：
 
-升级前建议备份 `data/state.json`。落地机建议再执行一次 Agent 安装命令以对齐 **agent v4.1.9**（用量/配额）。
+```bash
+cd ~/wg   # 你的 git 目录
+git pull
+sudo bash scripts/upgrade-panel.sh
+# 或：sudo bash install.sh --update
+```
+
+| 错误做法 | 为什么不够 |
+|----------|------------|
+| 只 `git pull` | 运行中的服务在 `/opt/wg-panel`，源码目录更新了进程还是旧文件 |
+| 只 `systemctl restart wg-panel` | 没有把新代码同步进 `/opt/wg-panel` |
+| 只改 `~/wg` 不跑 `install.sh --update` | systemd 仍执行 `/opt/wg-panel/server/index.js` |
+
+升级后自检：
+
+```bash
+curl -sS http://127.0.0.1:51821/api/health
+systemctl status wg-panel --no-pager
+```
+
+- **3.1 → 4.x**：state 自动迁 v6（备份到 `data/backups/`）  
+- 升级前建议：`cp /opt/wg-panel/data/state.json /opt/wg-panel/data/state.json.bak`  
+- **Agent 与面板版本不一致**时：落地页复制安装命令在家宽重装一次（不必每次面板升级都重装）
 
 本地回归：
 

@@ -6,6 +6,8 @@ set -euo pipefail
 #   sudo bash install.sh
 #   sudo WG_PASSWORD='你的密码' bash install.sh
 #   sudo bash install.sh --update
+# 推荐统一用（pull + update + 重启）：
+#   curl -fsSL https://raw.githubusercontent.com/cheesydui-cloud/wg/main/scripts/upgrade-panel.sh | sudo bash
 #   sudo bash install.sh --reset-password '新密码'
 #
 # 默认登录用户名：admin

@@ -974,9 +974,15 @@ app.get('/api/clients/:id/config', async (req, res) => {
       QRCode.toDataURL(dual.external, { margin: 1, width: 280 }),
       QRCode.toDataURL(shareLink, { margin: 1, width: 280 }),
     ]);
+    const pub = mieru.publicClient(c, state);
     return res.json({
       name: c.name,
       note: c.note || '',
+      label: pub.label,
+      expireAt: pub.package?.expireAt || '',
+      package: pub.package,
+      usage: pub.usage,
+      statusFlags: pub.statusFlags,
       endpoint: dual.endpoints.active,
       endpoints: dual.endpoints,
       shareLink,
@@ -986,7 +992,7 @@ app.get('/api/clients/:id/config', async (req, res) => {
       qrExternal,
       config: JSON.stringify(clientJson, null, 2),
       tip: dual.tip,
-      route: mieru.publicClient(c, state).route,
+      route: pub.route,
       path: '电脑/客户端 → 商家IX前置 → IX → 落地家宽 mita',
     });
   }

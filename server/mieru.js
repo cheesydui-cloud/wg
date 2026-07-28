@@ -440,6 +440,16 @@ function buildClientJson(state, client, protocol, hostOverride) {
   };
 }
 
+function formatRate(bytesPerSec) {
+  const n = Number(bytesPerSec) || 0;
+  if (n <= 0) return '—';
+  // 展示为 bit/s 更符合「网速」习惯；小流量用 KB/s 亦可，这里统一 Mbps/Kbps
+  const bits = n * 8;
+  if (bits >= 1e6) return (bits / 1e6).toFixed(bits >= 1e7 ? 1 : 2) + ' Mbps';
+  if (bits >= 1e3) return (bits / 1e3).toFixed(0) + ' Kbps';
+  return bits.toFixed(0) + ' bps';
+}
+
 function formatBytes(n) {
   const v = Number(n) || 0;
   if (v < 1024) return `${v} B`;
@@ -496,6 +506,11 @@ function publicClient(c, state = null) {
       quotaLimitMb: usage.quotaLimitMb,
       collectedAt: usage.collectedAt || null,
       source: usage.source || null,
+      downBps: Number(usage.downBps) || 0,
+      upBps: Number(usage.upBps) || 0,
+      downRateHuman: formatRate(Number(usage.downBps) || 0),
+      upRateHuman: formatRate(Number(usage.upBps) || 0),
+      rateAt: usage.rateAt || usage.collectedAt || null,
     },
     statusFlags: {
       expired,
@@ -588,8 +603,33 @@ function mergeUsageFromReport(state, nodeId, usage) {
         total = sizes[sizes.length - 1];
       }
     }
+    const prev = c.usage || {};
+    const collectedAt = usage.collectedAt || new Date().toISOString();
+    const prevAt = prev.collectedAt ? new Date(prev.collectedAt).getTime() : 0;
+    const nowAt = new Date(collectedAt).getTime();
+    const dtSec = prevAt && nowAt > prevAt ? (nowAt - prevAt) / 1000 : 0;
+    // 相邻两次用量差估算瞬时速率（mita 无实时速率接口；间隔过短/回绕则清零）
+    let downBps = 0;
+    let upBps = 0;
+    if (dtSec >= 5 && dtSec <= 3600) {
+      const dDown = download - (Number(prev.downloadBytes) || 0);
+      const dUp = upload - (Number(prev.uploadBytes) || 0);
+      if (dDown >= 0) downBps = dDown / dtSec;
+      if (dUp >= 0) upBps = dUp / dtSec;
+      // 异常跳变（计数器重置/换月）忽略
+      if (downBps > 200 * 1024 * 1024) downBps = 0;
+      if (upBps > 200 * 1024 * 1024) upBps = 0;
+    } else if (prev.downBps != null || prev.upBps != null) {
+      // 本轮无法估算时保留上一档显示一小会儿
+      downBps = Number(prev.downBps) || 0;
+      upBps = Number(prev.upBps) || 0;
+      if (dtSec > 3600) {
+        downBps = 0;
+        upBps = 0;
+      }
+    }
     c.usage = {
-      ...(c.usage || {}),
+      ...prev,
       downloadBytes: download,
       uploadBytes: upload,
       totalBytes: total || download + upload,
@@ -600,8 +640,11 @@ function mergeUsageFromReport(state, nodeId, usage) {
       day30DownloadBytes: Number(u.day30DownloadBytes) || download,
       day30UploadBytes: Number(u.day30UploadBytes) || upload,
       lastActive: u.lastActive || null,
-      collectedAt: usage.collectedAt || new Date().toISOString(),
+      collectedAt,
       source: usage.source || 'mita-cli',
+      downBps,
+      upBps,
+      rateAt: collectedAt,
     };
     const q = quotaByName.get(c.name);
     if (q) {
@@ -790,4 +833,5 @@ module.exports = {
   mergeUsageFromReport,
   usersForBundle,
   formatBytes,
+  formatRate,
 };

@@ -1897,41 +1897,86 @@ function clientStatusBadge(c) {
   return '<span class="badge ok">启用</span>';
 }
 
+function expireLabel(c) {
+  const raw = c.package?.expireAt ? String(c.package.expireAt).trim() : '';
+  if (!raw) return { text: '不限', cls: 'muted', title: '未设置到期' };
+  const day = raw.slice(0, 10);
+  const t = new Date(raw).getTime();
+  if (!Number.isFinite(t)) return { text: day, cls: '', title: raw };
+  const left = t - Date.now();
+  if (left < 0) return { text: day + ' 已到期', cls: 'expire-bad', title: raw };
+  const days = Math.ceil(left / 86400000);
+  if (days <= 7) return { text: day + ` · ${days}天后`, cls: 'expire-soon', title: raw };
+  return { text: day, cls: '', title: raw };
+}
+
+function rateCellHtml(c) {
+  const u = c.usage || {};
+  const down = u.downRateHuman || '—';
+  const up = u.upRateHuman || '—';
+  const active = (Number(u.downBps) || 0) + (Number(u.upBps) || 0) > 0;
+  return `<div class="rate-cell mono ${active ? 'rate-on' : ''}" title="由相邻两次用量差估算，约 30s 刷新；非网卡瞬时速率">
+    <div><span class="usage-dir down">↓</span> ${esc(down)}</div>
+    <div><span class="usage-dir up">↑</span> ${esc(up)}</div>
+  </div>`;
+}
+
 function usageCellHtml(c) {
   const u = c.usage || {};
-  const down = u.downloadHuman || (u.downloadBytes != null ? null : null);
   const has = Number(u.totalBytes) > 0 || Number(u.downloadBytes) > 0 || Number(u.uploadBytes) > 0;
   if (!has && !u.collectedAt) {
-    return `<span class="muted">—</span><div class="muted" style="font-size:10px">等待 Agent 上报</div>`;
+    return `<span class="muted">—</span><div class="muted" style="font-size:10px">等待上报</div>`;
   }
   const d = u.downloadHuman || '0 B';
   const up = u.uploadHuman || '0 B';
   const tot = u.totalHuman || '0 B';
   return `<div class="usage-cell mono">
-    <div title="下行（约 30 天）"><span class="usage-dir down">↓</span> ${esc(d)}</div>
-    <div title="上行（约 30 天）"><span class="usage-dir up">↑</span> ${esc(up)}</div>
-    <div class="muted" style="font-size:10px" title="合计">Σ ${esc(tot)}${
-      u.collectedAt ? ` · ${esc(fmtTime(u.collectedAt))}` : ''
-    }</div>
+    <div title="下行累计"><span class="usage-dir down">↓</span> ${esc(d)}</div>
+    <div title="上行累计"><span class="usage-dir up">↑</span> ${esc(up)}</div>
+    <div class="muted" style="font-size:10px" title="合计">Σ ${esc(tot)}</div>
   </div>`;
 }
 
+/** 卡片式用户行：备注/到期/网速分行，避免挤在一排 */
 function clientRowHtml(c) {
-  return `<tr>
-    <td class="mono"><strong>${esc(c.name)}</strong>${
-      c.note ? `<div class="muted" style="font-size:11px">${esc(c.note)}</div>` : ''
-    }</td>
-    <td class="mono">${esc(effectiveClientPort(c))}</td>
-    <td>${usageCellHtml(c)}</td>
-    <td class="mono">${esc(c.package?.expireAt ? String(c.package.expireAt).slice(0, 10) : '不限')}</td>
-    <td class="mono">${c.package?.quotaMb ? esc(c.package.quotaMb) + ' MB' : '不限'}</td>
-    <td>${clientStatusBadge(c)}</td>
-    <td class="btn-row tight">
-      <button class="btn btn-sm btn-primary" data-qr="${c.id}" title="复制 211/114 分享链接与二维码">链接</button>
+  const exp = expireLabel(c);
+  const quota = c.package?.quotaMb ? `${c.package.quotaMb} MB` : '不限';
+  const note = (c.note || '').trim();
+  return `<article class="user-card" data-user-id="${esc(c.id)}">
+    <div class="user-card-main">
+      <div class="user-card-id">
+        <div class="user-name mono">${esc(c.name)}</div>
+        <div class="user-note ${note ? '' : 'is-empty'}">${note ? esc(note) : '无备注'}</div>
+        <div class="user-meta">
+          <span class="chip mono" title="连接端口">:${esc(effectiveClientPort(c))}</span>
+          ${clientStatusBadge(c)}
+        </div>
+      </div>
+      <div class="user-card-stats">
+        <div class="stat">
+          <div class="stat-label">实时网速</div>
+          ${rateCellHtml(c)}
+        </div>
+        <div class="stat">
+          <div class="stat-label">累计流量</div>
+          ${usageCellHtml(c)}
+        </div>
+        <div class="stat">
+          <div class="stat-label">到期</div>
+          <div class="stat-value mono ${exp.cls}" title="${esc(exp.title)}">${esc(exp.text)}</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">配额</div>
+          <div class="stat-value mono">${esc(quota)}</div>
+        </div>
+      </div>
+    </div>
+    <div class="user-card-actions btn-row tight">
+      <button class="btn btn-sm btn-primary" data-qr="${c.id}" title="分享链接与二维码（含备注）">链接</button>
       <button class="btn btn-sm btn-secondary" data-edit="${c.id}" title="编辑用户/路由/套餐">编辑</button>
       <button class="btn btn-sm btn-danger" data-del="${c.id}" title="删除该用户">删除</button>
-    </td>
-  </tr>`;
+    </div>
+  </article>`;
 }
 
 async function renderClients() {
@@ -2014,17 +2059,13 @@ async function renderClients() {
         </div>
         ${
           g.clients.length
-            ? `<div class="table-wrap"><table><thead><tr>
-                <th>登录名</th><th>端口</th><th title="mita 30 天累计">流量 ↓↑</th><th>到期</th><th>配额</th><th>状态</th><th></th>
-              </tr></thead><tbody>
-              ${g.clients.map(clientRowHtml).join('')}
-            </tbody></table></div>`
+            ? `<div class="user-card-list">${g.clients.map(clientRowHtml).join('')}</div>`
             : '<p class="muted" style="padding:12px 14px">本落地暂无用户</p>'
         }
       </div>`;
             })
             .join('') +
-          `<p class="field-hint">客户端「用户」填登录名（英文/数字），不要填中文备注。流量为落地 mita 快照，非计费级精确。改落地后需「应用」才会写到 mita。</p>`
+          `<p class="field-hint">登录名填英文/数字；中文写备注（列表与扫码都会显示）。网速为相邻两次用量差估算（约 30s）。改落地后需「应用」才写入 mita。</p>`
         : `<div class="card"><p class="muted">还没有用户，点「添加用户」</p></div>`
     }
   `);
@@ -2066,6 +2107,17 @@ async function renderClients() {
       }
     };
   });
+  // 客户端页约 20s 静默刷新用量/网速（不打断弹窗）
+  if (window.__clientsRefreshTimer) clearTimeout(window.__clientsRefreshTimer);
+  window.__clientsRefreshTimer = setTimeout(() => {
+    if (state.page !== 'clients') return;
+    if (document.querySelector('.modal-backdrop, .modal.show, #modal-root .modal')) return;
+    refreshCore()
+      .then(() => {
+        if (state.page === 'clients') renderClients();
+      })
+      .catch(() => {});
+  }, 20000);
 }
 
 function openClientModal(client, preferLandingId) {
@@ -2202,10 +2254,19 @@ async function showClientQr(id) {
     const data = await api(`/api/clients/${id}/config?format=qr`);
     const mobile = data.shareLinks?.mobile || data.shareLink;
     const external = data.shareLinks?.external || data.shareLink;
+    const exp = data.expireAt ? String(data.expireAt).slice(0, 10) : '不限';
+    const note = (data.note || '').trim();
     openModal({
-      title: `客户端 · ${data.name || ''}${data.note ? '（' + data.note + '）' : ''}`,
+      title: `分享 · ${data.name || ''}`,
       body: `
-        <p class="field-hint center">${esc(data.tip || '电脑连商家 IX 前置 114/211')}</p>
+        <div class="qr-user-banner">
+          <div class="qr-user-line"><span class="muted">登录名</span> <strong class="mono">${esc(data.name || '')}</strong></div>
+          <div class="qr-user-line"><span class="muted">备注</span> <strong>${note ? esc(note) : '—'}</strong></div>
+          <div class="qr-user-line"><span class="muted">到期</span> <span class="mono">${esc(exp)}</span>
+            ${data.package?.quotaMb ? ` · 配额 <span class="mono">${esc(data.package.quotaMb)} MB</span>` : ''}
+          </div>
+          <div class="qr-user-line muted" style="font-size:12px">${esc(data.tip || '电脑连商家 IX 前置 114/211')}</div>
+        </div>
         <div class="dual-qr">
           <div class="dual-qr-col">
             <strong>移动宽带前置 211</strong>

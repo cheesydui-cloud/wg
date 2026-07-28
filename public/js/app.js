@@ -181,6 +181,62 @@ function ixName(id) {
   return x?.name || id.slice(0, 8);
 }
 
+/** 用户实际连接端口：个人 route → 所属落地 listenPort → 全局默认 */
+function effectiveClientPort(c) {
+  if (c?.route?.listenPort) return Number(c.route.listenPort);
+  const nid = c?.route?.landingNodeId;
+  if (nid) {
+    const L = landingByNodeId(nid);
+    if (L?.listenPort) return Number(L.listenPort);
+    const n = (state.nodes || []).find((x) => x.id === nid);
+    if (n?.listenPort) return Number(n.listenPort);
+  }
+  return Number(state.server?.listenPort) || 7901;
+}
+
+/** 商家前置 host（不含端口） */
+function endpointHostOnly(ep) {
+  const s = String(ep || '');
+  if (!s) return '';
+  // [ipv6]:port or host:port
+  if (s.startsWith('[')) {
+    const m = s.match(/^\[([^\]]+)\]/);
+    return m ? m[1] : s;
+  }
+  const idx = s.lastIndexOf(':');
+  if (idx > 0 && s.indexOf(':') === idx) return s.slice(0, idx);
+  // bare host or multi-colon ipv6 without brackets
+  return s.replace(/:\d+$/, '');
+}
+
+function multiLandingEndpointBanner() {
+  const host = endpointHostOnly(activeEp()) || '（先到拓扑填前置）';
+  const nodes = state.nodes || [];
+  const landings = landingsList();
+  if (!nodes.length) {
+    return `<div class="alert info"><div>默认 Endpoint：<code class="mono">${esc(
+      activeEp() || '未配置'
+    )}</code></div></div>`;
+  }
+  const rows = nodes
+    .map((n) => {
+      const L = landings.find((x) => x.nodeId === n.id) || {};
+      const port = Number(L.listenPort || n.listenPort || 7901);
+      const users = (state.clients || []).filter((c) => c.route?.landingNodeId === n.id).length;
+      const tag = n.isPrimary ? ' · 默认落地' : '';
+      return `<div style="margin-top:4px"><strong>${esc(n.name)}</strong>${tag} → 客户端连
+        <code class="mono">${esc(host)}:${port}</code>
+        <span class="muted">（落地监听 :${port} · ${users} 用户 · IX ${esc(ixName(L.ixId))}）</span></div>`;
+    })
+    .join('');
+  return `<div class="alert info"><div>
+      <strong>多落地入口（不是只有 7901）</strong>
+      <div class="muted" style="font-size:12px;margin:4px 0 6px">上面「默认 Endpoint」只是未指定落地时的参考；
+        <strong>pro3 用户必须用 7902 的链接</strong>（点该用户「链接」复制，不要用 NB.JP 的 7901 链接）。</div>
+      ${rows}
+    </div></div>`;
+}
+
 function topAlerts() {
   const parts = [];
   if (state.status?.forcePasswordChange) {
@@ -1833,7 +1889,7 @@ function clientRowHtml(c) {
     <td class="mono"><strong>${esc(c.name)}</strong>${
       c.note ? `<div class="muted" style="font-size:11px">${esc(c.note)}</div>` : ''
     }</td>
-    <td class="mono">${esc(c.route?.listenPort || '默认')}</td>
+    <td class="mono">${esc(effectiveClientPort(c))}</td>
     <td>${usageCellHtml(c)}</td>
     <td class="mono">${esc(c.package?.expireAt ? String(c.package.expireAt).slice(0, 10) : '不限')}</td>
     <td class="mono">${c.package?.quotaMb ? esc(c.package.quotaMb) + ' MB' : '不限'}</td>
@@ -1886,9 +1942,7 @@ async function renderClients() {
       !activeEp()
         ? `<div class="alert warn"><div>尚未配置入站。请先到「拓扑」为 IX 填写前置 IP/域名。</div>
           <button class="btn btn-sm btn-primary" data-nav-jump="topology" title="去配置前置">去拓扑</button></div>`
-        : `<div class="alert info"><div>默认 Endpoint：<code class="mono">${esc(
-            activeEp()
-          )}</code> · 分享链按用户所属 IX 前置生成</div></div>`
+        : multiLandingEndpointBanner()
     }
     ${
       state.clients.length
@@ -1909,9 +1963,9 @@ async function renderClients() {
                   ? '<span class="badge ok">在线</span>'
                   : '<span class="badge warn">离线</span>'
             }
-            <span class="muted" style="font-weight:500;font-size:12px">${g.clients.length} 用户${
-                L?.ixId ? ` · IX ${esc(ixName(L.ixId))}` : ''
-              }</span>
+            <span class="muted" style="font-weight:500;font-size:12px">${g.clients.length} 用户 · 端口 :${esc(
+                L?.listenPort || n.listenPort || 7901
+              )}${L?.ixId ? ` · IX ${esc(ixName(L.ixId))}` : ''}</span>
           </div>
           <div class="btn-row">
             ${

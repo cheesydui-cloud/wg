@@ -87,6 +87,11 @@ function uniquifyLandingIds(t) {
 }
 
 function defaultLanding(overrides = {}) {
+  const listenPort = clampPort(overrides.listenPort, CM_DEFAULTS.defaultPort);
+  // 家宽 mita 端口默认跟本落地 listenPort（pro3=7902），不要写死 7901
+  let homePort = overrides.homeReachablePort;
+  if (homePort == null || homePort === '') homePort = listenPort;
+  else if (Number(homePort) === 7901 && Number(listenPort) !== 7901) homePort = listenPort;
   return {
     // 多落地时禁止共用 landing-default，否则按 landing.id 解析会命中第一台
     id: overrides.id || newId('landing'),
@@ -95,8 +100,8 @@ function defaultLanding(overrides = {}) {
     name: String(overrides.name || '落地家宽').trim().slice(0, 40) || '落地家宽',
     role: overrides.role || 'us-home',
     homeReachableHost: String(overrides.homeReachableHost || '').trim(),
-    homeReachablePort: clampPort(overrides.homeReachablePort, CM_DEFAULTS.defaultPort),
-    listenPort: clampPort(overrides.listenPort, CM_DEFAULTS.defaultPort),
+    homeReachablePort: clampPort(homePort, listenPort),
+    listenPort,
     note: overrides.note || 'Agent + mita 装在这里；出网 IP 应为家宽',
   };
 }
@@ -353,16 +358,19 @@ function ensureTopology(state) {
   }
 
   const defIxId = t.ixes[0]?.id || null;
-  t.landings = (Array.isArray(t.landings) ? t.landings : []).map((L, i) =>
-    defaultLanding({
+  t.landings = (Array.isArray(t.landings) ? t.landings : []).map((L, i) => {
+    const lp = clampPort(L.listenPort, t.ingress.port);
+    let hp = L.homeReachablePort;
+    if (hp == null || hp === '' || (Number(hp) === 7901 && Number(lp) !== 7901)) hp = lp;
+    return defaultLanding({
       id: L.id || (i === 0 ? 'landing-default' : newId('landing')),
       ...L,
-      homeReachablePort: clampPort(L.homeReachablePort, t.ingress.port),
-      listenPort: clampPort(L.listenPort, t.ingress.port),
+      listenPort: lp,
+      homeReachablePort: hp,
       nodeId: L.nodeId || (i === 0 ? state.primaryNodeId || null : L.nodeId) || null,
       ixId: L.ixId || defIxId,
-    })
-  );
+    });
+  });
   if (!t.landings.length) {
     t.landings = [
       defaultLanding({
@@ -500,10 +508,18 @@ function buildIxForwardScript(state, opts = {}) {
     const homeHost = String(
       (isFocus && opts.homeHost) || L.homeReachableHost || ix?.homeReachableHost || ''
     ).trim();
-    const homePort = clampPort(
-      (isFocus && opts.homePort) || L.homeReachablePort || L.listenPort || ix?.homeReachablePort,
-      listenPort
-    );
+    let rawHomePort =
+      (isFocus && opts.homePort) || L.homeReachablePort || L.listenPort || ix?.homeReachablePort;
+    // 旧数据常把 homeReachablePort 留在 7901，而 pro3 listenPort=7902 → 会 DNAT 到错误端口
+    if (
+      !(isFocus && opts.homePort) &&
+      Number(L.homeReachablePort) === 7901 &&
+      Number(L.listenPort) &&
+      Number(L.listenPort) !== 7901
+    ) {
+      rawHomePort = L.listenPort;
+    }
+    const homePort = clampPort(rawHomePort, listenPort);
     return {
       id: L.id,
       name: L.name || L.id,
@@ -939,14 +955,41 @@ function diagnoseTopology(state, opts = {}) {
 
   const anyFwd = t.ixes.some((x) => x.forwardConfigured);
   const anyHome = t.landings.some((L) => L.homeReachableHost) || t.ixes.some((x) => x.homeReachableHost);
+  // 多落地：逐条检查端口与可达地址，避免「默认 7901 绿了」掩盖 pro3:7902
+  const routeHints = [];
+  const hostByLanding = new Map();
+  for (const L of t.landings) {
+    const lp = Number(L.listenPort) || port;
+    const hh = String(L.homeReachableHost || '').trim();
+    hostByLanding.set(L.id, hh);
+    routeHints.push(`${L.name || L.id}:商家前置:${lp}→${hh || '未填可达'}:${L.homeReachablePort || lp}`);
+  }
+  const missingHome = t.landings.filter((L) => !String(L.homeReachableHost || '').trim());
+  const hosts = t.landings.map((L) => String(L.homeReachableHost || '').trim()).filter(Boolean);
+  const sameHostAll =
+    t.landings.length >= 2 && hosts.length >= 2 && new Set(hosts).size === 1;
+  let fwdLevel = anyFwd && anyHome ? 'ok' : 'error';
+  let fwdFix = anyFwd ? '' : '拓扑页复制「IX 转发脚本」在对应 IX root 整文件执行';
+  let fwdDetail = anyFwd
+    ? `已标记转发的 IX · 路由：${routeHints.join('；') || '无落地'}`
+    : '未配置：商家前置流量到不了落地家宽 mita';
+  if (anyFwd && missingHome.length) {
+    fwdLevel = 'warn';
+    fwdDetail += ` · 缺可达地址：${missingHome.map((L) => L.name).join('、')}`;
+    fwdFix =
+      '落地页展开每台落地填写「家宽可达地址」（pro3 必须是 pro3 自己的公网 IP，不要填成 NB.JP 的）→ 拓扑重新生成脚本并在 IX 执行';
+  } else if (anyFwd && sameHostAll) {
+    fwdLevel = 'warn';
+    fwdDetail += ` · 多落地共用同一可达 IP ${hosts[0]}（若两台是不同家宽，pro3 会指错机）`;
+    fwdFix =
+      '确认 pro3 的「家宽可达地址」是 pro3 公网 IP；两台落地 IP 不同时不要都填 82.x。改完后重新生成并在 IX 执行转发脚本（须含 7901 与 7902）';
+  }
   push({
     id: 'ix_forward',
-    level: anyFwd && anyHome ? 'ok' : 'error',
-    title: 'IX → 落地家宽 TCP 转发',
-    detail: anyFwd
-      ? `至少一台 IX 已标记转发 · 默认 :${port}`
-      : '未配置：商家前置流量到不了落地家宽 mita',
-    fix: anyFwd ? '' : '拓扑页复制「IX 转发脚本」在对应 IX root 整文件执行',
+    level: fwdLevel,
+    title: 'IX → 落地家宽 TCP 转发（多端口）',
+    detail: fwdDetail,
+    fix: fwdFix,
   });
 
   if (mode === 'agent') {
@@ -961,11 +1004,17 @@ function diagnoseTopology(state, opts = {}) {
         level: online && running ? 'ok' : online ? 'warn' : 'error',
         title: `落地 · ${L.name}`,
         detail: online
-          ? `Agent 在线${node?.hostname ? ' · ' + node.hostname : ''} · mita ${mita.status || '未知'} · 端口 ${L.listenPort}`
+          ? `Agent 在线${node?.hostname ? ' · ' + node.hostname : ''} · mita ${mita.status || '未知'} · 端口 ${L.listenPort} · IX可达 ${L.homeReachableHost || '未填'}`
           : L.nodeId
             ? 'Agent 离线'
             : '未绑定 Agent 节点',
-        fix: online ? (running ? '' : '点「一键落地」') : '在落地页安装 Agent',
+        fix: online
+          ? running
+            ? L.homeReachableHost
+              ? ''
+              : '填写本落地「家宽可达地址」并重新生成 IX 转发'
+            : '点「一键落地」'
+          : '在落地页安装 Agent',
       });
       if (report?.exitPublicIp) {
         push({
@@ -1004,11 +1053,12 @@ function diagnoseTopology(state, opts = {}) {
     }
   }
 
+  const portList = [...new Set(t.landings.map((L) => Number(L.listenPort) || port))].join('/');
   push({
     id: 'test_hint',
     level: 'info',
     title: '如何测通',
-    detail: `本机客户端连商家前置 ${ep || '114.x:7901'}；IX/家宽 tcpdump -ni any tcp port ${port}`,
+    detail: `本机客户端：NB.JP 用 ${ep || '前置'}:${port}；其它落地用各自端口（当前 ${portList || port}）。IX: nft list table ip mieru_ix_forward；家宽: ss -lntp | grep -E '7901|7902'`,
   });
 
   const errors = items.filter((i) => i.level === 'error').length;

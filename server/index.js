@@ -1100,7 +1100,8 @@ app.put('/api/nodes/:id', (req, res) => {
     node.server.listenPort = port;
     if (landing) {
       landing.listenPort = port;
-      if (landing.homeReachablePort == null || landing.homeReachablePort === 7901) {
+      // 与 mita 监听端口对齐（pro3:7902 时 home 也必须 7902，否则 IX DNAT 打到 7901）
+      if (body.homeReachablePort === undefined) {
         landing.homeReachablePort = port;
       }
     }

@@ -541,5 +541,46 @@ ok('publicTopology per-IX ingress/endpoints');
   ok('job lease reclaim marks error after 5');
 }
 
+
+// 18) pro3 listen 7902 时转发目标端口不得仍是 7901
+{
+  const st = {
+    topology: topology.defaultTopology(),
+    server: { listenPort: 7901, endpoint: '1.1.1.1:7901' },
+    nodes: [],
+    clients: [],
+  };
+  st.topology.ixes[0].forwardConfigured = true;
+  st.topology.landings = [
+    {
+      id: 'L1',
+      name: 'NB.JP',
+      nodeId: 'n1',
+      listenPort: 7901,
+      homeReachableHost: '8.8.8.8',
+      homeReachablePort: 7901,
+      ixId: st.topology.ixes[0].id,
+    },
+    {
+      id: 'L2',
+      name: 'pro3',
+      nodeId: 'n2',
+      listenPort: 7902,
+      homeReachableHost: '9.9.9.9',
+      homeReachablePort: 7901, // 旧脏数据
+      ixId: st.topology.ixes[0].id,
+    },
+  ];
+  topology.ensureTopology(st);
+  assert.strictEqual(Number(st.topology.landings[1].homeReachablePort), 7902);
+  const fwd = topology.buildIxForwardScript(st);
+  assert.ok(fwd.ok, fwd.error);
+  const r2 = fwd.routes.find((r) => r.name === 'pro3');
+  assert.strictEqual(r2.listenPort, 7902);
+  assert.strictEqual(r2.homePort, 7902);
+  assert.ok(fwd.script.includes('dnat to 9.9.9.9:7902'));
+  ok('pro3 homeReachablePort follows listenPort 7902');
+}
+
 console.log('\nsmoke-v4: all passed');
 console.log('tmp data:', tmp);

@@ -614,22 +614,30 @@ function diagnose(state, opts = {}) {
   const running = Boolean(mita.running) || /RUNNING/i.test(String(mita.status || ''));
 
   if (opts.dirty) {
+    const which =
+      Array.isArray(opts.dirtyLandings) && opts.dirtyLandings.length
+        ? opts.dirtyLandings.join('、')
+        : '';
     push({
       id: 'dirty',
       level: 'warn',
       title: '有未应用的更改',
-      detail: '面板已保存，尚未下发到落地机 mita',
-      fix: '点「应用配置」或「一键落地」',
+      detail: which
+        ? `以下落地配置未写入 mita：${which}`
+        : '面板已保存，尚未下发到落地机 mita',
+      fix: which
+        ? '到「落地」展开对应机器点「应用配置」；或顶栏「应用全部」。空用户落地不会下发也无需下发'
+        : '点「应用配置」或「一键落地」',
     });
   }
 
   if (opts.clientsNeedRescan) {
     push({
       id: 'need_rescan',
-      level: 'warn',
-      title: '连接参数已变',
-      detail: '入站/端口/密码改过，客户端需更新分享链',
-      fix: '到「客户端」重新复制 mierus://（host 应为商家前置 114 或 211）',
+      level: 'info',
+      title: '连接参数已变（提醒）',
+      detail: '入站/端口/密码改过。这不是故障：客户端要用新 mierus 链接；更新后点「我已更新」即可消除本条',
+      fix: '到「客户端」重新复制 mierus://（host=商家前置 114/211）→ 顶栏点「我已更新」',
     });
   }
 

@@ -245,17 +245,23 @@ function configHashForNode(node, hasher) {
 }
 
 function isNodeDirty(node, hasher) {
-  if (node._dirtyFlag) return true;
-  if (!node.lastAppliedHash) {
-    return (node.clients || []).length > 0 || Boolean(node.server?.listenPort);
+  const hasUsers = (node.clients || []).length > 0;
+  // 无绑定用户：不需要、也无法 apply → 不算 dirty（并清掉误打的脏标记）
+  // 旧逻辑：listenPort 或 _dirtyFlag 会让 pro3「用户0」永远黄条
+  if (!hasUsers) {
+    if (node._dirtyFlag) node._dirtyFlag = false;
+    return false;
   }
+  if (node._dirtyFlag) return true;
+  // 从未成功应用且有用户 → dirty
+  if (!node.lastAppliedHash) return true;
   if (hasher) {
     try {
       const h = configHashForNode(node, hasher);
-      if (!h) return Boolean(node._dirtyFlag);
+      if (!h) return true;
       return h !== node.lastAppliedHash;
     } catch {
-      return Boolean(node._dirtyFlag);
+      return true;
     }
   }
   return false;

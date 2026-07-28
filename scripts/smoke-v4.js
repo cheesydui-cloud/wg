@@ -282,6 +282,28 @@ ok('publicTopology per-IX ingress/endpoints');
   const port = topology.allocateListenPort(state, { ixId: state.topology.ixes[0].id });
   assert.ok(port !== 7901 && port !== 7902, 'allocates free port got ' + port);
   ok('multi-landing forward ports + allocateListenPort');
+
+// 12) empty landing (0 users, never applied) must NOT keep global dirty forever
+{
+  const nodeEmpty = {
+    id: 'n_empty',
+    name: 'empty',
+    clients: [],
+    server: { listenPort: 7902, protocol: 'TCP' },
+    lastAppliedHash: null,
+    _dirtyFlag: false,
+  };
+  assert.strictEqual(nodes.isNodeDirty(nodeEmpty, null), false, 'empty never-applied not dirty');
+  nodeEmpty.clients = [{ id: 'c1', name: 'u1' }];
+  assert.strictEqual(nodes.isNodeDirty(nodeEmpty, null), true, 'with users never-applied dirty');
+  nodeEmpty._dirtyFlag = true;
+  nodeEmpty.clients = [];
+  assert.strictEqual(nodes.isNodeDirty(nodeEmpty, null), false, 'empty clears sticky dirty flag');
+  assert.strictEqual(nodeEmpty._dirtyFlag, false, 'flag cleared');
+  nodeEmpty.lastAppliedHash = 'abc';
+  assert.strictEqual(nodes.isNodeDirty(nodeEmpty, null), false, 'applied then emptied clean');
+  ok('empty landing not sticky-dirty');
+}
 }
 
 console.log('\nsmoke-v4: all passed');

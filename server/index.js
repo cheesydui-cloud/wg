@@ -107,9 +107,35 @@ function markDirtyForClient(client) {
 
 function isUnifiedDirty() {
   if (state.mode === 'agent') {
-    return nodes.ensureNodes(state).some((n) => nodes.isNodeDirty(n, hasher()));
+    // 用 state.clients 实时镜像到 node.clients，避免脏标记与绑定脱节
+    return nodes.ensureNodes(state).some((n) => {
+      try {
+        n.clients = mieru.clientsForNode(state, n.id);
+      } catch {
+        /* ignore */
+      }
+      return nodes.isNodeDirty(n, hasher());
+    });
   }
   return mieru.isDirty(state);
+}
+
+/** 哪些落地仍 dirty（诊断用） */
+function dirtyLandingNames() {
+  if (state.mode !== 'agent') return [];
+  const names = [];
+  for (const n of nodes.ensureNodes(state)) {
+    try {
+      n.clients = mieru.clientsForNode(state, n.id);
+    } catch {
+      /* */
+    }
+    if (nodes.isNodeDirty(n, hasher())) {
+      const uc = (n.clients || []).length;
+      names.push(`${n.name}(${uc}用户)`);
+    }
+  }
+  return names;
 }
 
 function anyNodeDirty() {
@@ -1178,17 +1204,55 @@ app.post('/api/apply', async (req, res) => {
     // all dirty or primary
     const all = req.body?.all === true;
     const targets = all
-      ? nodes.ensureNodes(state).filter((n) => nodes.isNodeDirty(n, hasher()) || true)
+      ? nodes.ensureNodes(state).filter((n) => {
+          try {
+            n.clients = mieru.clientsForNode(state, n.id);
+          } catch {
+            /* */
+          }
+          // 应用全部：只下发「有用户且 dirty」的落地；空落地跳过
+          const uc = mieru.clientsForNode(state, n.id).filter((c) => c.enabled !== false).length;
+          return uc > 0 && nodes.isNodeDirty(n, hasher());
+        })
       : (() => {
           const p = nodes.getPrimaryNode(state);
           return p ? [p] : [];
         })();
     if (!targets.length) {
+      if (all) {
+        return res.json({
+          ok: true,
+          mode: 'agent',
+          pending: false,
+          jobs: [],
+          message: '没有需要下发的落地（均已应用或无绑定用户）',
+          dirty: isUnifiedDirty(),
+        });
+      }
       return res.status(400).json({ ok: false, error: '远程模式但没有节点，请先安装 Agent' });
     }
+    // 应用全部时跳过 0 用户（避免任务必失败）
     const jobs = [];
+    const skipped = [];
     for (const node of targets) {
+      const bound = mieru.clientsForNode(state, node.id).filter((c) => c.enabled !== false);
+      if (!bound.length) {
+        skipped.push(node.name);
+        continue;
+      }
       jobs.push(enqueueApply(node, 'mieru_apply'));
+    }
+    if (!jobs.length) {
+      return res.json({
+        ok: true,
+        mode: 'agent',
+        pending: false,
+        jobs: [],
+        message: skipped.length
+          ? `跳过无用户落地：${skipped.join('、')}`
+          : '没有可下发的落地',
+        dirty: isUnifiedDirty(),
+      });
     }
     persist();
     return res.json({
@@ -1197,7 +1261,7 @@ app.post('/api/apply', async (req, res) => {
       pending: true,
       jobs,
       message: all
-        ? `已下发应用到 ${targets.length} 个落地`
+        ? `已下发应用到 ${jobs.length} 个落地`
         : `已下发「应用 mita 配置」到默认落地`,
       dirty: true,
     });
@@ -1262,6 +1326,7 @@ app.get('/api/diagnose', async (req, res) => {
       hostname: n.hostname,
       lastReport: n.lastReport,
     }));
+    const dirtyNames = dirtyLandingNames();
     const result = mieru.diagnose(state, {
       mode: state.mode || 'local',
       report: primary?.lastReport || null,
@@ -1269,11 +1334,13 @@ app.get('/api/diagnose', async (req, res) => {
       hostname: primary?.hostname,
       agentVersion: primary?.agentVersion,
       clientsNeedRescan: Boolean(state.clientsNeedRescan),
-      dirty: isUnifiedDirty(),
+      dirty: dirtyNames.length > 0,
+      dirtyLandings: dirtyNames,
       nodes: nodePubs,
     });
     result.clientsNeedRescan = Boolean(state.clientsNeedRescan);
-    result.dirty = isUnifiedDirty();
+    result.dirty = dirtyNames.length > 0;
+    result.dirtyLandings = dirtyNames;
     result.topology = topology.publicTopology(state);
     result.nodes = nodes.ensureNodes(state).map((n) => enrichNodePublic(n));
     if (primary) {

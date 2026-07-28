@@ -646,6 +646,119 @@ tbody tr:hover td { background: rgba(59, 130, 246, 0.03); }
   background: var(--primary-soft);
   border-color: transparent;
 }
+.alert.danger {
+  background: var(--danger-soft);
+  border-color: transparent;
+  color: var(--text);
+}
+.alert.compact {
+  padding: 8px 12px;
+  margin-bottom: 10px;
+}
+.alert-todo {
+  margin: -6px 0 14px;
+}
+.alert-todo-toggle {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0 2px 6px;
+  cursor: pointer;
+}
+.alert-todo-toggle:hover { color: var(--primary); }
+.alert-todo-list { display: none; }
+.alert-todo.open .alert-todo-list { display: block; }
+.alert-todo .alert { margin-bottom: 8px; }
+
+/* 多落地入口折叠条 */
+.ep-banner {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+}
+.ep-banner-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+}
+.ep-banner-body {
+  display: none;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(59, 130, 246, 0.15);
+}
+.ep-banner.open .ep-banner-body { display: block; }
+.ep-row {
+  font-size: 12.5px;
+  margin-top: 4px;
+  color: var(--text-2);
+}
+.ep-row strong { color: var(--text); }
+
+/* 落地详情按钮分区 */
+.landing-actions { margin-top: 12px; }
+.landing-actions-primary { margin-bottom: 4px; }
+.landing-more {
+  margin-top: 8px;
+  border-top: 1px dashed var(--border-soft);
+  padding-top: 8px;
+}
+.landing-more summary {
+  cursor: pointer;
+  color: var(--text-3);
+  font-size: 12px;
+  font-weight: 600;
+  user-select: none;
+  list-style: none;
+}
+.landing-more summary::-webkit-details-marker { display: none; }
+.landing-more summary:hover { color: var(--primary); }
+
+/* 可折叠卡片（全局 mita 等） */
+.fold-card .fold-head {
+  cursor: pointer;
+  user-select: none;
+}
+.fold-card .fold-head:hover { opacity: 0.92; }
+.fold-card .fold-body { display: none; }
+.fold-card.open .fold-body {
+  display: block;
+  padding-top: 4px;
+}
+.compact-card .card-desc { display: none; }
+
+/* 概览双栏 */
+.dash-two {
+  display: grid;
+  gap: 16px;
+}
+@media (min-width: 960px) {
+  .dash-two { grid-template-columns: 1fr 1fr; }
+}
+.dash-list { display: grid; gap: 0; }
+.dash-list-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 13px;
+}
+.dash-list-row:last-child { border-bottom: 0; }
+.dash-list-ops {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.dash-meta { line-height: 1.5; }
+.dash-actions .btn-ghost { opacity: 0.9; }
 .tip {
   background: var(--surface-2);
   border: 1px solid var(--border);
@@ -1032,6 +1145,22 @@ tbody tr:hover td { background: rgba(59, 130, 246, 0.03); }
   border-radius: var(--radius);
   padding: 14px 16px;
   margin-bottom: 4px;
+}
+.path-banner.compact {
+  padding: 10px 12px;
+}
+.path-banner.compact .path-node {
+  padding: 6px 8px;
+  min-width: 64px;
+  font-size: 11.5px;
+}
+.path-banner .path-tip {
+  margin: 8px 0 0;
+  font-size: 12px;
+}
+.path-banner.compact .path-tip {
+  margin: 6px 0 0;
+  color: var(--text-3);
 }
 .path-flow {
   display: flex;

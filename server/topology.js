@@ -56,7 +56,7 @@ function defaultIx(overrides = {}, globalIngress = null) {
   const ingSrc = overrides.ingress && typeof overrides.ingress === 'object' ? overrides.ingress : overrides;
   return {
     id: overrides.id || 'ix-default',
-    name: overrides.name || '沪日IX',
+    name: String(overrides.name || '沪日IX').trim().slice(0, 40) || '沪日IX',
     lanIp: overrides.lanIp || CM_DEFAULTS.ixLanIp,
     sshPort: clampPort(overrides.sshPort, CM_DEFAULTS.ixSshPort),
     portMin: Number(overrides.portMin) || CM_DEFAULTS.portMin,
@@ -92,7 +92,7 @@ function defaultLanding(overrides = {}) {
     id: overrides.id || newId('landing'),
     nodeId: overrides.nodeId || null,
     ixId: overrides.ixId || null,
-    name: overrides.name || '落地家宽',
+    name: String(overrides.name || '落地家宽').trim().slice(0, 40) || '落地家宽',
     role: overrides.role || 'us-home',
     homeReachableHost: String(overrides.homeReachableHost || '').trim(),
     homeReachablePort: clampPort(overrides.homeReachablePort, CM_DEFAULTS.defaultPort),
@@ -751,15 +751,17 @@ function applyTopologyPatch(state, body = {}) {
 
   // full replace lists if provided
   if (Array.isArray(body.ixes)) {
-    t.ixes = body.ixes.map((x, i) =>
-      defaultIx(
+    t.ixes = body.ixes.map((x, i) => {
+      const nm = String(x.name != null ? x.name : '').trim();
+      return defaultIx(
         {
           id: x.id || (i === 0 ? 'ix-default' : newId('ix')),
           ...x,
+          name: nm || (i === 0 ? '沪日IX' : `IX-${i + 1}`),
         },
         t.ingress
-      )
-    );
+      );
+    });
     if (!t.ixes.length) t.ixes = [defaultIx({}, t.ingress)];
   } else if (body.ix && typeof body.ix === 'object') {
     // v3 single ix patch → first (or body.ixId target)
@@ -768,7 +770,10 @@ function applyTopologyPatch(state, body = {}) {
     if (body.ixId) {
       target = t.ixes.find((i) => i.id === body.ixId) || target;
     }
-    if (x.name !== undefined) target.name = String(x.name || target.name);
+    if (x.name !== undefined) {
+      const nm = String(x.name || '').trim();
+      if (nm) target.name = nm.slice(0, 40);
+    }
     if (x.lanIp !== undefined) target.lanIp = String(x.lanIp || '').trim();
     if (x.sshPort !== undefined) target.sshPort = clampPort(x.sshPort, 7900);
     if (x.portMin !== undefined) target.portMin = Number(x.portMin) || target.portMin;

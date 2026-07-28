@@ -1048,7 +1048,12 @@ app.put('/api/nodes/:id', (req, res) => {
   const node = nodes.findNode(state, req.params.id);
   if (!node) return res.status(404).json({ error: '节点不存在' });
   const body = req.body || {};
-  if (body.name !== undefined) node.name = String(body.name || node.name);
+  if (body.name !== undefined) {
+    const nm = String(body.name || '').trim();
+    if (!nm) return res.status(400).json({ error: '落地显示名称不能为空' });
+    if (nm.length > 40) return res.status(400).json({ error: '落地显示名称最多 40 字' });
+    node.name = nm;
+  }
   if (body.note !== undefined) node.note = String(body.note || '');
   topology.ensureTopology(state);
   let landing = topology.getLandingByNodeId(state, node.id);

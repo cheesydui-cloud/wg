@@ -949,13 +949,14 @@ async function renderTopology() {
       ${ixes
         .map(
           (x) =>
-            `<button type="button" class="ix-tab ${x.id === ix.id ? 'on' : ''}" data-ix-tab="${esc(x.id)}">${esc(
+            `<button type="button" class="ix-tab ${x.id === ix.id ? 'on' : ''}" data-ix-tab="${esc(x.id)}" title="点击切换 · 双击可改名">${esc(
               x.name || 'IX'
             )}<small class="mono">${esc(x.lanIp || '')}</small></button>`
         )
         .join('')}
       <button type="button" class="ix-tab add" id="t-add-ix">+ 添加 IX</button>
     </div>
+    <p class="field-hint" style="margin:8px 0 0">上方标签显示名称可自定义：改下方「IX 显示名称」后点「保存本 IX」，或<strong>双击标签</strong>快速改名。</p>
 
     ${pathBanner(ix)}
 
@@ -1021,8 +1022,9 @@ async function renderTopology() {
       </div>
       <div class="inline-fields">
         <div>
-          <label>名称</label>
-          <input class="field" id="t-ix-name" value="${esc(ix.name || '')}" />
+          <label>IX 显示名称</label>
+          <input class="field" id="t-ix-name" value="${esc(ix.name || '')}" placeholder="如 沪日IX / 东京IX" maxlength="40" />
+          <p class="field-hint" style="margin-top:4px">标签、路径条、落地「所属 IX」下拉均用此名称</p>
         </div>
         <div>
           <label>内网 IP</label>
@@ -1126,17 +1128,91 @@ async function renderTopology() {
     };
   });
 
+  // 单击切换（延迟，避免与双击改名冲突）；双击改名
   document.querySelectorAll('[data-ix-tab]').forEach((b) => {
-    b.onclick = async () => {
-      try {
-        await saveCurrentIx(activeChoice);
-      } catch {
-        /* */
+    let clickTimer = null;
+    b.onclick = (ev) => {
+      if (clickTimer) clearTimeout(clickTimer);
+      clickTimer = setTimeout(async () => {
+        clickTimer = null;
+        try {
+          await saveCurrentIx(activeChoice);
+        } catch {
+          /* */
+        }
+        state.selectedIxId = b.dataset.ixTab;
+        state.selectedLandingId = null;
+        state.forwardScript = '';
+        render();
+      }, 280);
+    };
+    b.ondblclick = async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (clickTimer) {
+        clearTimeout(clickTimer);
+        clickTimer = null;
       }
-      state.selectedIxId = b.dataset.ixTab;
-      state.selectedLandingId = null;
-      state.forwardScript = '';
-      render();
+      const id = b.dataset.ixTab;
+      const cur = (ixesList().find((x) => x.id === id) || {}).name || '';
+      const name = prompt('IX 显示名称', cur);
+      if (name === null) return;
+      const trimmed = String(name).trim();
+      if (!trimmed) return toast('名称不能为空', 'err');
+      if (trimmed.length > 40) return toast('名称太长（最多 40 字）', 'err');
+      try {
+        // 保留当前表单其它字段；只改被双击那台 IX 的名称
+        const latest = collectIxes().map((x) => (x.id === id ? { ...x, name: trimmed } : x));
+        // 若双击的不是当前 IX，collectIxes 仍带当前表单，名称改在目标 id 上
+        if (!latest.some((x) => x.id === id)) {
+          const all = ixesList().map((x) =>
+            x.id === id ? { ...x, name: trimmed } : { ...x, ingress: { ...(x.ingress || {}) } }
+          );
+          const r = await api('/api/topology', {
+            method: 'PUT',
+            body: {
+              ingress: {
+                active: activeChoice,
+                port: Number(val('t-port')) || 7901,
+                externalHost: val('t-ext'),
+                mobileHost: val('t-mob'),
+                customHost: val('t-custom'),
+                provinceWhitelist: val('t-province'),
+                protocol: 'TCP',
+              },
+              ixId: ix.id,
+              ixes: all,
+              landings: collectLandings(),
+            },
+          });
+          state.topology = r.topology;
+        } else {
+          const r = await api('/api/topology', {
+            method: 'PUT',
+            body: {
+              ingress: {
+                active: activeChoice,
+                port: Number(val('t-port')) || 7901,
+                externalHost: val('t-ext'),
+                mobileHost: val('t-mob'),
+                customHost: val('t-custom'),
+                provinceWhitelist: val('t-province'),
+                protocol: 'TCP',
+              },
+              ixId: ix.id,
+              ixes: latest,
+              landings: collectLandings(),
+            },
+          });
+          state.topology = r.topology;
+        }
+        state.selectedIxId = id;
+        toast(`IX 已改名为「${trimmed}」`);
+        await refreshCore();
+        render();
+      } catch (e) {
+        toast(e.message, 'err');
+      }
     };
   });
 
@@ -1153,7 +1229,8 @@ async function renderTopology() {
     const idx = list.findIndex((x) => x.id === ix.id);
     const target = list[idx >= 0 ? idx : 0];
     if (target) {
-      target.name = val('t-ix-name') || target.name;
+      const nm = String(val('t-ix-name') || '').trim();
+      target.name = nm || target.name || 'IX';
       target.lanIp = val('t-ix-lan');
       target.sshPort = Number(val('t-ix-ssh')) || 7900;
       target.portMin = Number(val('t-pmin')) || 7900;
@@ -1231,10 +1308,14 @@ async function renderTopology() {
     try {
       await saveCurrentIx(activeChoice).catch(() => {});
       const list = collectIxes();
+      const defName = `IX-${list.length + 1}`;
+      const nameIn = prompt('新 IX 显示名称', defName);
+      if (nameIn === null) return;
+      const ixNameNew = String(nameIn).trim() || defName;
       const nid = 'ix-' + Math.random().toString(16).slice(2, 8);
       list.push({
         id: nid,
-        name: `IX-${list.length + 1}`,
+        name: ixNameNew,
         lanIp: '172.16.2.79',
         sshPort: 7900,
         portMin: 7900,
@@ -1253,7 +1334,7 @@ async function renderTopology() {
       await api('/api/topology', { method: 'PUT', body: { ixes: list } });
       state.selectedIxId = nid;
       state.selectedLandingId = null;
-      toast('已添加 IX（请改本机前置 IP/端口段）');
+      toast(`已添加 IX「${ixNameNew}」（请改本机前置 IP/端口段）`);
       await refreshCore();
       render();
     } catch (e) {
@@ -1278,8 +1359,10 @@ async function renderTopology() {
 
   document.getElementById('topo-save').onclick = async () => {
     try {
+      const nm = String(val('t-ix-name') || '').trim();
+      if (!nm) return toast('请填写 IX 显示名称', 'err');
       const r = await saveCurrentIx(activeChoice);
-      toast(r.tip || '本 IX 已保存');
+      toast(r.tip || `本 IX「${nm}」已保存`);
       const qs = scriptQs();
       const topoRes = await api('/api/topology' + (qs ? '?' + qs : ''));
       state.forwardScript = topoRes.forwardScript || '';
@@ -1370,7 +1453,7 @@ async function renderServer() {
     <div style="margin-top:16px">
       <div class="card-head" style="margin-bottom:10px">
         <h3 style="margin:0;font-size:14px">落地列表</h3>
-        <span class="muted" style="font-size:12px">点击行展开详情配置</span>
+        <span class="muted" style="font-size:12px">单击展开 · 双击名称可改名 · 展开后改「落地显示名称」并保存</span>
       </div>
       ${
         nodes.length
@@ -1412,8 +1495,9 @@ async function renderServer() {
             <div class="kv"><span>出网 IP</span><span class="mono">${esc(n.exitPublicIp || '-')}</span></div>
             <div class="inline-fields" style="margin-top:10px">
               <div>
-                <label>显示名称</label>
-                <input class="field" id="n-name-${n.id}" value="${esc(n.name || '')}" />
+                <label>落地显示名称</label>
+                <input class="field" id="n-name-${n.id}" value="${esc(n.name || '')}" placeholder="如 pro3 / 家宽-北京" maxlength="40" />
+                <p class="field-hint" style="margin-top:4px">列表标题、客户端分组、拓扑落地表都会同步</p>
               </div>
               <div>
                 <label>所属 IX</label>
@@ -1483,10 +1567,40 @@ async function renderServer() {
   bindShell();
 
   document.querySelectorAll('[data-toggle-landing]').forEach((el) => {
+    let tmr = null;
     el.onclick = () => {
+      if (tmr) clearTimeout(tmr);
+      tmr = setTimeout(() => {
+        tmr = null;
+        const id = el.dataset.toggleLanding;
+        state.expandedLandingId = state.expandedLandingId === id ? null : id;
+        render();
+      }, 260);
+    };
+    el.ondblclick = async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (tmr) {
+        clearTimeout(tmr);
+        tmr = null;
+      }
       const id = el.dataset.toggleLanding;
-      state.expandedLandingId = state.expandedLandingId === id ? null : id;
-      render();
+      const node = (state.nodes || []).find((n) => n.id === id);
+      if (!node) return;
+      const name = prompt('落地显示名称', node.name || '');
+      if (name === null) return;
+      const trimmed = String(name).trim();
+      if (!trimmed) return toast('名称不能为空', 'err');
+      if (trimmed.length > 40) return toast('名称太长（最多 40 字）', 'err');
+      try {
+        await api(`/api/nodes/${id}`, { method: 'PUT', body: { name: trimmed } });
+        toast(`落地已改名为「${trimmed}」`);
+        state.expandedLandingId = id;
+        await refreshCore();
+        render();
+      } catch (e) {
+        toast(e.data?.error || e.message, 'err');
+      }
     };
   });
 
@@ -1561,18 +1675,22 @@ async function renderServer() {
       if (!Number.isFinite(listenPort) || listenPort < 1 || listenPort > 65535) {
         return toast('请填写有效监听端口（如 7902）', 'err');
       }
+      const displayName = document.getElementById(`n-name-${id}`)?.value?.trim() || '';
+      if (!displayName) return toast('请填写落地显示名称', 'err');
+      if (displayName.length > 40) return toast('名称太长（最多 40 字）', 'err');
       try {
         const r = await api(`/api/nodes/${id}`, {
           method: 'PUT',
           body: {
-            name: document.getElementById(`n-name-${id}`)?.value?.trim() || undefined,
+            name: displayName,
             listenPort,
             homeReachableHost: document.getElementById(`n-home-${id}`)?.value?.trim() || '',
             ixId: document.getElementById(`n-ix-${id}`)?.value || null,
           },
         });
         const savedPort = r.landing?.listenPort || r.node?.listenPort || listenPort;
-        toast(`已保存落地配置 · 端口 ${savedPort}`);
+        const savedName = r.node?.name || r.landing?.name || displayName;
+        toast(`已保存「${savedName}」· 端口 ${savedPort}`);
         state.expandedLandingId = id;
         await refreshCore();
         render();

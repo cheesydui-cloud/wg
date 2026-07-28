@@ -1010,6 +1010,7 @@ app.post('/api/nodes', (req, res) => {
     ? Number(body.listenPort) || topology.allocateListenPort(state, { ixId })
     : topology.allocateListenPort(state, { ixId });
   node.server.listenPort = listenPort;
+  node.nameSource = 'panel';
   const landing = topology.defaultLanding({
     id: topology.newId('landing'),
     nodeId: node.id,
@@ -1049,6 +1050,7 @@ app.put('/api/nodes/:id', (req, res) => {
     if (!nm) return res.status(400).json({ error: '落地显示名称不能为空' });
     if (nm.length > 40) return res.status(400).json({ error: '落地显示名称最多 40 字' });
     node.name = nm;
+    node.nameSource = 'panel'; // 锁定：Agent hello 不得再覆盖
   }
   if (body.note !== undefined) node.note = String(body.note || '');
   topology.ensureTopology(state);
@@ -1577,7 +1579,8 @@ app.post('/api/agent/hello', (req, res) => {
   node.hostname = body.hostname || node.hostname;
   node.agentVersion = body.agentVersion || node.agentVersion;
   node.lastSeenAt = new Date().toISOString();
-  if (body.name) node.name = body.name;
+  // 显示名称只由面板管理（创建/改名）。Agent 的 WG_AGENT_NAME 不得覆盖，
+  // 否则用户改名保存后，Agent 重连 hello 会把名字改回安装时的旧值。
   persist();
   res.json({ ok: true, nodeId: node.id, protocol: 'mieru' });
 });

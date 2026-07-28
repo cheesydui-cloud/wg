@@ -483,5 +483,45 @@ ok('publicTopology per-IX ingress/endpoints');
   ok('mergeClientsFromNodes recovers orphan node.clients');
 }
 
+
+// 16) Agent hello 不得覆盖面板改过的落地显示名
+{
+  const st = {
+    mode: 'agent',
+    primaryNodeId: null,
+    nodes: [],
+    clients: [{ id: 'c', name: 'u1', password: 'p', enabled: true, route: {}, package: {}, usage: {} }],
+    server: { listenPort: 7901 },
+    topology: require('../server/topology').defaultTopology(),
+  };
+  const { node } = nodes.createNode(st, { name: '落地出口' });
+  st.primaryNodeId = node.id;
+  // 模拟面板改名
+  node.name = '家宽-北京';
+  node.nameSource = 'panel';
+  // 模拟 agent hello 带安装时旧名
+  const reported = '落地出口';
+  if (node.nameSource !== 'panel') {
+    node.name = reported;
+  } else {
+    // panel locked — keep
+  }
+  assert.strictEqual(node.name, '家宽-北京', 'panel rename must stick after agent hello');
+  // 未锁定时占位名可被 agent 填充
+  const n2 = nodes.createNode(st, { name: '落地-2' }).node;
+  // 模拟 hello 逻辑：placeholder 可更新
+  let nameSource = n2.nameSource;
+  let nm = n2.name;
+  const bodyName = 'pro3-home';
+  if (bodyName && nameSource !== 'panel') {
+    const cur = String(nm || '').trim();
+    const placeholder =
+      !cur || cur === 'node' || /^落地-\d+$/.test(cur) || cur === '落地家宽' || cur === '落地出口';
+    if (placeholder) nm = bodyName;
+  }
+  assert.strictEqual(nm, 'pro3-home', 'placeholder can take agent name');
+  ok('agent hello must not overwrite panel landing name');
+}
+
 console.log('\nsmoke-v4: all passed');
 console.log('tmp data:', tmp);

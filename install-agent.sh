@@ -126,7 +126,7 @@ fi
 cat > "${APP_DIR}/package.json" <<EOF
 {
   "name": "wg-agent",
-  "version": "4.1.10",
+  "version": "4.2.0",
   "private": true,
   "main": "index.js"
 }

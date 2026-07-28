@@ -3,7 +3,7 @@
 中文、新手友好的 **mieru / mita 拓扑出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v4.1.11**（修 /api/health 崩溃导致家宽装 Agent 失败）
+当前版本：**v4.2.0**（落地/IX 显示名不被 Agent 覆盖 · 健康检查/装机加固）
 
 - 每台 IX 独立商家前置（IP/域名）与端口段
 - 拓扑 = IX 工作台；落地列表点开详情；客户端按落地分组
@@ -31,6 +31,11 @@
 | **兼容 v3.1** | 单前置 / 单 IX / 单落地自动迁成一条路由，Endpoint 保留 |
 
 路径保持不变。业务流量不经面板。
+
+### v4.2.0
+
+- **落地显示名称保存后不再被改回**：Agent `hello` 曾用安装时的 `WG_AGENT_NAME` 覆盖面板改名；现以面板 `nameSource=panel` 锁定，Agent 重启也不回滚。
+- 继承 4.1.x：IX/落地可自定义名、/api/health 修复、多落地用户列表不被主落地心跳抹掉。
 
 ### v4.1.11
 
@@ -135,7 +140,7 @@ sudo bash install.sh --update
 # 新装：sudo bash install.sh
 ```
 
-打开 `http://面板IP:51821`，确认版本 **v4.1.11**。
+打开 `http://面板IP:51821`，确认版本 **v4.2.0**。
 
 忘记密码：
 

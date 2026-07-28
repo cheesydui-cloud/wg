@@ -211,6 +211,10 @@ function migrateState(parsed) {
 }
 
 function ensureClientFields(c, primaryNodeId = null) {
+  // 旧数据/手工导入可能没有 id，编辑保存会 PUT /api/clients/undefined →「用户不存在」
+  if (!c.id || typeof c.id !== 'string' || !String(c.id).trim()) {
+    c.id = crypto.randomUUID();
+  }
   if (!c.route || typeof c.route !== 'object') c.route = defaultClientRoute(primaryNodeId);
   else {
     c.route = {

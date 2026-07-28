@@ -29,6 +29,8 @@ let state = loadState();
 nodes.ensureNodes(state);
 topology.ensureTopology(state);
 mieru.ensureMieruDefaults(state);
+// 保证每个客户端都有 id（否则编辑保存会「用户不存在」）
+for (const c of state.clients || []) ensureClientFields(c, state.primaryNodeId);
 // ensure default landing bound
 if (state.primaryNodeId && state.topology.landings[0] && !state.topology.landings[0].nodeId) {
   state.topology.landings[0].nodeId = state.primaryNodeId;
@@ -809,8 +811,27 @@ app.post('/api/clients', (req, res) => {
 });
 
 app.put('/api/clients/:id', (req, res) => {
-  const c = state.clients.find((x) => x.id === req.params.id);
-  if (!c) return res.status(404).json({ error: '用户不存在' });
+  mieru.ensureMieruDefaults(state);
+  // 补齐可能缺失的 id（旧 state）
+  for (const x of state.clients || []) ensureClientFields(x, state.primaryNodeId);
+  const id = String(req.params.id || '').trim();
+  if (!id || id === 'undefined' || id === 'null') {
+    return res.status(400).json({
+      error: '用户 id 无效。请关闭弹窗，刷新页面后重新点「编辑」；若仍失败请删除后重建',
+      code: 'BAD_CLIENT_ID',
+    });
+  }
+  let c = state.clients.find((x) => x.id === id);
+  // 兼容：偶发前端用 name 当 id（不应发生，兜底）
+  if (!c && req.body?.name) {
+    c = state.clients.find((x) => x.name === String(req.body.name).trim());
+  }
+  if (!c) {
+    return res.status(404).json({
+      error: '用户不存在（可能已删除或页面数据过期）。请刷新客户端页后重试',
+      code: 'CLIENT_NOT_FOUND',
+    });
+  }
   const body = req.body || {};
   const prevLanding = mieru.clientLandingNodeId(c, state);
 

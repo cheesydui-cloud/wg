@@ -1838,7 +1838,11 @@ async function renderClients() {
   });
   document.querySelectorAll('[data-edit]').forEach((b) => {
     b.onclick = () => {
-      const c = state.clients.find((x) => x.id === b.dataset.edit);
+      const id = b.dataset.edit;
+      if (!id) return toast('无法编辑：用户 id 缺失，请刷新页面', 'err');
+      const c = state.clients.find((x) => x.id === id);
+      if (!c) return toast('用户不存在，请刷新页面', 'err');
+      if (!c.id) return toast('该用户数据损坏（无 id），请删除后重建', 'err');
       openClientModal(c);
     };
   });
@@ -1857,7 +1861,9 @@ async function renderClients() {
 }
 
 function openClientModal(client, preferLandingId) {
-  const isEdit = Boolean(client);
+  // 只认有 id 的对象为编辑；否则走创建（避免 PUT /undefined → 用户不存在）
+  const editId = client && client.id ? String(client.id) : '';
+  const isEdit = Boolean(editId);
   const nodes = state.nodes || [];
   const defaultLanding =
     client?.route?.landingNodeId || preferLandingId || state.primaryNode?.id || nodes[0]?.id || '';
@@ -1944,12 +1950,23 @@ function openClientModal(client, preferLandingId) {
         },
       };
       if (val('c-pass')) body.password = val('c-pass');
-      if (isEdit) {
+      if (isEdit && editId) {
         body.regeneratePassword = document.getElementById('c-regen')?.checked;
         body.enabled = document.getElementById('c-enabled')?.checked;
-        await api(`/api/clients/${client.id}`, { method: 'PUT', body });
-        toast('已保存（记得点应用下发）');
+        // 保存前再确认列表里还有该 id（防页面过期）
+        const still = (state.clients || []).find((x) => x.id === editId);
+        if (!still) {
+          await refreshCore().catch(() => {});
+        }
+        const again = (state.clients || []).find((x) => x.id === editId);
+        if (!again) {
+          toast('用户不存在或页面已过期，请关闭后刷新再编辑', 'err');
+          return;
+        }
+        await api(`/api/clients/${encodeURIComponent(editId)}`, { method: 'PUT', body });
+        toast('已保存（记得到 pro3 点「应用本落地」）');
         closeModal();
+        await refreshCore();
         render();
       } else {
         const r = await api('/api/clients', { method: 'POST', body });
@@ -1961,7 +1978,7 @@ function openClientModal(client, preferLandingId) {
         if (r.client?.id) showClientQr(r.client.id);
       }
     } catch (e) {
-      toast(e.message, 'err');
+      toast(e.data?.error || e.message, 'err');
     }
   };
 }

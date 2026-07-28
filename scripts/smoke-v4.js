@@ -259,5 +259,30 @@ ok('publicTopology per-IX ingress/endpoints');
   ok('dirty hash aligned with bundle configHash');
 }
 
+// 12) multi-landing same IX: different ports in one forward script
+{
+  const L2 = topology.defaultLanding({
+    id: 'landing-2',
+    nodeId: 'node-2',
+    ixId: state.topology.ixes[0].id,
+    name: 'pro3',
+    listenPort: 7902,
+    homeReachableHost: '9.9.9.9',
+    homeReachablePort: 7902,
+  });
+  // ensure first landing has host
+  state.topology.landings[0].homeReachableHost = state.topology.landings[0].homeReachableHost || '8.8.8.8';
+  state.topology.landings[0].listenPort = 7901;
+  state.topology.landings.push(L2);
+  const fwd2 = topology.buildIxForwardScript(state, { ixId: state.topology.ixes[0].id });
+  assert.ok(fwd2.ok, fwd2.error);
+  assert.ok(fwd2.script.includes('7901'), 'script has 7901');
+  assert.ok(fwd2.script.includes('7902'), 'script has 7902');
+  assert.ok(fwd2.script.includes('9.9.9.9'), 'script has pro3 host');
+  const port = topology.allocateListenPort(state, { ixId: state.topology.ixes[0].id });
+  assert.ok(port !== 7901 && port !== 7902, 'allocates free port got ' + port);
+  ok('multi-landing forward ports + allocateListenPort');
+}
+
 console.log('\nsmoke-v4: all passed');
 console.log('tmp data:', tmp);

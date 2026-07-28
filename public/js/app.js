@@ -1388,8 +1388,8 @@ async function renderServer() {
                 <select class="field" id="n-ix-${n.id}">${ixOpts || '<option value="">—</option>'}</select>
               </div>
               <div>
-                <label>监听端口</label>
-                <input class="field mono" id="n-port-${n.id}" value="${esc(L.listenPort || n.listenPort || 7901)}" />
+                <label>本落地监听端口</label>
+                <input class="field mono" id="n-port-${n.id}" value="${esc(L.listenPort || n.listenPort || 7901)}" title="同 IX 多落地须不同，如 7902" />
               </div>
               <div>
                 <label>家宽可达地址（IX→家宽）</label>
@@ -1418,13 +1418,15 @@ async function renderServer() {
 
     <div class="card" style="margin-top:16px">
       <div class="card-head"><h3>全局 mita 默认参数</h3></div>
-      <p class="card-desc">新建落地时的默认值；各落地可单独覆盖监听端口。入站 211/114 请到「拓扑」按 IX 配置。</p>
+      <p class="card-desc">这里是<strong>全局默认</strong>（主要影响分享链默认 Endpoint / 新建落地参考）。
+        <strong>改某台落地端口请点上方列表展开该行 →「监听端口」→ 保存配置</strong>，不要改这里的 7901。
+        同 IX 多落地必须不同端口（如默认 7901、pro3 7902）。入站 211/114 到「拓扑」。</p>
       <div class="kv"><span>当前默认 Endpoint</span><span class="mono">${esc(activeEp() || '未配置')}</span></div>
       <p class="field-hint"><a href="#" id="srv-to-topo">到「拓扑」修改前置 IP/域名与 IX 转发</a></p>
       <div class="inline-fields">
         <div>
-          <label>默认监听端口</label>
-          <input class="field mono" id="s-port" value="${esc(s.listenPort || 7901)}" />
+          <label>全局默认端口（非单落地）</label>
+          <input class="field mono" id="s-port" value="${esc(s.listenPort || 7901)}" title="不要用这里改 pro3 端口" />
         </div>
         <div>
           <label>协议</label>
@@ -1497,7 +1499,8 @@ async function renderServer() {
           ixId: state.selectedIxId || ixesList()[0]?.id || null,
         },
       });
-      toast('已创建落地');
+      const p = r.landing?.listenPort || r.node?.listenPort;
+      toast(p ? `已创建落地 · 自动端口 ${p}` : '已创建落地');
       state.expandedLandingId = r.node?.id || r.id || null;
       openModal({
         title: '安装 Agent',
@@ -1520,21 +1523,28 @@ async function renderServer() {
   document.querySelectorAll('[data-save-node]').forEach((b) => {
     b.onclick = async () => {
       const id = b.dataset.saveNode;
+      const portRaw = document.getElementById(`n-port-${id}`)?.value;
+      const listenPort = Number(portRaw);
+      if (!Number.isFinite(listenPort) || listenPort < 1 || listenPort > 65535) {
+        return toast('请填写有效监听端口（如 7902）', 'err');
+      }
       try {
-        await api(`/api/nodes/${id}`, {
+        const r = await api(`/api/nodes/${id}`, {
           method: 'PUT',
           body: {
             name: document.getElementById(`n-name-${id}`)?.value?.trim() || undefined,
-            listenPort: Number(document.getElementById(`n-port-${id}`)?.value) || 7901,
+            listenPort,
             homeReachableHost: document.getElementById(`n-home-${id}`)?.value?.trim() || '',
             ixId: document.getElementById(`n-ix-${id}`)?.value || null,
           },
         });
-        toast('已保存落地配置');
+        const savedPort = r.landing?.listenPort || r.node?.listenPort || listenPort;
+        toast(`已保存落地配置 · 端口 ${savedPort}`);
         state.expandedLandingId = id;
+        await refreshCore();
         render();
       } catch (e) {
-        toast(e.message, 'err');
+        toast(e.data?.error || e.message, 'err');
       }
     };
   });

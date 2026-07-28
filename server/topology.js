@@ -115,6 +115,44 @@ function clampPort(p, fallback = 7901) {
   return n;
 }
 
+/** 同 IX 下为新落地分配未占用端口 */
+function allocateListenPort(state, { ixId = null, preferred = null, excludeLandingId = null } = {}) {
+  ensureTopology(state);
+  const ix = getIx(state, ixId);
+  const min = Number(ix?.portMin) || CM_DEFAULTS.portMin;
+  const max = Number(ix?.portMax) || CM_DEFAULTS.portMax;
+  const used = new Set();
+  for (const L of state.topology.landings || []) {
+    if (excludeLandingId && L.id === excludeLandingId) continue;
+    if (ixId && L.ixId && L.ixId !== ixId) continue;
+    const p = Number(L.listenPort);
+    if (p) used.add(p);
+  }
+  for (const n of state.nodes || []) {
+    const p = Number(n?.server?.listenPort);
+    if (p) used.add(p);
+  }
+  const pref = Number(preferred);
+  if (pref && pref >= min && pref <= max && !used.has(pref)) return pref;
+  for (let p = min; p <= max; p++) {
+    if (!used.has(p)) return p;
+  }
+  return clampPort(preferred, CM_DEFAULTS.defaultPort);
+}
+
+function landingsForIx(state, ixId) {
+  ensureTopology(state);
+  const list = state.topology.landings || [];
+  if (!ixId) return list.slice();
+  const bound = list.filter((L) => L.ixId === ixId);
+  if (state.topology.ixes[0]?.id === ixId) {
+    const unbound = list.filter((L) => !L.ixId);
+    const ids = new Set(bound.map((L) => L.id));
+    for (const L of unbound) if (!ids.has(L.id)) bound.push(L);
+  }
+  return bound;
+}
+
 function ingressHostFrom(ingOrTopo, activeOverride) {
   // accept either ingress object or full topology
   const ing = ingOrTopo?.ingress && !ingOrTopo.mobileHost ? ingOrTopo.ingress : ingOrTopo || {};
@@ -429,47 +467,96 @@ function portInMerchantRange(port, ixOrMin = null, max = null) {
 function buildIxForwardScript(state, opts = {}) {
   ensureTopology(state);
   const ix = getIx(state, opts.ixId);
-  const landing = getLanding(state, opts.landingId);
-  const listenPort = clampPort(opts.port || state.topology.ingress.port || landing?.listenPort, 7901);
-  const homeHost = String(
-    opts.homeHost || landing?.homeReachableHost || ix?.homeReachableHost || ''
-  ).trim();
-  const homePort = clampPort(
-    opts.homePort || landing?.homeReachablePort || landing?.listenPort || ix?.homeReachablePort,
-    listenPort
-  );
   const lanIp = ix?.lanIp || CM_DEFAULTS.ixLanIp;
   const ixName = ix?.name || 'IX';
+  const focusLanding = opts.landingId ? getLanding(state, opts.landingId) : null;
 
-  if (!homeHost) {
+  // 同 IX 全部落地一起写规则，避免 nft 整表删除后只剩一条
+  let targets = landingsForIx(state, ix?.id).map((L) => {
+    const isFocus = focusLanding && L.id === focusLanding.id;
+    const listenPort = clampPort(
+      isFocus && opts.port ? opts.port : L.listenPort || state.topology.ingress.port,
+      7901
+    );
+    const homeHost = String(
+      (isFocus && opts.homeHost) || L.homeReachableHost || ix?.homeReachableHost || ''
+    ).trim();
+    const homePort = clampPort(
+      (isFocus && opts.homePort) || L.homeReachablePort || L.listenPort || ix?.homeReachablePort,
+      listenPort
+    );
+    return {
+      id: L.id,
+      name: L.name || L.id,
+      nodeId: L.nodeId,
+      listenPort,
+      homeHost,
+      homePort,
+    };
+  });
+
+  if (!targets.length && focusLanding) {
+    const listenPort = clampPort(
+      opts.port || focusLanding.listenPort || state.topology.ingress.port,
+      7901
+    );
+    targets = [
+      {
+        id: focusLanding.id,
+        name: focusLanding.name,
+        nodeId: focusLanding.nodeId,
+        listenPort,
+        homeHost: String(
+          opts.homeHost || focusLanding.homeReachableHost || ix?.homeReachableHost || ''
+        ).trim(),
+        homePort: clampPort(
+          opts.homePort || focusLanding.homeReachablePort || focusLanding.listenPort,
+          listenPort
+        ),
+      },
+    ];
+  }
+
+  const ready = targets.filter((x) => x.homeHost);
+  if (!ready.length) {
     return {
       ok: false,
-      error: '请先填写「家宽对 IX 可达地址」（落地页或 IX 配置）',
+      error: '请先填写各落地的「家宽对 IX 可达地址」（落地页展开保存）',
       script: '',
       ixId: ix?.id,
-      landingId: landing?.id,
+      landingId: focusLanding?.id,
+      routes: targets,
     };
   }
 
-  const script = [
+  const portMap = new Map();
+  const conflicts = [];
+  for (const r of ready) {
+    if (portMap.has(r.listenPort)) {
+      conflicts.push(`端口 ${r.listenPort}: ${portMap.get(r.listenPort)} 与 ${r.name}`);
+    } else {
+      portMap.set(r.listenPort, r.name);
+    }
+  }
+
+  const ext =
+    (ix && getIxIngress(ix, state.topology.ingress).externalHost) || CM_DEFAULTS.externalIngress;
+  const mob =
+    (ix && getIxIngress(ix, state.topology.ingress).mobileHost) || CM_DEFAULTS.mobileIngress;
+
+  const lines = [
     '#!/usr/bin/env bash',
-    `# ${ixName} → 落地家宽 TCP 转发（商家 IX 前置 · v4）`,
+    `# ${ixName} → 多落地 TCP 转发（商家 IX 前置 · v4.1）`,
     `# 在 IX 本机 root 执行（内网 ${lanIp}）`,
-    `# 电脑 → 商家前置 114/211:${listenPort} → 本机 DNAT → ${homeHost}:${homePort} mita`,
+    '# 一次性写入本 IX 下全部已填可达地址的落地，避免只配一台时清掉其它端口',
     '#',
-    '# 推荐整段执行（不要一行行粘贴到交互 shell）：',
+    '# 推荐整段执行：',
     "#   cat > /tmp/ix-forward.sh << 'SCRIPT_EOF'",
-    '#   ...粘贴本文件全文...',
+    '#   ...全文...',
     '#   SCRIPT_EOF',
     '#   chmod +x /tmp/ix-forward.sh && bash /tmp/ix-forward.sh',
     '#',
-    '# 成功后在 IX 上应能：',
-    `#   timeout 5 bash -c 'echo >/dev/tcp/${homeHost}/${homePort}' && echo OK`,
-    '# 家宽须 mita RUNNING 且监听端口；客户端仍连商家前置，勿连家宽公网 IP。',
     'set -euo pipefail',
-    `HOME_HOST=${JSON.stringify(homeHost)}`,
-    `HOME_PORT=${homePort}`,
-    `LISTEN_PORT=${listenPort}`,
     '',
     'if [[ "$(id -u)" -ne 0 ]]; then echo "请使用 root"; exit 1; fi',
     '',
@@ -478,65 +565,105 @@ function buildIxForwardScript(state, opts = {}) {
     'mkdir -p /etc/sysctl.d',
     "echo 'net.ipv4.ip_forward=1' >/etc/sysctl.d/99-mieru-ix-forward.conf",
     '',
-    'echo "==> 检测本机 ${LISTEN_PORT} 是否被占用"',
-    'if ss -lntp 2>/dev/null | grep -q ":${LISTEN_PORT} "; then',
-    '  echo "!! 警告: 本机 ${LISTEN_PORT} 已有进程在听（mita 请先 stop）"',
-    '  ss -lntp | grep ":${LISTEN_PORT} " || true',
-    'fi',
-    '',
-    'echo "==> 配置 DNAT 转发"',
-    'if command -v nft >/dev/null 2>&1; then',
-    '  nft delete table ip mieru_ix_forward 2>/dev/null || true',
-    '  nft add table ip mieru_ix_forward',
-    '  nft add chain ip mieru_ix_forward prerouting { type nat hook prerouting priority dstnat \\; policy accept \\; }',
-    '  nft add chain ip mieru_ix_forward postrouting { type nat hook postrouting priority srcnat \\; policy accept \\; }',
-    '  nft add chain ip mieru_ix_forward forward { type filter hook forward priority filter \\; policy accept \\; }',
-    '  nft add rule ip mieru_ix_forward prerouting tcp dport ${LISTEN_PORT} dnat to ${HOME_HOST}:${HOME_PORT}',
-    '  nft add rule ip mieru_ix_forward postrouting ip daddr ${HOME_HOST} tcp dport ${HOME_PORT} masquerade',
-    '  nft add rule ip mieru_ix_forward forward tcp dport ${HOME_PORT} ip daddr ${HOME_HOST} accept',
-    '  nft add rule ip mieru_ix_forward forward tcp sport ${HOME_PORT} ip saddr ${HOME_HOST} accept',
-    '  echo "    nft 规则已加载"',
-    'else',
-    '  iptables -t nat -C PREROUTING -p tcp --dport "${LISTEN_PORT}" -j DNAT --to-destination "${HOME_HOST}:${HOME_PORT}" 2>/dev/null \\',
-    '    || iptables -t nat -A PREROUTING -p tcp --dport "${LISTEN_PORT}" -j DNAT --to-destination "${HOME_HOST}:${HOME_PORT}"',
-    '  iptables -t nat -C POSTROUTING -p tcp -d "${HOME_HOST}" --dport "${HOME_PORT}" -j MASQUERADE 2>/dev/null \\',
-    '    || iptables -t nat -A POSTROUTING -p tcp -d "${HOME_HOST}" --dport "${HOME_PORT}" -j MASQUERADE',
-    '  iptables -C FORWARD -p tcp -d "${HOME_HOST}" --dport "${HOME_PORT}" -j ACCEPT 2>/dev/null \\',
-    '    || iptables -A FORWARD -p tcp -d "${HOME_HOST}" --dport "${HOME_PORT}" -j ACCEPT',
-    '  iptables -C FORWARD -p tcp -s "${HOME_HOST}" --sport "${HOME_PORT}" -j ACCEPT 2>/dev/null \\',
-    '    || iptables -A FORWARD -p tcp -s "${HOME_HOST}" --sport "${HOME_PORT}" -j ACCEPT',
-    '  echo "    iptables 规则已加载"',
-    'fi',
-    '',
-    'echo "==> 探测 IX → 家宽 ${HOME_HOST}:${HOME_PORT}"',
-    'if timeout 5 bash -c "echo >/dev/tcp/${HOME_HOST}/${HOME_PORT}" 2>/dev/null; then',
-    '  echo "    TCP 可达"',
-    'else',
-    '  echo "    !! 探测失败：IX 访问不到家宽，请检查家宽公网/防火墙/mita"',
-    'fi',
-    '',
-    'echo "============================================"',
-    'echo " 转发: :${LISTEN_PORT} → ${HOME_HOST}:${HOME_PORT}"',
-    `echo " 客户端连本 IX 商家前置: ${JSON.stringify(
-      (ix && getIxIngress(ix, state.topology.ingress).externalHost) || CM_DEFAULTS.externalIngress
-    )}:\${LISTEN_PORT} 或 ${JSON.stringify(
-      (ix && getIxIngress(ix, state.topology.ingress).mobileHost) || CM_DEFAULTS.mobileIngress
-    )}:\${LISTEN_PORT}"`,
-    'echo " 路径: 电脑 → 商家IX前置 → 本IX → 落地家宽 mita"',
-    'echo "============================================"',
-    '',
-  ].join('\n');
+  ];
+
+  if (conflicts.length) {
+    lines.push(`echo "!! 警告: 同 IX 落地端口冲突: ${conflicts.join('; ')}"`);
+    lines.push('echo "   请在落地页把各落地改成不同端口（如 7901 / 7902）"');
+    lines.push('');
+  }
+
+  lines.push('echo "==> 重建本 IX 转发表（含全部落地）"');
+  lines.push('if command -v nft >/dev/null 2>&1; then');
+  lines.push('  nft delete table ip mieru_ix_forward 2>/dev/null || true');
+  lines.push('  nft add table ip mieru_ix_forward');
+  lines.push(
+    '  nft add chain ip mieru_ix_forward prerouting { type nat hook prerouting priority dstnat \\; policy accept \\; }'
+  );
+  lines.push(
+    '  nft add chain ip mieru_ix_forward postrouting { type nat hook postrouting priority srcnat \\; policy accept \\; }'
+  );
+  lines.push(
+    '  nft add chain ip mieru_ix_forward forward { type filter hook forward priority filter \\; policy accept \\; }'
+  );
+
+  for (const r of ready) {
+    lines.push(`  # ${r.name}: :${r.listenPort} → ${r.homeHost}:${r.homePort}`);
+    lines.push(
+      `  nft add rule ip mieru_ix_forward prerouting tcp dport ${r.listenPort} dnat to ${r.homeHost}:${r.homePort}`
+    );
+    lines.push(
+      `  nft add rule ip mieru_ix_forward postrouting ip daddr ${r.homeHost} tcp dport ${r.homePort} masquerade`
+    );
+    lines.push(
+      `  nft add rule ip mieru_ix_forward forward tcp dport ${r.homePort} ip daddr ${r.homeHost} accept`
+    );
+    lines.push(
+      `  nft add rule ip mieru_ix_forward forward tcp sport ${r.homePort} ip saddr ${r.homeHost} accept`
+    );
+  }
+  lines.push(`  echo "    nft 已加载 ${ready.length} 条落地"`);
+  lines.push('else');
+  lines.push('  echo "    使用 iptables（按端口幂等添加）"');
+  for (const r of ready) {
+    lines.push(`  # ${r.name}`);
+    lines.push(
+      `  iptables -t nat -C PREROUTING -p tcp --dport ${r.listenPort} -j DNAT --to-destination ${r.homeHost}:${r.homePort} 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport ${r.listenPort} -j DNAT --to-destination ${r.homeHost}:${r.homePort}`
+    );
+    lines.push(
+      `  iptables -t nat -C POSTROUTING -p tcp -d ${r.homeHost} --dport ${r.homePort} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -p tcp -d ${r.homeHost} --dport ${r.homePort} -j MASQUERADE`
+    );
+    lines.push(
+      `  iptables -C FORWARD -p tcp -d ${r.homeHost} --dport ${r.homePort} -j ACCEPT 2>/dev/null || iptables -A FORWARD -p tcp -d ${r.homeHost} --dport ${r.homePort} -j ACCEPT`
+    );
+    lines.push(
+      `  iptables -C FORWARD -p tcp -s ${r.homeHost} --sport ${r.homePort} -j ACCEPT 2>/dev/null || iptables -A FORWARD -p tcp -s ${r.homeHost} --sport ${r.homePort} -j ACCEPT`
+    );
+  }
+  lines.push('fi');
+  lines.push('');
+  lines.push('echo "==> 探测 IX → 各落地"');
+  for (const r of ready) {
+    lines.push(`echo -n "  ${r.name} ${r.homeHost}:${r.homePort} ... "`);
+    lines.push(
+      `if timeout 5 bash -c "echo >/dev/tcp/${r.homeHost}/${r.homePort}" 2>/dev/null; then echo OK; else echo FAIL; fi`
+    );
+  }
+  lines.push('');
+  lines.push('echo "============================================"');
+  for (const r of ready) {
+    lines.push(
+      `echo "  ${r.name}: 商家前置 :${r.listenPort} → ${r.homeHost}:${r.homePort}"`
+    );
+    lines.push(`echo "    客户端: ${ext}:${r.listenPort} 或 ${mob}:${r.listenPort}"`);
+  }
+  if (targets.some((x) => !x.homeHost)) {
+    const miss = targets.filter((x) => !x.homeHost).map((x) => x.name).join(', ');
+    lines.push(`echo "  未纳入（缺可达地址）: ${miss}"`);
+  }
+  lines.push('echo " 路径: 电脑 → 商家IX前置 → 本IX → 落地家宽 mita"');
+  lines.push('echo "============================================"');
+  lines.push('');
+
+  const focus = focusLanding
+    ? ready.find((r) => r.id === focusLanding.id) || ready[0]
+    : ready[0];
 
   return {
     ok: true,
-    script,
-    listenPort,
-    homeHost,
-    homePort,
+    script: lines.join('\n'),
+    listenPort: focus?.listenPort,
+    homeHost: focus?.homeHost,
+    homePort: focus?.homePort,
     lanIp,
     ixId: ix?.id,
-    landingId: landing?.id,
-    tip: '在 IX root 整段执行；IX→家宽探测 OK 后面板勾选已配置',
+    landingId: focusLanding?.id || focus?.id,
+    routes: ready,
+    conflicts,
+    tip:
+      ready.length > 1
+        ? `在 IX root 整段执行；将写入 ${ready.length} 条落地转发`
+        : '在 IX root 整段执行；IX→家宽探测 OK 后面板勾选已配置',
   };
 }
 
@@ -889,6 +1016,8 @@ module.exports = {
   altEndpoint,
   portInMerchantRange,
   buildIxForwardScript,
+  allocateListenPort,
+  landingsForIx,
   publicTopology,
   applyTopologyPatch,
   diagnoseTopology,

@@ -144,6 +144,18 @@ function enrichNodePublic(node) {
       }
     : null;
   pub.isPrimary = state.primaryNodeId === node.id;
+  try {
+    topology.ensureTopology(state);
+    const L = topology.getLandingByNodeId(state, node.id);
+    if (L) {
+      pub.landingId = L.id;
+      pub.listenPort = Number(L.listenPort) || pub.listenPort;
+      pub.homeReachableHost = L.homeReachableHost || '';
+      pub.ixId = L.ixId || null;
+    }
+  } catch {
+    /* ignore */
+  }
   return pub;
 }
 
@@ -861,17 +873,21 @@ app.post('/api/nodes', (req, res) => {
     note: body.note || '',
     template: body.template || 'cm',
   });
-  if (body.listenPort) node.server.listenPort = Number(body.listenPort) || 7901;
-  // add landing meta
   topology.ensureTopology(state);
+  const ixId = body.ixId || state.topology.ixes[0]?.id || null;
+  // 同 IX 自动分配空闲端口，避免新落地默认 7901 与旧落地冲突
+  const listenPort = body.listenPort
+    ? Number(body.listenPort) || topology.allocateListenPort(state, { ixId })
+    : topology.allocateListenPort(state, { ixId });
+  node.server.listenPort = listenPort;
   const landing = topology.defaultLanding({
     id: topology.newId('landing'),
     nodeId: node.id,
-    ixId: body.ixId || state.topology.ixes[0]?.id || null,
+    ixId,
     name: node.name,
-    listenPort: node.server.listenPort,
+    listenPort,
     homeReachableHost: body.homeReachableHost || '',
-    homeReachablePort: body.homeReachablePort || node.server.listenPort,
+    homeReachablePort: body.homeReachablePort || listenPort,
   });
   state.topology.landings.push(landing);
   if (!state.primaryNodeId) {
@@ -900,30 +916,61 @@ app.put('/api/nodes/:id', (req, res) => {
   const body = req.body || {};
   if (body.name !== undefined) node.name = String(body.name || node.name);
   if (body.note !== undefined) node.note = String(body.note || '');
-  if (body.listenPort !== undefined) {
-    node.server.listenPort = Number(body.listenPort) || node.server.listenPort;
-    nodes.markNodeDirty(node);
-  }
-  // update landing meta
   topology.ensureTopology(state);
   let landing = topology.getLandingByNodeId(state, node.id);
   if (!landing && body.createLanding !== false) {
+    const ixId0 = body.ixId || state.topology.ixes[0]?.id || null;
+    const port0 =
+      body.listenPort !== undefined
+        ? Number(body.listenPort) || topology.allocateListenPort(state, { ixId: ixId0 })
+        : topology.allocateListenPort(state, { ixId: ixId0 });
     landing = topology.defaultLanding({
       id: topology.newId('landing'),
       nodeId: node.id,
       name: node.name,
-      listenPort: node.server.listenPort,
+      ixId: ixId0,
+      listenPort: port0,
     });
     state.topology.landings.push(landing);
+    node.server.listenPort = port0;
+  }
+  if (body.listenPort !== undefined) {
+    const port = Number(body.listenPort);
+    if (!Number.isFinite(port) || port < 1 || port > 65535) {
+      return res.status(400).json({ error: '监听端口无效' });
+    }
+    // 同 IX 端口冲突提示
+    const ixId = body.ixId !== undefined ? body.ixId : landing?.ixId;
+    const clash = (state.topology.landings || []).find(
+      (L) =>
+        L.nodeId !== node.id &&
+        Number(L.listenPort) === port &&
+        (!ixId || !L.ixId || L.ixId === ixId)
+    );
+    if (clash) {
+      return res.status(400).json({
+        error: `端口 ${port} 已被落地「${clash.name}」占用，同 IX 须用不同端口`,
+      });
+    }
+    node.server.listenPort = port;
+    if (landing) {
+      landing.listenPort = port;
+      if (landing.homeReachablePort == null || landing.homeReachablePort === 7901) {
+        landing.homeReachablePort = port;
+      }
+    }
+    nodes.markNodeDirty(node);
   }
   if (landing) {
     if (body.homeReachableHost !== undefined) {
       landing.homeReachableHost = String(body.homeReachableHost || '').trim();
     }
     if (body.homeReachablePort !== undefined) {
-      landing.homeReachablePort = topology.clampPort(body.homeReachablePort, node.server.listenPort);
+      landing.homeReachablePort = topology.clampPort(
+        body.homeReachablePort,
+        node.server.listenPort || 7901
+      );
     }
-    if (body.listenPort !== undefined) landing.listenPort = Number(body.listenPort) || landing.listenPort;
     if (body.ixId !== undefined) landing.ixId = body.ixId || null;
     if (body.name !== undefined) landing.name = node.name;
   }

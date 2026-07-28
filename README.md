@@ -3,7 +3,7 @@
 中文、新手友好的 **mieru / mita 拓扑出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v4.2.4**（落地一键更新 Agent）
+当前版本：**v4.2.5**（apply 强制校验 mita 端口）
 
 - 每台 IX 独立商家前置（IP/域名）与端口段
 - 拓扑 = IX 工作台；落地列表点开详情；客户端按落地分组
@@ -31,6 +31,11 @@
 | **兼容 v3.1** | 单前置 / 单 IX / 单落地自动迁成一条路由，Endpoint 保留 |
 
 路径保持不变。业务流量不经面板。
+
+### v4.2.5
+
+- **apply 强制端口**：bundle/agent 强制 portBindings=落地 listenPort；apply 后校验本机是否在听该端口，否则不算成功并走 OneClick 重配（修 pro3 仍停 7901）。
+- 落地改端口保存后，在线时自动排队 apply。
 
 ### v4.2.4
 
@@ -164,7 +169,7 @@ git clone https://github.com/cheesydui-cloud/wg.git ~/wg
 cd ~/wg && sudo bash install.sh
 ```
 
-打开 `http://面板IP:51821`，确认版本 **v4.2.4**。
+打开 `http://面板IP:51821`，确认版本 **v4.2.5**。
 
 忘记密码：
 

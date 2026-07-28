@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Edge Agent v4.2.4 — mieru / mita 落地（支持多落地 + 流量/套餐）
+ * Edge Agent v4.2.5 — mieru / mita 落地（支持多落地 + 流量/套餐）
  * 连接中心面板，拉取任务：安装/应用 mita、上报状态与用量
  *
  * 环境变量：
@@ -19,7 +19,7 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
-const VERSION = '4.2.4';
+const VERSION = '4.2.5';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';
@@ -734,7 +734,23 @@ async function applyUserPackages(users, script) {
   return notes;
 }
 
+async function portIsListening(port) {
+  const p = Number(port);
+  if (!p) return false;
+  const ss = await run('ss', ['-lnt']);
+  if (!ss.ok) {
+    // fallback: bash /dev/tcp
+    const r = await run('bash', ['-c', `timeout 2 bash -c 'echo >/dev/tcp/127.0.0.1/${p}' 2>/dev/null`], {
+      timeout: 5000,
+    });
+    return r.ok;
+  }
+  const re = new RegExp(`:${p}\\s`);
+  return re.test(ss.stdout || '');
+}
+
 async function installOrReconfigure(bundle) {
+
   const s = bundle.server || {};
   const users = (bundle.users || []).filter(
     (u) =>
@@ -759,8 +775,29 @@ async function installOrReconfigure(bundle) {
   const action = st0.installed && (st0.running || st0.idle || st0.ok) ? 'reconfigure' : 'install';
 
   function buildCfg() {
-    if (!bundle.serverConfig) return null;
-    const cfg = JSON.parse(JSON.stringify(bundle.serverConfig));
+    // 无 serverConfig 时也拼一份，保证端口一定按 bundle 下发
+    let cfg;
+    if (bundle.serverConfig) {
+      cfg = JSON.parse(JSON.stringify(bundle.serverConfig));
+    } else {
+      cfg = {
+        portBindings: [{ port, protocol: protocol === 'UDP' ? 'UDP' : 'TCP' }],
+        users: users.map((u) => ({ name: u.name, password: u.password })),
+        loggingLevel: 'INFO',
+        mtu: Number(s.mtu) || 1400,
+      };
+    }
+    // 强制覆盖端口：防止面板/旧 bundle 端口与 node 不一致时 mita 仍停在 7901
+    const bindProto =
+      protocol === 'UDP' || protocol === 'BOTH' || protocol === 'UDP_ONLY' ? protocol : 'TCP';
+    if (bindProto === 'BOTH') {
+      cfg.portBindings = [
+        { port, protocol: 'TCP' },
+        { port, protocol: 'UDP' },
+      ];
+    } else {
+      cfg.portBindings = [{ port, protocol: bindProto === 'UDP' ? 'UDP' : 'TCP' }];
+    }
     if (Array.isArray(cfg.users)) {
       cfg.users = cfg.users.filter(
         (u) => u?.name && u?.password && /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(String(u.name))
@@ -769,6 +806,13 @@ async function installOrReconfigure(bundle) {
     if (!cfg.users?.length) {
       cfg.users = users.map((u) => ({ name: u.name, password: u.password }));
     }
+    // mita apply 需要明文 password；若只有 hashed 会导致看似成功但端口/用户不更新
+    const byName = new Map(users.map((u) => [u.name, u.password]));
+    cfg.users = cfg.users.map((u) => ({
+      name: u.name,
+      password: u.password || byName.get(u.name) || '',
+    })).filter((u) => u.password);
+    if (!cfg.users.length) return null;
     return cfg;
   }
 
@@ -777,26 +821,35 @@ async function installOrReconfigure(bundle) {
   const cfg0 = buildCfg();
   if (cfg0 && st0.installed) {
     console.log(
-      `[agent] apply mita full config users=${cfg0.users.map((u) => u.name).join(',')} port=${port}`
+      `[agent] apply mita full config users=${cfg0.users.map((u) => u.name).join(',')} port=${port} bindings=${JSON.stringify(cfg0.portBindings)}`
     );
     const ap = await applyMitaConfig(cfg0);
     if (ap.ok) {
       await openFirewall(port, protocol);
-      const pkgNotes = await applyUserPackages(bundle.users, script);
-      return {
-        ok: true,
-        message: `已同步 mita（${cfg0.users.length} 用户）· RUNNING`,
-        detail: {
-          action: 'apply-full',
-          mita: ap.mita,
-          configHash: bundle.configHash,
-          users: cfg0.users.map((u) => u.name),
-          packageNotes: pkgNotes,
-        },
-      };
+      // 关键：apply 报成功但端口仍停在 7901（pro3 故障现场）
+      const listening = await portIsListening(port);
+      if (listening) {
+        const pkgNotes = await applyUserPackages(bundle.users, script);
+        return {
+          ok: true,
+          message: `已同步 mita（${cfg0.users.length} 用户）· 端口 ${port} · RUNNING`,
+          detail: {
+            action: 'apply-full',
+            mita: ap.mita,
+            configHash: bundle.configHash,
+            users: cfg0.users.map((u) => u.name),
+            packageNotes: pkgNotes,
+            listenPort: port,
+            listening: true,
+          },
+        };
+      }
+      applyFailMsg = `mita apply 返回成功但本机未监听 ${port}，强制 OneClick 重配`;
+      console.warn('[agent]', applyFailMsg);
+    } else {
+      applyFailMsg = ap.message || 'mita apply 失败';
+      console.warn('[agent] apply-full 失败，回退 OneClick:', applyFailMsg);
     }
-    applyFailMsg = ap.message || 'mita apply 失败';
-    console.warn('[agent] apply-full 失败，回退 OneClick:', applyFailMsg);
   }
 
   // 2) OneClick 安装/重配（首装或 apply 失败兜底）
@@ -846,41 +899,51 @@ async function installOrReconfigure(bundle) {
         const pkgNotes = await applyUserPackages(bundle.users, script);
         const st = await mitaStatus();
         const via = applyFailMsg ? '（安装后 apply 成功）' : '';
-        return {
-          ok: true,
-          message: `落地完成 · mita RUNNING · ${cfg1.users.length} 用户${via}`,
-          detail: {
-            action: applyFailMsg ? 'oneclick+apply-full' : 'apply-full',
-            mita: st,
-            configHash: bundle.configHash,
-            users: cfg1.users.map((u) => u.name),
-            packageNotes: pkgNotes,
-            applyFailBefore: applyFailMsg || undefined,
-            scriptOk: r.ok,
-          },
-        };
+        const listening2 = await portIsListening(port);
+        if (!listening2) {
+          secondApplyOk = false;
+          secondApplyMsg = `apply 成功但未监听 ${port}`;
+          console.warn('[agent]', secondApplyMsg);
+        } else {
+          return {
+            ok: true,
+            message: `落地完成 · mita RUNNING · 端口 ${port} · ${cfg1.users.length} 用户${via}`,
+            detail: {
+              action: applyFailMsg ? 'oneclick+apply-full' : 'apply-full',
+              mita: st,
+              configHash: bundle.configHash,
+              users: cfg1.users.map((u) => u.name),
+              packageNotes: pkgNotes,
+              applyFailBefore: applyFailMsg || undefined,
+              scriptOk: r.ok,
+              listenPort: port,
+              listening: true,
+            },
+          };
+        }
       }
     }
   }
 
   const pkgNotes = await applyUserPackages(bundle.users, script);
   const st = await mitaStatus();
-  const ok = st.running || r.ok;
+  const listening = await portIsListening(port);
+  // 必须本机真正在听目标端口才算成功（避免 7901 跑着却报 OK）
+  const ok = (st.running || r.ok) && listening;
 
-  // 成功：明确成功文案（不要「脚本异常…回退」类误导）
-  // 失败：带上脚本尾部便于排查
   let message;
-  if (ok && st.running) {
+  if (ok && st.running && listening) {
     if (applyFailMsg && r.ok) {
-      message = `落地完成 · mita RUNNING · 用户 ${users.map((u) => u.name).join(',')}（OneClick 成功）`;
+      message = `落地完成 · 端口 ${port} · RUNNING · 用户 ${users.map((u) => u.name).join(',')}（OneClick）`;
     } else if (r.ok) {
-      message = `${action} 完成 · RUNNING · 用户 ${users.map((u) => u.name).join(',')}`;
+      message = `${action} 完成 · 端口 ${port} · RUNNING · 用户 ${users.map((u) => u.name).join(',')}`;
     } else {
-      // 脚本非 0 但 mita 已在跑：仍算成功
-      message = `落地完成 · mita 已 RUNNING · 用户 ${users.map((u) => u.name).join(',')}`;
+      message = `落地完成 · 端口 ${port} · RUNNING · 用户 ${users.map((u) => u.name).join(',')}`;
     }
+  } else if (st.running && !listening) {
+    message = `落地失败 · mita RUNNING 但未监听目标端口 ${port}（当前可能仍是旧端口）。请看 journalctl -u wg-agent`;
   } else if (ok) {
-    message = `${action} 完成 · 状态 ${st.status}`;
+    message = `${action} 完成 · 状态 ${st.status} · 端口 ${port}`;
   } else {
     const tail = scriptTail.replace(/\s+/g, ' ').slice(-180);
     message = `落地失败 · ${st.status}${tail ? ' · ' + tail : ''}`;
@@ -900,6 +963,8 @@ async function installOrReconfigure(bundle) {
       applyFailBefore: applyFailMsg || undefined,
       secondApplyOk: secondApplyOk || undefined,
       secondApplyMsg: secondApplyMsg || undefined,
+      listenPort: port,
+      listening,
     },
   };
 }

@@ -335,6 +335,18 @@ function buildBundleForNode(node) {
     // rethrow
     throw err;
   }
+  // 强制 portBindings 与本落地 listenPort 一致（防全局 7901 渗入）
+  const proto = mieru.normalizeProtocol(fake.server.protocol || 'TCP');
+  const bindings = [];
+  if (proto === 'UDP' || proto === 'UDP_ONLY') {
+    bindings.push({ port: listenPort, protocol: 'UDP' });
+  } else if (proto === 'BOTH') {
+    bindings.push({ port: listenPort, protocol: 'TCP' });
+    bindings.push({ port: listenPort, protocol: 'UDP' });
+  } else {
+    bindings.push({ port: listenPort, protocol: 'TCP' });
+  }
+  serverConfig.portBindings = bindings;
   const hash = crypto
     .createHash('sha256')
     .update(JSON.stringify({ serverConfig, users: users.map((u) => ({ n: u.name, e: u.enabled, p: u.package })) }))
@@ -1103,9 +1115,19 @@ app.put('/api/nodes/:id', (req, res) => {
       // 与 mita 监听端口对齐（pro3:7902 时 home 也必须 7902，否则 IX DNAT 打到 7901）
       if (body.homeReachablePort === undefined) {
         landing.homeReachablePort = port;
+      } else if (Number(body.homeReachablePort) === 7901 && port !== 7901) {
+        landing.homeReachablePort = port;
       }
     }
     nodes.markNodeDirty(node);
+    // 端口变更后自动排队 apply，避免「只保存、mita 仍 7901」
+    if (nodes.isNodeOnline(node)) {
+      try {
+        enqueueApply(node, 'mieru_apply');
+      } catch (e) {
+        console.warn('[panel] auto-apply after port change:', e.message);
+      }
+    }
   }
   if (landing) {
     if (body.homeReachableHost !== undefined) {

@@ -272,7 +272,7 @@ function topAlerts() {
     parts.push(`<div class="alert warn">
       <div><strong>落地 Agent 版本过旧</strong> · ${esc(names)} · 面板 v${esc(
       state.status?.version || ''
-    )} · 会出现「脚本异常…回退」等旧文案。请点落地页「安装命令」重装，或等 Agent 自动更新后重启</div>
+    )} · 会出现「脚本异常…回退」等旧文案。请点落地页「更新 Agent」（在线即可，无需登录家宽）</div>
       <button class="btn btn-sm btn-primary" data-nav-jump="server">去落地</button>
     </div>`);
   }
@@ -1490,6 +1490,7 @@ async function renderServer() {
       <div class="btn-row">
         <button class="btn btn-primary" id="srv-add" title="新增一台落地家宽节点">添加落地</button>
         <button class="btn btn-success" id="srv-apply-all" title="把用户配置下发到全部落地 mita">应用全部</button>
+        <button class="btn btn-secondary" id="srv-update-agents" title="向所有在线落地排队更新 Agent">全部更新 Agent</button>
         <button class="btn btn-secondary" id="srv-save" title="保存全局 mita 默认端口/协议">保存全局参数</button>
       </div>
     </div>
@@ -1534,7 +1535,7 @@ async function renderServer() {
               ${n.isPrimary ? '<span class="badge ok">默认</span>' : ''}
               ${n.online ? '<span class="badge ok">在线</span>' : '<span class="badge warn">离线</span>'}
               ${n.dirty ? '<span class="badge warn">未应用</span>' : ''}
-              ${n.agentOutdated ? '<span class="badge warn" title="请重装 Agent 对齐面板版本">Agent 过旧</span>' : ''}
+              ${n.agentOutdated ? '<span class="badge warn" title="点「更新 Agent」对齐面板版本">Agent 过旧</span>' : ''}
             </div>
             <div class="landing-row-meta">
               <span>mita <span class="mono">${esc(n.mita?.status || '-')}</span></span>
@@ -1547,7 +1548,7 @@ async function renderServer() {
           <div class="landing-row-body">
             <div class="kv"><span>主机 / Agent</span><span class="mono">${esc(n.hostname || '-')} · v${esc(
               n.agentVersion || '-'
-            )}${n.agentOutdated ? ' ⚠ 请点下方「安装命令」重装到 v' + esc(n.panelVersion || state.status?.version || '') : ''}</span></div>
+            )}${n.agentOutdated ? ' ⚠ 点「更新 Agent」对齐面板 v' + esc(n.panelVersion || state.status?.version || '') : ''}</span></div>
             <div class="kv"><span>出网 IP</span><span class="mono">${esc(n.exitPublicIp || '-')}</span></div>
             <div class="inline-fields" style="margin-top:10px">
               <div>
@@ -1574,7 +1575,8 @@ async function renderServer() {
               <button class="btn btn-sm btn-success" data-exit-node="${n.id}" title="安装/启动 mita 并套用基础参数">一键落地</button>
               <button class="btn btn-sm btn-success" data-apply-node="${n.id}" title="下发本机用户到 mita" ${userN ? '' : 'disabled'}>应用配置</button>
               ${userN ? '' : '<span class="muted" style="font-size:12px">本落地 0 用户 · 先到客户端改绑再应用</span>'}
-              <button class="btn btn-sm btn-secondary" data-cmd-node="${n.id}" title="复制 Agent 安装命令">安装命令</button>
+              <button class="btn btn-sm ${n.agentOutdated ? 'btn-warn' : 'btn-secondary'}" data-update-agent="${n.id}" title="在线时远程拉取面板最新 Agent 并重启，无需登录家宽" ${n.online ? '' : 'disabled'}>${n.agentOutdated ? '更新 Agent ⚠' : '更新 Agent'}</button>
+              <button class="btn btn-sm btn-secondary" data-cmd-node="${n.id}" title="复制 Agent 安装命令（离线/首次用）">安装命令</button>
               <button class="btn btn-sm btn-secondary" data-users-node="${n.id}" title="查看绑定到本落地的客户端">本机用户</button>
               ${n.isPrimary ? '' : `<button class="btn btn-sm btn-secondary" data-primary-node="${n.id}" title="未指定路由的用户落到此机">设为默认</button>`}
               <button class="btn btn-sm btn-warn" data-rotate-node="${n.id}" title="旧 Agent 将失效，需重装">轮换 Token</button>
@@ -1757,6 +1759,36 @@ async function renderServer() {
   });
   document.querySelectorAll('[data-apply-node]').forEach((b) => {
     b.onclick = () => applyConfig(true, { nodeId: b.dataset.applyNode });
+  });
+  document.querySelectorAll('[data-update-agent]').forEach((b) => {
+    b.onclick = async () => {
+      const id = b.dataset.updateAgent;
+      const n = (state.nodes || []).find((x) => x.id === id);
+      if (!n?.online) return toast('Agent 离线，无法远程更新', 'err');
+      try {
+        b.disabled = true;
+        const r = await api(`/api/nodes/${id}/update-agent`, { method: 'POST', body: {} });
+        toast(r.message || '已下发更新');
+        state.expandedLandingId = id;
+        // 多刷几次等 agent 重启上报新版本
+        setTimeout(() => refreshCore().then(() => render()).catch(() => {}), 8000);
+        setTimeout(() => refreshCore().then(() => render()).catch(() => {}), 20000);
+      } catch (e) {
+        toast(e.data?.error || e.message, 'err');
+      } finally {
+        b.disabled = false;
+      }
+    };
+  });
+  document.getElementById('srv-update-agents')?.addEventListener('click', async () => {
+    if (!confirm('向所有在线落地排队「更新 Agent」？离线的会跳过。')) return;
+    try {
+      const r = await api('/api/nodes/update-agent-all', { method: 'POST', body: {} });
+      toast(r.message || '已排队');
+      setTimeout(() => refreshCore().then(() => render()).catch(() => {}), 10000);
+    } catch (e) {
+      toast(e.data?.error || e.message, 'err');
+    }
   });
   document.querySelectorAll('[data-exit-node]').forEach((b) => {
     b.onclick = () => setupExit(b.dataset.exitNode);

@@ -1173,6 +1173,55 @@ app.get('/api/nodes/:id/install-command', (req, res) => {
   });
 });
 
+app.post('/api/nodes/:id/update-agent', (req, res) => {
+  const node = nodes.findNode(state, req.params.id);
+  if (!node) return res.status(404).json({ error: '节点不存在' });
+  if (!nodes.isNodeOnline(node)) {
+    return res.status(400).json({
+      error: `「${node.name}」Agent 离线，无法远程更新。请先确认在线，或用「安装命令」在家宽手动执行`,
+      code: 'AGENT_OFFLINE',
+    });
+  }
+  const job = nodes.enqueueJob(node, 'agent_update', {
+    force: true,
+    forceNew: true,
+    panelVersion: panelVersion(),
+  });
+  persist();
+  res.json({
+    ok: true,
+    pending: true,
+    jobId: job.id,
+    message: `已下发「更新 Agent」到「${node.name}」（当前上报 v${node.agentVersion || '?'} → 面板 v${panelVersion()}）。约 10–30 秒后刷新看版本`,
+    node: enrichNodePublic(node),
+  });
+});
+
+app.post('/api/nodes/update-agent-all', (req, res) => {
+  const list = nodes.ensureNodes(state);
+  const jobs = [];
+  const skipped = [];
+  for (const node of list) {
+    if (!nodes.isNodeOnline(node)) {
+      skipped.push({ id: node.id, name: node.name, reason: 'offline' });
+      continue;
+    }
+    const job = nodes.enqueueJob(node, 'agent_update', {
+      force: true,
+      forceNew: true,
+      panelVersion: panelVersion(),
+    });
+    jobs.push({ nodeId: node.id, name: node.name, jobId: job.id });
+  }
+  persist();
+  res.json({
+    ok: true,
+    message: `已向 ${jobs.length} 台在线落地排队更新 Agent` + (skipped.length ? `，${skipped.length} 台离线跳过` : ''),
+    jobs,
+    skipped,
+  });
+});
+
 app.post('/api/nodes/:id/token', (req, res) => {
   const node = nodes.findNode(state, req.params.id);
   if (!node) return res.status(404).json({ error: '节点不存在' });

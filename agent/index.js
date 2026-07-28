@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Edge Agent v4.2.3 — mieru / mita 落地（支持多落地 + 流量/套餐）
+ * Edge Agent v4.2.4 — mieru / mita 落地（支持多落地 + 流量/套餐）
  * 连接中心面板，拉取任务：安装/应用 mita、上报状态与用量
  *
  * 环境变量：
@@ -19,7 +19,7 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
-const VERSION = '4.2.3';
+const VERSION = '4.2.4';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';
@@ -65,29 +65,40 @@ let _lastSelfUpdateAt = 0;
 const SELF_UPDATE_COOLDOWN_MS = 10 * 60 * 1000;
 
 /**
- * 若面板版本更高，从 /api/agent/download 拉新 index.js 并退出由 systemd 拉起
- * heartbeat 可返回 panelVersion
+ * 从面板下载最新 agent/index.js 并退出由 systemd 重启
+ * @param {{ force?: boolean, targetVersion?: string }} opts
+ * force=true：面板「一键更新 Agent」下发，忽略版本比较与冷却
  */
-async function maybeSelfUpdate(panelVersion) {
-  if (!panelVersion || cmpSemver(VERSION, panelVersion) >= 0) return false;
-  if (Date.now() - _lastSelfUpdateAt < SELF_UPDATE_COOLDOWN_MS) return false;
+async function performSelfUpdate(opts = {}) {
+  const force = Boolean(opts.force);
+  const targetVersion = opts.targetVersion || '';
+  if (!force) {
+    if (!targetVersion || cmpSemver(VERSION, targetVersion) >= 0) return { ok: false, skipped: true, message: '已是最新' };
+    if (Date.now() - _lastSelfUpdateAt < SELF_UPDATE_COOLDOWN_MS) {
+      return { ok: false, skipped: true, message: '冷却中，稍后再试' };
+    }
+  }
   _lastSelfUpdateAt = Date.now();
   const selfPath = process.argv[1] ? path.resolve(process.argv[1]) : '';
   if (!selfPath || !fs.existsSync(selfPath)) {
-    console.warn('[agent] 无法定位自身路径，跳过自更新');
-    return false;
+    return { ok: false, message: '无法定位 agent 自身路径' };
   }
-  console.log(`[agent] 面板要求 agent ${panelVersion}（当前 ${VERSION}），开始自更新…`);
+  console.log(
+    `[agent] ${force ? '面板下发强制更新' : '自动更新'}（当前 ${VERSION} → 目标 ${targetVersion || 'panel'}）…`
+  );
   try {
     const body = await requestRaw('GET', '/api/agent/download');
     const text = typeof body === 'string' ? body : String(body || '');
     if (!text.includes('Edge Agent') && !text.includes('installOrReconfigure')) {
-      console.warn('[agent] 下载内容不像 agent，跳过');
-      return false;
+      return { ok: false, message: '下载内容不像 agent 脚本' };
     }
-    if (!text.includes(`VERSION`) && !/const VERSION\s*=/.test(text)) {
-      console.warn('[agent] 下载内容缺少 VERSION，跳过');
-      return false;
+    if (!text.includes('VERSION') && !/const VERSION\s*=/.test(text)) {
+      return { ok: false, message: '下载内容缺少 VERSION' };
+    }
+    const m = text.match(/const VERSION = ['"]([^'"]+)['"]/);
+    const newVer = m ? m[1] : targetVersion || '?';
+    if (!force && newVer && cmpSemver(VERSION, newVer) >= 0) {
+      return { ok: true, skipped: true, message: `已是最新 v${VERSION}`, version: VERSION };
     }
     const bak = selfPath + '.bak';
     try {
@@ -98,19 +109,30 @@ async function maybeSelfUpdate(panelVersion) {
     fs.writeFileSync(selfPath, text, { mode: 0o755 });
     try {
       const verFile = path.join(path.dirname(selfPath), 'VERSION');
-      const m = text.match(/const VERSION = ['"]([^'"]+)['"]/);
       if (m) fs.writeFileSync(verFile, m[1] + '\n');
     } catch {
       /* */
     }
-    console.log(`[agent] 已写入 ${selfPath}，即将退出由 systemd 重启（目标 ${panelVersion}）`);
-    // 任务已在本 tick 处理完；稍后再退
+    console.log(`[agent] 已写入 ${selfPath} (v${newVer})，即将重启`);
+    // 调用方先上报 job-result，再 exit
+    return {
+      ok: true,
+      message: `Agent 已更新到 v${newVer}，正在重启`,
+      version: newVer,
+      restart: true,
+    };
+  } catch (e) {
+    return { ok: false, message: `自更新失败: ${e.message}` };
+  }
+}
+
+async function maybeSelfUpdate(panelVersion) {
+  const r = await performSelfUpdate({ force: false, targetVersion: panelVersion });
+  if (r.ok && r.restart) {
     setTimeout(() => process.exit(0), 800);
     return true;
-  } catch (e) {
-    console.warn('[agent] 自更新失败:', e.message);
-    return false;
   }
+  return false;
 }
 
 function requestRaw(method, apiPath) {
@@ -985,6 +1007,18 @@ async function handleJob(job) {
     };
   }
   if (job.type === 'ping') return { ok: true, message: 'pong' };
+  if (job.type === 'agent_update' || job.type === 'self_update') {
+    const r = await performSelfUpdate({
+      force: job.payload?.force !== false,
+      targetVersion: job.payload?.panelVersion || '',
+    });
+    return {
+      ok: Boolean(r.ok),
+      message: r.message || (r.ok ? '更新完成' : '更新失败'),
+      detail: { version: r.version || VERSION, restart: Boolean(r.restart), skipped: Boolean(r.skipped) },
+      _restartAfterReport: Boolean(r.restart),
+    };
+  }
   return { ok: false, message: `未知任务类型: ${job.type}` };
 }
 
@@ -1024,8 +1058,13 @@ async function tick() {
     } catch (err) {
       console.error('[agent] 上报失败:', err.message);
     }
+    // 一键更新：上报成功后退出，由 systemd 拉起新 agent
+    if (result._restartAfterReport) {
+      setTimeout(() => process.exit(0), 600);
+      return;
+    }
   }
-  // 任务完成后再自更新（systemd Restart=always 拉起新版本）
+  // 任务完成后再自动自更新（版本落后时）
   if (res.panelVersion && (await maybeSelfUpdate(res.panelVersion))) {
     return;
   }

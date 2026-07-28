@@ -316,7 +316,7 @@ function looksLikeDomain(host) {
 
 /**
  * 分享链 / 客户端里显示的节点名：备注优先，并带到期日
- * 多数客户端（含小火箭）会用 URI #fragment 作为节点备注名
+ * 小火箭等：写入 mierus 的 profile= 作为节点「备注」；#fragment 作兼容备用
  */
 function shareDisplayName(client) {
   const note = String(client?.note || '').trim();
@@ -343,16 +343,18 @@ function shareLinkForHost(state, client, host, protocol, portOverride) {
   const port = portForProtocol(listenPort, proto, mode);
   const mtu = Number(s.mtu) || DEFAULT_MTU;
   const multiplexing = s.multiplexing || DEFAULT_MULTIPLEXING;
+  // 小火箭「备注」读的是 query 的 profile=（不是 #fragment）。
+  // 写入「面板备注 · 到期日期」，扫码后编辑节点里的备注即为此文案。
+  const remark = shareDisplayName(client);
   const query = [
     'handshake-mode=HANDSHAKE_STANDARD',
     `mtu=${mtu}`,
     `multiplexing=${multiplexing}`,
     `port=${port}`,
-    'profile=default',
+    `profile=${urlencode(remark)}`,
     `protocol=${proto}`,
   ].join('&');
-  // # 后为展示名：小火箭等导入后节点列表显示备注+到期（不影响鉴权）
-  const remark = shareDisplayName(client);
+  // #fragment 作兼容备用（部分客户端用 hash 当节点名）
   return `mierus://${urlencode(client.name)}:${urlencode(client.password)}@${h}:${port}?${query}#${urlencode(remark)}`;
 }
 

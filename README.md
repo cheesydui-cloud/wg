@@ -3,7 +3,7 @@
 中文、新手友好的 **mieru / mita 拓扑出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v4.2.8**（分享链带备注·到期）
+当前版本：**v4.2.9**（小火箭备注=profile）
 
 - 每台 IX 独立商家前置（IP/域名）与端口段
 - 拓扑 = IX 工作台；落地列表点开详情；客户端按落地分组
@@ -31,6 +31,10 @@
 | **兼容 v3.1** | 单前置 / 单 IX / 单落地自动迁成一条路由，Endpoint 保留 |
 
 路径保持不变。业务流量不经面板。
+
+### v4.2.9
+
+- **小火箭备注**：`mierus` 链接的 `profile=` 写入「备注 · 到期日期」（此前写死 default，扫码后备注才是 default）。需重新扫码/导入。
 
 ### v4.2.8
 
@@ -181,7 +185,7 @@ git clone https://github.com/cheesydui-cloud/wg.git ~/wg
 cd ~/wg && sudo bash install.sh
 ```
 
-打开 `http://面板IP:51821`，确认版本 **v4.2.8**。
+打开 `http://面板IP:51821`，确认版本 **v4.2.9**。
 
 忘记密码：
 

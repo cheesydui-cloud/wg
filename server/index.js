@@ -20,11 +20,13 @@ const {
 const auth = require('./auth');
 const mieru = require('./mieru');
 const nodes = require('./nodes');
+const topology = require('./topology');
 
 ensureDataDir();
 auth.setSessionsFile(SESSIONS_FILE);
 let state = loadState();
 nodes.ensureNodes(state);
+topology.ensureTopology(state);
 mieru.ensureMieruDefaults(state);
 persist();
 
@@ -127,6 +129,8 @@ app.get('/api/health', (req, res) => {
     ok: true,
     version: require(path.join(ROOT, 'package.json')).version,
     protocol: 'mieru',
+    profile: state.topology?.profile || 'cm-ix-home',
+    path: 'mobile-ingress → 沪日IX → 美国家宽',
     uptime: process.uptime(),
   });
 });
@@ -164,6 +168,7 @@ app.get('/api/status', async (req, res) => {
     primaryNode: loggedIn ? modeInfo.primaryNode : undefined,
     clientsNeedRescan: loggedIn ? Boolean(state.clientsNeedRescan) : false,
     server: loggedIn ? publicServer(state.server) : undefined,
+    topology: loggedIn ? topology.publicTopology(state) : undefined,
     legacyWireGuard: loggedIn ? Boolean(state.legacyWireGuard) : false,
   });
 });
@@ -249,14 +254,75 @@ app.post('/api/password', (req, res) => {
 // ---------- Server (mieru) ----------
 
 app.get('/api/server', (req, res) => {
+  topology.ensureTopology(state);
   res.json({
     server: publicServer(state.server),
+    topology: topology.publicTopology(state),
     wizardDone: state.wizardDone,
     dirty: isUnifiedDirty(),
     lastAppliedAt: state.lastAppliedAt,
     clientsNeedRescan: Boolean(state.clientsNeedRescan),
     protocol: 'mieru',
   });
+});
+
+app.get('/api/topology', (req, res) => {
+  topology.ensureTopology(state);
+  const fwd = topology.buildIxForwardScript(state);
+  res.json({
+    topology: topology.publicTopology(state),
+    forwardScript: fwd.ok ? fwd.script : '',
+    forwardError: fwd.error || '',
+    server: publicServer(state.server),
+  });
+});
+
+app.put('/api/topology', (req, res) => {
+  const body = req.body || {};
+  const prevHash = (() => {
+    try {
+      return mieru.configHash(state);
+    } catch {
+      return null;
+    }
+  })();
+  const { endpointChanged } = topology.applyTopologyPatch(state, body);
+  // 监听端口变更会影响 mita
+  let serverConfChanged = false;
+  try {
+    serverConfChanged = prevHash !== mieru.configHash(state);
+  } catch {
+    serverConfChanged = true;
+  }
+  if (endpointChanged) state.clientsNeedRescan = true;
+  if (serverConfChanged) markDirtyUnified();
+  if (state.mode === 'agent') nodes.syncPrimaryFromState(state);
+  if (body.wizardDone !== undefined) state.wizardDone = Boolean(body.wizardDone);
+  persist();
+  const tips = [];
+  if (endpointChanged) tips.push('入站已更新，请重新复制客户端链接（优先 211 移动入口）');
+  if (serverConfChanged) tips.push('监听参数有变，请在家宽「应用配置/一键落地」');
+  res.json({
+    ok: true,
+    topology: topology.publicTopology(state),
+    server: publicServer(state.server),
+    dirty: isUnifiedDirty(),
+    endpointChanged,
+    serverConfChanged,
+    clientsNeedRescan: Boolean(state.clientsNeedRescan),
+    tip: tips.join('。') || '拓扑已保存',
+  });
+});
+
+app.get('/api/topology/forward-script', (req, res) => {
+  const fwd = topology.buildIxForwardScript(state);
+  if (!fwd.ok) return res.status(400).json({ error: fwd.error, script: '' });
+  if (req.query.download === '1') {
+    res.setHeader('Content-Disposition', 'attachment; filename="ix-forward-7901.sh"');
+    res.type('text/x-shellscript');
+    return res.send(fwd.script);
+  }
+  res.json(fwd);
 });
 
 app.put('/api/server', (req, res) => {
@@ -287,6 +353,27 @@ app.put('/api/server', (req, res) => {
   } else if (s.endpoint && !String(s.endpoint).includes(':') && s.listenPort) {
     s.endpoint = `${String(s.endpoint).trim()}:${s.listenPort}`;
   }
+
+  // 反写 topology（兼容旧 API）
+  topology.ensureTopology(state);
+  if (body.listenPort !== undefined) state.topology.ingress.port = s.listenPort;
+  if (body.protocol !== undefined) state.topology.ingress.protocol = s.protocol;
+  if (body.endpoint !== undefined && s.endpoint) {
+    const parsed = mieru.parseEndpoint(s.endpoint);
+    const host = parsed.host || '';
+    if (host === state.topology.ingress.mobileHost || host === '211.136.162.184') {
+      state.topology.ingress.active = 'mobile';
+      state.topology.ingress.mobileHost = host;
+    } else if (host === state.topology.ingress.externalHost || host === '114.111.176.37') {
+      state.topology.ingress.active = 'external';
+      state.topology.ingress.externalHost = host;
+    } else if (host) {
+      state.topology.ingress.active = 'custom';
+      state.topology.ingress.customHost = host;
+    }
+    if (parsed.port) state.topology.ingress.port = parsed.port;
+  }
+  topology.ensureTopology(state);
 
   if (body.wizardDone !== undefined) state.wizardDone = Boolean(body.wizardDone);
 
@@ -324,6 +411,7 @@ app.put('/api/server', (req, res) => {
   if (serverConfChanged && isUnifiedDirty()) tips.push('服务端参数有变，请点「应用配置」或「一键落地」');
   res.json({
     server: publicServer(state.server),
+    topology: topology.publicTopology(state),
     wizardDone: state.wizardDone,
     dirty: isUnifiedDirty(),
     endpointChanged,
@@ -441,11 +529,17 @@ app.get('/api/clients/:id/config', async (req, res) => {
   if (!c) return res.status(404).json({ error: '用户不存在' });
   const format = String(req.query.format || 'json');
   const proto = req.query.protocol || undefined;
+  let dual;
   let shareLink;
   let clientJson;
   try {
-    shareLink = mieru.buildShareLink(state, c, proto);
-    clientJson = mieru.buildClientJson(state, c, proto);
+    dual = mieru.buildDualShareLinks(state, c, proto);
+    shareLink = dual.preferred;
+    const preferHost =
+      dual.active === 'external'
+        ? dual.endpoints.external.split(':')[0]
+        : dual.endpoints.mobile.split(':')[0];
+    clientJson = mieru.buildClientJson(state, c, proto, preferHost);
   } catch (err) {
     return res.status(400).json({ error: err.message, code: err.code });
   }
@@ -458,22 +552,35 @@ app.get('/api/clients/:id/config', async (req, res) => {
     return res.json(clientJson);
   }
   if (format === 'qr') {
-    const qr = await QRCode.toDataURL(shareLink, { margin: 1, width: 280 });
+    const [qrMobile, qrExternal, qr] = await Promise.all([
+      QRCode.toDataURL(dual.mobile, { margin: 1, width: 280 }),
+      QRCode.toDataURL(dual.external, { margin: 1, width: 280 }),
+      QRCode.toDataURL(shareLink, { margin: 1, width: 280 }),
+    ]);
     return res.json({
       name: c.name,
+      note: c.note || '',
       endpoint: state.server.endpoint,
+      endpoints: dual.endpoints,
       shareLink,
-      config: JSON.stringify(clientJson, null, 2),
+      shareLinks: { mobile: dual.mobile, external: dual.external, preferred: dual.preferred },
       qr,
-      tip: '使用支持 mieru 的客户端导入链接或 JSON（小火箭/NekoBox/官方 mieru）',
+      qrMobile,
+      qrExternal,
+      config: JSON.stringify(clientJson, null, 2),
+      tip: dual.tip,
+      path: '手机 → 商家移动入口 → 沪日IX → 美国家宽 mita',
     });
   }
   res.json({
     name: c.name,
+    note: c.note || '',
     endpoint: state.server.endpoint,
+    endpoints: dual.endpoints,
     shareLink,
+    shareLinks: { mobile: dual.mobile, external: dual.external, preferred: dual.preferred },
     client: clientJson,
-    tip: '手机导入 mierus:// 或 JSON，不要用 WireGuard',
+    tip: dual.tip,
   });
 });
 
@@ -538,6 +645,7 @@ app.post('/api/exit/setup', async (req, res) => {
 app.get('/api/exit/overview', async (req, res) => {
   const primary = nodes.getPrimaryNode(state);
   const report = primary?.lastReport || null;
+  topology.ensureTopology(state);
   res.json({
     mode: state.mode,
     protocol: 'mieru',
@@ -547,6 +655,8 @@ app.get('/api/exit/overview', async (req, res) => {
     endpoint: state.server.endpoint,
     listenPort: state.server.listenPort,
     dirty: isUnifiedDirty(),
+    topology: topology.publicTopology(state),
+    path: '商家移动入口 → 沪日IX → 美国家宽',
   });
 });
 
@@ -564,6 +674,7 @@ app.get('/api/diagnose', async (req, res) => {
     });
     result.clientsNeedRescan = Boolean(state.clientsNeedRescan);
     result.dirty = isUnifiedDirty();
+    result.topology = topology.publicTopology(state);
     if (primary) {
       const jobs = primary.jobs || [];
       const latest = jobs[0] || null;

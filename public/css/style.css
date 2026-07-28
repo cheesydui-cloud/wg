@@ -848,6 +848,79 @@ tbody tr:hover td { background: rgba(59, 130, 246, 0.03); }
   margin: 8px 0 12px;
 }
 
+.path-banner {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 4px;
+}
+.path-flow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 4px;
+}
+.path-node {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-size: 12px;
+  text-align: center;
+  min-width: 72px;
+  color: var(--text-2);
+  line-height: 1.35;
+}
+.path-node.on {
+  border-color: rgba(34, 197, 94, 0.45);
+  background: var(--ok-soft);
+  color: var(--text);
+}
+.path-node.warn {
+  border-color: rgba(245, 158, 11, 0.45);
+  background: var(--warn-soft);
+  color: var(--text);
+}
+.path-node small {
+  display: block;
+  font-size: 11px;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+.path-arrow {
+  color: var(--text-3);
+  font-size: 14px;
+  padding: 0 2px;
+}
+.choice-card.selected {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.25);
+}
+.dual-qr {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 8px;
+}
+.dual-qr-col {
+  text-align: center;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.dual-qr-col strong {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+@media (max-width: 560px) {
+  .dual-qr { grid-template-columns: 1fr; }
+  .path-flow { justify-content: center; }
+}
+
 .endpoint-card {
   border: 1px solid rgba(59, 130, 246, 0.35);
   box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.08);

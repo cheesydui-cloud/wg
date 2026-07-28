@@ -1,52 +1,46 @@
-# mieru 出口面板 v2.0
+# mieru 出口面板 v3.0
 
-中文、新手友好的 **mieru / mita 出口管理面板**。
+中文、新手友好的 **mieru / mita 拓扑出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v2.0.5**
+当前版本：**v3.0.0**
 
-> **v2 起默认协议是 mieru，不再是 WireGuard。**  
-> 老板移动前置 + 落地家宽只支持 mieru 时，请用本版本。  
-> 最后一版 WireGuard 面板见 tag **v1.4.1**。
-
----
-
-## 为什么是 mieru
-
-| 线路 | 能用什么 |
-|------|----------|
-| 老板前置 + 家宽「只支持 mieru」 | **mieru / mita（TCP）** |
-| 裸 UDP / 任意端口映射 | 才可考虑 WireGuard（v1.4.x） |
-
-WireGuard 需要端到端 UDP；很多商家前置只转 **TCP / mieru**，所以 v1 扫码不通是线路限制，不是面板「又监听到本机」。
+> **v3 面向商家移动入口约束**：端口 7900–7999、河南白名单、TCP mieru、沪日 IX 转发到美国家宽。  
+> **v2 起默认协议是 mieru，不再是 WireGuard。** 最后一版 WireGuard 见 tag **v1.4.1**。
 
 ---
 
-## 架构
+## 真实拓扑（必读）
 
 ```
 手机（小火箭 / NekoBox / 官方 mieru）
-        │  TCP → 前置入站 Endpoint
+        │  TCP mierus://
         ▼
-  落地机 mita（美国家宽）  ←── Agent ──  面板（只管理）
+  商家移动入口 211.x  /  外部 114.x     ← 手机填这个（不是出网 IP）
         │
         ▼
-     公网（出口 IP = 家宽）
+  沪日 IX（内网 172.16.x）              ← TCP DNAT 转发到家宽
+        │
+        ▼
+  美国家宽 mita + Agent                 ← 真正出网
+        │
+        ▼
+  公网（出口 IP = 家宽）
 ```
 
-| 角色 | 做什么 |
-|------|--------|
-| 面板机 | 只跑 Web 面板 |
-| 落地机 | 装 Agent，跑 **mita**，出网 |
-| Endpoint | 填**前置入站 IP:TCP端口**，不是出网 IP，不是面板 IP |
+| 机器 | 装什么 | 注意 |
+|------|--------|------|
+| **面板** | 本仓库 Web 面板 | **独立 VPS**，只管理，不在业务链上 |
+| **沪日 IX** | 不装 mita（转发场景） | root 执行面板生成的 **IX 转发脚本** |
+| **美国家宽** | Agent + mita | 「一键落地」；出网 IP 只读 |
 
-落地安装基于 [mieru-OneClick](https://github.com/ike-sh/mieru-OneClick)（仓库内 `scripts/install-mita.sh` / `vendor/mieru-oneclick`）。
+**美国 VPS 对 114:7901 的 `nc` 超时不算失败**（省份白名单）。请用 **河南移动手机** 测 211 入口。
 
 ---
 
-## 五步打通（老板前置 + 家宽）
+## 五步打通（商家入口）
 
-### 1. 管理机安装面板
+### 1. 独立 VPS 安装/升级面板
 
 ```bash
 cd ~/wg   # 或你的安装目录
@@ -57,68 +51,68 @@ sudo bash install.sh --update
 
 浏览器打开 `http://面板IP:51821`。
 
-#### 忘记登录密码（不会丢配置）
-
-`--update` **不会**改登录密码。重置：
+#### 忘记登录密码
 
 ```bash
 cd ~/wg && git pull
 sudo bash install.sh --reset-password '你的新密码'
-# 或：
-sudo node /opt/wg-panel/scripts/reset-password.js --restart '你的新密码'
 ```
 
-默认用户名 `admin`。凭据也会写到 `/opt/wg-panel/data/initial-credentials.txt`。
+### 2. 向导确认路径 → 家宽装 Agent
 
-### 2. 向导选「另一台落地机」
+向导默认路径：**商家移动入口 → 沪日IX → 美国家宽**。  
+在**美国家宽** root 执行面板给出的 Agent 安装命令（不是 IX、不是面板机）。
 
-复制 Agent 安装命令。
+### 3. 拓扑页配置入口 + IX 转发
 
-### 3. 落地机 root 执行安装命令
+- 入口优先 **移动 211**，端口 **7900–7999**（如 7901），协议 **TCP**
+- 填写「家宽对 IX 可达地址」（家宽公网或隧道）
+- **生成并复制 IX 转发脚本** → 在**沪日 IX root** 执行
+- 勾选「IX 转发已配置」
 
-回到面板确认 **远程落地 · 在线**。
+### 4. 家宽一键落地 mita
 
-### 4. 填参数并一键落地
-
-- 协议：**TCP**（推荐）
-- 端口：商家可用段，如 `7901`
-- 入站 IP：`外部连接IP` 或 `移动入口`（如 114.x / 211.x）
-- 点 **一键落地** → 落地机安装/配置 mita
+「落地机 / 概览」→ **一键落地** → 等 Agent 任务完成，`mita` = RUNNING。
 
 ### 5. 客户端
 
-- 打开「客户端」→ 复制 **mierus://** 或扫码 / 下载 JSON  
-- 用支持 mieru 的 App 导入（**不要**用 WireGuard 官方 App 扫 WG 码）  
-- 验证：`ifconfig.me` 应为**家宽出网 IP**
-
-若仍不通：让老板确认 **TCP 端口** 已映射到落地机内网（不是 UDP）。
+- 「客户端」→ **211/114** 双链接（河南优先扫 **211**）
+- 登录名须英文/数字（如 `u7af760`），**不要**把「我的手机」填进小火箭用户栏
+- 验证：`ifconfig.me` ≈ 家宽出网 IP
 
 ---
 
-## 升级说明（1.x → 2.0）
+## 升级说明
+
+### 2.x → 3.0
 
 1. `git pull` 后 `sudo bash install.sh --update`
-2. state 自动迁到 **v4 / protocol=mieru**
-3. 旧 WireGuard 客户端会归档到 `legacyWireGuard`，**不会**当成 mieru 用户
-4. 落地机建议**重装 Agent**（安装命令再执行一次），以使用 v2 agent
-5. 重新「一键落地」装 mita，新建客户端用户，用 mierus 链接
+2. state 自动迁到 **v5 / topology**（入口·IX·落地）
+3. 打开「拓扑」：补全 IX 家宽可达地址、跑转发脚本、勾选已配置
+4. 客户端重新复制 **211** mierus 链接
+5. 家宽建议再点一次「一键落地 / 应用配置」
+
+### 1.x → 3.0
+
+同 2.0 迁移：旧 WireGuard 归档；落地机重装 Agent；新建 mieru 用户。
 
 ---
 
 ## 功能摘要
 
-- 单一出口模型（本机 / 远程 Agent）
-- mita 安装与配置下发（OneClick + apply 回退）
-- 用户管理、`mierus://` 分享链、JSON、二维码
-- 诊断：Agent / mita RUNNING / 入站地址 / 出网 IP 只读
-- 任务轮询、脏标记、改 Endpoint 后提示更新链接
+- **拓扑页**：211/114 入站、商家端口段校验、IX 转发脚本、分层诊断
+- 远程 Agent 一键装 mita、用户与 `mierus://` 双入口二维码
+- 诊断：入口 / IX 转发 / Agent / mita / 出网 IP 分层展示
+- 登录加固、重置密码、改 Endpoint 后提示重扫
 
 ---
 
 ## 环境要求
 
-- 面板：Linux，Node.js 18+，TCP 面板端口（默认 51821）
-- 落地：Linux root，出网访问面板与 GitHub（装 mita），前置映射 **TCP** 监听端口
+- 面板：Linux，Node.js 18+，TCP 51821（可改）
+- 家宽：Linux root，出网访问面板与 GitHub，监听 TCP 790x
+- IX：root，能访问家宽可达地址，可写 nft/iptables DNAT
+- 手机：河南移动优先；支持 mieru 的客户端
 
 ---
 

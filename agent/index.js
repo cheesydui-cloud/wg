@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Edge Agent v2.0.0 — mieru / mita 落地
+ * Edge Agent v3.0.0 — mieru / mita 落地（美国家宽）
  * 连接中心面板，拉取任务：安装/应用 mita、上报状态
  *
  * 环境变量：
@@ -19,7 +19,7 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
-const VERSION = '2.0.0';
+const VERSION = '3.0.0';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';

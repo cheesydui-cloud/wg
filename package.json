@@ -1,7 +1,7 @@
 {
   "name": "wg-panel",
-  "version": "2.0.5",
-  "description": "mieru / mita \u51fa\u53e3\u7ba1\u7406\u9762\u677f\uff08\u9762\u677f + Agent \u8fdc\u7a0b\u843d\u5730\uff09",
+  "version": "3.0.0",
+  "description": "mieru 拓扑出口面板：商家移动入口 → 沪日IX → 美国家宽 mita",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",

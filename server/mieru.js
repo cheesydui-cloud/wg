@@ -76,6 +76,14 @@ function ensureMieruDefaults(state) {
   if (!s.multiplexing) s.multiplexing = DEFAULT_MULTIPLEXING;
   if (!s.trafficPattern) s.trafficPattern = 'conservative';
   if (!Array.isArray(state.clients)) state.clients = [];
+  // 拓扑同步 endpoint（商家入口）
+  try {
+    const topology = require('./topology');
+    topology.ensureTopology(state);
+    if (state.server.endpoint) s.endpoint = state.server.endpoint;
+  } catch {
+    /* topology optional at boot */
+  }
   // 至少一个用户
   if (state.clients.length === 0) {
     state.clients.push({
@@ -168,13 +176,12 @@ function endpointHost(state) {
   return '';
 }
 
-/** mierus:// 分享链（与 OneClick 对齐） */
-function buildShareLink(state, client, protocol) {
+function shareLinkForHost(state, client, host, protocol) {
   ensureMieruDefaults(state);
   const s = state.server;
-  const host = endpointHost(state);
-  if (!host) {
-    const err = new Error('请先填写客户端连接地址（前置入站 IP）');
+  const h = String(host || '').trim();
+  if (!h) {
+    const err = new Error('请先填写客户端连接地址（商家入站 IP）');
     err.code = 'NO_ENDPOINT';
     throw err;
   }
@@ -191,16 +198,60 @@ function buildShareLink(state, client, protocol) {
     'profile=default',
     `protocol=${proto}`,
   ].join('&');
-  return `mierus://${urlencode(client.name)}:${urlencode(client.password)}@${host}:${port}?${query}`;
+  return `mierus://${urlencode(client.name)}:${urlencode(client.password)}@${h}:${port}?${query}`;
+}
+
+/** mierus:// 分享链（默认用当前 active 入站） */
+function buildShareLink(state, client, protocol) {
+  return shareLinkForHost(state, client, endpointHost(state), protocol);
+}
+
+/** 双入口链接：移动 211 / 外部 114 */
+function buildDualShareLinks(state, client, protocol) {
+  ensureMieruDefaults(state);
+  const s = state.server;
+  let mobileHost = '211.136.162.184';
+  let externalHost = '114.111.176.37';
+  let active = 'mobile';
+  try {
+    const topology = require('./topology');
+    topology.ensureTopology(state);
+    const t = state.topology;
+    mobileHost = t.ingress.mobileHost || mobileHost;
+    externalHost = t.ingress.externalHost || externalHost;
+    active = t.ingress.active || 'mobile';
+  } catch {
+    const ep = endpointHost(state);
+    if (ep === externalHost) active = 'external';
+    else if (ep && ep !== mobileHost) active = 'custom';
+  }
+  const mode = normalizeProtocol(s.protocol);
+  const proto = String(protocol || protocolsForMode(mode)[0]).toUpperCase();
+  const port = portForProtocol(s.listenPort, proto, mode);
+  const mobile = shareLinkForHost(state, client, mobileHost, proto);
+  const external = shareLinkForHost(state, client, externalHost, proto);
+  const preferred = active === 'external' ? external : mobile;
+  return {
+    mobile,
+    external,
+    preferred,
+    active,
+    endpoints: {
+      mobile: `${mobileHost}:${port}`,
+      external: `${externalHost}:${port}`,
+      active: `${active === 'external' ? externalHost : mobileHost}:${port}`,
+    },
+    tip: '河南移动优先扫 211；外部 114 作备用。美国 VPS nc 超时可忽略。',
+  };
 }
 
 /** 官方 mieru 客户端 JSON */
-function buildClientJson(state, client, protocol) {
+function buildClientJson(state, client, protocol, hostOverride) {
   ensureMieruDefaults(state);
   const s = state.server;
-  const host = endpointHost(state);
+  const host = String(hostOverride || endpointHost(state) || '').trim();
   if (!host) {
-    const err = new Error('请先填写客户端连接地址（前置入站 IP）');
+    const err = new Error('请先填写客户端连接地址（商家入站 IP）');
     err.code = 'NO_ENDPOINT';
     throw err;
   }
@@ -260,89 +311,32 @@ function diagnose(state, opts = {}) {
   const ep = parseEndpoint(s.endpoint);
   const users = enabledUsers(state);
 
-  push({
-    id: 'protocol',
-    level: 'info',
-    title: '出口协议',
-    detail: `mieru / mita · ${normalizeProtocol(s.protocol)}（老板前置/家宽场景请用 TCP）`,
-  });
-
-  if (mode === 'agent') {
+  // 分层拓扑诊断（商家入口 → IX → 家宽）
+  try {
+    const topology = require('./topology');
+    const topo = topology.diagnoseTopology(state, opts);
+    for (const it of topo.items || []) push(it);
+  } catch {
     push({
-      id: 'agent_online',
-      level: agentOnline ? 'ok' : 'error',
-      title: 'Agent 在线',
-      detail: agentOnline
-        ? `在线${opts.hostname ? ' · ' + opts.hostname : ''}${opts.agentVersion ? ' · v' + opts.agentVersion : ''}`
-        : '离线：无法在落地机安装/更新 mita',
-      fix: agentOnline ? '' : '在落地机执行面板生成的安装命令',
+      id: 'protocol',
+      level: 'info',
+      title: '出口协议',
+      detail: `mieru / mita · ${normalizeProtocol(s.protocol)}`,
     });
   }
-
-  if (!ep.ok) {
-    push({
-      id: 'endpoint',
-      level: 'error',
-      title: '客户端连接地址（前置入站）',
-      detail: '未填写。手机无法主动连接',
-      fix: '填商家外部连接 IP 或移动入口（不是出网 IP）',
-    });
-  } else {
-    const portMismatch = ep.port != null && Number(s.listenPort) && ep.port !== Number(s.listenPort);
-    push({
-      id: 'endpoint',
-      level: portMismatch ? 'warn' : 'ok',
-      title: '客户端连接地址（前置入站）',
-      detail: s.endpoint,
-      fix: portMismatch ? `端口建议与监听一致：${ep.host}:${s.listenPort}` : '',
-    });
-  }
-
-  push({
-    id: 'listen',
-    level: s.listenPort ? 'ok' : 'error',
-    title: '监听端口',
-    detail: s.listenPort
-      ? `${normalizeProtocol(s.protocol)} ${s.listenPort}${normalizeProtocol(s.protocol) === 'BOTH' ? ` / UDP ${Number(s.listenPort) + 1}` : ''}`
-      : '未设置',
-    fix: s.listenPort ? '确认老板前置把该 TCP 端口转到落地机内网' : '设置端口',
-  });
 
   push({
     id: 'users',
     level: users.length ? 'ok' : 'error',
     title: '客户端用户',
-    detail: users.length ? `${users.length} 个启用` : '没有用户',
+    detail: users.length
+      ? `${users.length} 个启用（登录名须英文/数字，勿用「我的手机」）`
+      : '没有用户',
     fix: users.length ? '' : '在「客户端」添加用户',
   });
 
   const mita = report?.mita || {};
   const running = Boolean(mita.running) || /RUNNING/i.test(String(mita.status || ''));
-  const listening = Boolean(mita.listening);
-  push({
-    id: 'mita',
-    level: running ? 'ok' : mode === 'agent' && !agentOnline ? 'warn' : 'error',
-    title: 'mita 服务',
-    detail: running
-      ? `RUNNING${listening ? ' · 端口在听' : ''}${mita.version ? ' · ' + mita.version : ''}`
-      : report
-        ? `未运行（${mita.status || 'unknown'}）`
-        : '尚无落地机上报',
-    fix: running ? '' : '点「一键落地」在落地机安装并启动 mita',
-  });
-
-  if (report?.exitPublicIp) {
-    const same = ep.ok && ep.host && String(report.exitPublicIp).trim() === String(ep.host).trim();
-    push({
-      id: 'egress_ip',
-      level: same ? 'warn' : 'info',
-      title: '当前出网 IP（只读，勿当连接地址）',
-      detail: String(report.exitPublicIp),
-      fix: same
-        ? '前置入口场景：连接地址应是外部/移动入口，不是家宽出网 IP'
-        : '手机连上后 ifconfig.me 应接近此 IP',
-    });
-  }
 
   if (opts.dirty) {
     push({
@@ -359,24 +353,19 @@ function diagnose(state, opts = {}) {
       id: 'need_rescan',
       level: 'warn',
       title: '连接参数已变',
-      detail: 'Endpoint/端口/密码改过，手机需更新分享链',
-      fix: '到「客户端」重新复制 mierus:// 或扫码导入',
+      detail: '入站/端口/密码改过，手机需更新分享链',
+      fix: '到「客户端」重新复制 mierus://（host 应为 211 或 114）',
     });
   }
-
-  push({
-    id: 'path',
-    level: 'info',
-    title: '正确路径',
-    detail: '手机 mieru → 老板前置(TCP) → 家宽 mita → 出网。不是 WireGuard。',
-  });
 
   const errors = items.filter((i) => i.level === 'error').length;
   const warns = items.filter((i) => i.level === 'warn').length;
   let summary = '配置看起来正常';
-  if (errors) summary = `发现 ${errors} 个必须处理的问题`;
+  if (errors) summary = `发现 ${errors} 个必须处理的问题（优先看 IX 转发 + 家宽 mita）`;
   else if (warns) summary = `有 ${warns} 个警告`;
-  if (running && users.length && ep.ok) summary = 'mita 与配置就绪；手机请用 mierus 链接连接';
+  if (running && users.length && ep.ok) {
+    summary = '配置就绪；用河南移动手机连 211 入口的 mierus 链接';
+  }
 
   return {
     ok: errors === 0,
@@ -412,6 +401,8 @@ module.exports = {
   isDirty,
   markClean,
   buildShareLink,
+  buildDualShareLinks,
+  shareLinkForHost,
   buildClientJson,
   publicClient,
   diagnose,

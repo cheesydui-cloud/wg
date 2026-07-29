@@ -330,7 +330,7 @@ function ensureTopology(state) {
 
   t.ingress.port = clampPort(t.ingress.port, CM_DEFAULTS.defaultPort);
   t.ingress.protocol = String(t.ingress.protocol || 'TCP').toUpperCase() === 'UDP' ? 'UDP' : 'TCP';
-  if (!['mobile', 'external', 'custom'].includes(t.ingress.active)) t.ingress.active = 'external';
+  if (!['mobile', 'external', 'custom'].includes(t.ingress.active)) t.ingress.active = 'mobile';
 
   t.ixes = (Array.isArray(t.ixes) ? t.ixes : []).map((x, i) =>
     defaultIx(
@@ -404,6 +404,16 @@ function ensureTopology(state) {
   state.server.endpoint = host ? `${host}:${t.ingress.port}` : '';
 
   uniquifyLandingIds(t);
+  // 顺手清掉跨 IX 端口段的用户专用端口（不改拓扑本身）
+  try {
+    const n = sanitizeClientPortsForIxRanges(state);
+    if (n > 0) {
+      state.clientsNeedRescan = true;
+      console.log(`[panel] 已清除 ${n} 个用户不在所属 IX 端口段的专用端口（改用落地默认）`);
+    }
+  } catch (e) {
+    console.warn('[panel] sanitize client ports:', e.message);
+  }
   return state.topology;
 }
 
@@ -894,6 +904,37 @@ function applyTopologyPatch(state, body = {}) {
   return { endpointChanged, topology: publicTopology(state) };
 }
 
+/** 清掉不在所属 IX 端口段的用户专用端口（常见：10400 段落地却写死 7901） */
+function sanitizeClientPortsForIxRanges(state) {
+  // 由 ensureTopology 调用：禁止再调 getLandingByNodeId/resolveIx（它们会 ensureTopology 递归）
+  if (!state || !state.topology) return 0;
+  const t = state.topology;
+  const ixes = Array.isArray(t.ixes) ? t.ixes : [];
+  const landings = Array.isArray(t.landings) ? t.landings : [];
+  let fixed = 0;
+  for (const c of state.clients || []) {
+    if (!c?.route) continue;
+    const port = c.route.listenPort != null && c.route.listenPort !== '' ? Number(c.route.listenPort) : null;
+    if (!port) continue;
+    const nid = c.route.landingNodeId || state.primaryNodeId || null;
+    const L =
+      (nid && landings.find((x) => x.nodeId === nid)) ||
+      landings[0] ||
+      null;
+    const ixId = c.route.ixId || L?.ixId || ixes[0]?.id || null;
+    const ix = (ixId && ixes.find((x) => x.id === ixId)) || ixes[0] || null;
+    if (!ix) continue;
+    if (!portInMerchantRange(port, ix)) {
+      c.route.listenPort = null;
+      if (!c.route.ixId && L?.ixId) c.route.ixId = L.ixId;
+      fixed += 1;
+    } else if (L?.listenPort && Number(L.listenPort) === port) {
+      c.route.listenPort = null;
+    }
+  }
+  return fixed;
+}
+
 function diagnoseTopology(state, opts = {}) {
   ensureTopology(state);
   const items = [];
@@ -908,7 +949,7 @@ function diagnoseTopology(state, opts = {}) {
     id: 'topo_path',
     level: 'info',
     title: '拓扑路径',
-    detail: '电脑/客户端 → 商家IX前置(211/114) → IX → 落地家宽 mita → 出网',
+    detail: '电脑/客户端 → 商家IX前置（拓扑主入口）→ IX → 落地家宽 mita → 出网',
   });
 
   push({
@@ -918,41 +959,88 @@ function diagnoseTopology(state, opts = {}) {
     detail: '独立 VPS 只管理，不在业务链上',
   });
 
-  const inRange = portInMerchantRange(port);
+  // 端口段按「每台 IX」校验；禁止用全局默认 7900–7999 误伤 10400 段等
+  const ixes = t.ixes || [];
+  const portOkOnAnyIx = ixes.some((ix) => portInMerchantRange(port, ix));
+  const rangesLabel = ixes.length
+    ? ixes.map((ix) => `${ix.name || ix.id}:${ix.portMin}-${ix.portMax}`).join('；')
+    : `${CM_DEFAULTS.portMin}-${CM_DEFAULTS.portMax}`;
+  // 优先当前选中 IX / 带该端口落地的 IX / 第一台
+  let primaryIx =
+    (opts.ixId && ixes.find((x) => x.id === opts.ixId)) ||
+    ixes.find((ix) => portInMerchantRange(port, ix)) ||
+    ixes[0] ||
+    null;
+  const primaryRange = primaryIx
+    ? `${primaryIx.portMin}-${primaryIx.portMax}`
+    : `${CM_DEFAULTS.portMin}-${CM_DEFAULTS.portMax}`;
+  const inRange = portOkOnAnyIx || (ixes.length === 0 && portInMerchantRange(port));
   push({
     id: 'ingress',
     level: ep && inRange ? 'ok' : 'error',
     title: '商家 IX 前置入口（客户端连接地址）',
     detail: ep
-      ? `${ep} · 当前=${t.ingress.active} · ${t.ingress.provinceWhitelist || '—'}`
+      ? `${ep} · 当前=${t.ingress.active || 'mobile'} · ${t.ingress.provinceWhitelist || '—'}`
       : '未配置前置入口',
     fix: !ep
-      ? '在拓扑页选择外部 114 或移动宽带前置 211'
+      ? '在拓扑页填写主入口 Host（IP/域名）并保存'
       : !inRange
-        ? `端口须在商家段 ${CM_DEFAULTS.portMin}-${CM_DEFAULTS.portMax}`
+        ? `端口 ${port} 不在任一台 IX 端口段（${rangesLabel}）。到对应 IX 改端口段，或改默认/落地端口落在段内`
         : '用你本机经商家前置测；无关 VPS nc 超时可忽略',
   });
 
-  for (const ix of t.ixes) {
+  for (const ix of ixes) {
     const ing = getIxIngress(ix, t.ingress);
     const home =
       t.landings.find((L) => L.ixId === ix.id && L.homeReachableHost)?.homeReachableHost ||
       t.landings.find((L) => L.homeReachableHost)?.homeReachableHost ||
       ix.homeReachableHost ||
       '';
-    const rangeOk = portInMerchantRange(port, ix);
+    // 本 IX 默认/绑定落地端口是否在本 IX 段
+    const ixLandings = (t.landings || []).filter((L) => !L.ixId || L.ixId === ix.id);
+    const checkPorts = [
+      port,
+      ...ixLandings.map((L) => Number(L.listenPort) || 0).filter(Boolean),
+    ];
+    const badPorts = [...new Set(checkPorts)].filter((p) => !portInMerchantRange(p, ix));
+    // 仅当本 IX 实际在用的端口不在段内才报；全局 ingress.port 若属于其它 IX 段则不误伤本 IX
+    const usesGlobalPort = ixLandings.some((L) => Number(L.listenPort) === Number(port)) ||
+      ixes.length === 1 ||
+      (primaryIx && primaryIx.id === ix.id);
+    const rangeOk = usesGlobalPort
+      ? portInMerchantRange(port, ix) && badPorts.filter((p) => p !== Number(port) || usesGlobalPort).every((p) => portInMerchantRange(p, ix))
+      : ixLandings.every((L) => portInMerchantRange(L.listenPort || port, ix));
+    let ixLevel = 'ok';
+    let ixFix = '';
+    if (!home && !ix.forwardConfigured) {
+      ixLevel = 'warn';
+      ixFix = '在 IX 执行转发脚本后勾选「已配置」；并填家宽可达地址';
+    } else if (!rangeOk && usesGlobalPort && !portInMerchantRange(port, ix)) {
+      // 全局默认端口不在本 IX 段：若本 IX 自己的落地端口都在段内，只 info/warn 不 error
+      const landingsOk = !ixLandings.length || ixLandings.every((L) => portInMerchantRange(L.listenPort || 0, ix) || !L.listenPort);
+      if (landingsOk && ixLandings.length) {
+        ixLevel = 'ok';
+        ixFix = '';
+      } else {
+        ixLevel = 'warn';
+        ixFix = `默认端口 ${port} 不在本 IX 段 ${ix.portMin}-${ix.portMax}；请改本 IX 默认端口或端口段`;
+      }
+    } else if (ixLandings.some((L) => L.listenPort && !portInMerchantRange(L.listenPort, ix))) {
+      const bad = ixLandings.filter((L) => L.listenPort && !portInMerchantRange(L.listenPort, ix));
+      ixLevel = 'error';
+      ixFix = `落地端口不在本 IX 段 ${ix.portMin}-${ix.portMax}：${bad.map((L) => `${L.name}:${L.listenPort}`).join('、')}`;
+    } else if (!ix.forwardConfigured) {
+      ixLevel = 'warn';
+      ixFix = '在 IX 执行转发脚本后勾选「已配置」';
+    }
     push({
       id: `ix_${ix.id}`,
-      level: home || ix.forwardConfigured ? 'ok' : 'warn',
+      level: ixLevel,
       title: `IX · ${ix.name}`,
-      detail: `内网 ${ix.lanIp} · 端口段 ${ix.portMin}-${ix.portMax} · 主入口=${ing.mobileHost || ing.customHost || ing.externalHost || "未填"} · 备用=${ing.externalHost || "—"}${
+      detail: `内网 ${ix.lanIp || '—'} · 端口段 ${ix.portMin}-${ix.portMax} · 主入口=${ing.mobileHost || ing.customHost || ing.externalHost || '未填'} · 备用=${ing.externalHost || '—'}${
         ing.customHost ? ` / 自定义=${ing.customHost}` : ''
       } · 转发${ix.forwardConfigured ? '已标记' : '未标记'} · 可达 ${home || '未填'}`,
-      fix: ix.forwardConfigured
-        ? rangeOk
-          ? ''
-          : `默认端口 ${port} 不在本 IX 段 ${ix.portMin}-${ix.portMax}`
-        : '在 IX 执行转发脚本后勾选「已配置」',
+      fix: ixFix,
     });
   }
 
@@ -1099,6 +1187,7 @@ module.exports = {
   publicTopology,
   applyTopologyPatch,
   diagnoseTopology,
+  sanitizeClientPortsForIxRanges,
   getIx,
   getLanding,
   getLandingByNodeId,

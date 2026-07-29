@@ -271,6 +271,40 @@ function applyRoutePackageBody(client, body) {
     }
   }
 
+  // 专用端口必须落在所属 IX 端口段；与落地默认相同则清空（走落地）
+  if (client.route.listenPort != null && client.route.listenPort !== '') {
+    const p = Number(client.route.listenPort);
+    if (!Number.isFinite(p) || p < 1 || p > 65535) {
+      const err = new Error('专用端口无效');
+      err.code = 'BAD_LISTEN_PORT';
+      err.status = 400;
+      throw err;
+    }
+    try {
+      const L = topology.getLandingByNodeId(state, client.route.landingNodeId);
+      const ix = topology.resolveIx(state, {
+        ixId: client.route.ixId || L?.ixId,
+        landingNodeId: client.route.landingNodeId,
+      });
+      if (ix && !topology.portInMerchantRange(p, ix)) {
+        const err = new Error(
+          `专用端口 ${p} 不在 IX「${ix.name || ix.id}」端口段 ${ix.portMin}-${ix.portMax}（请留空使用落地默认 :${L?.listenPort || ix.portMin}）`
+        );
+        err.code = 'PORT_OUT_OF_IX_RANGE';
+        err.status = 400;
+        throw err;
+      }
+      if (L?.listenPort && Number(L.listenPort) === p) {
+        client.route.listenPort = null;
+      } else {
+        client.route.listenPort = p;
+      }
+    } catch (e) {
+      if (e && e.code) throw e;
+      client.route.listenPort = p;
+    }
+  }
+
   if (body.package && typeof body.package === 'object') {
     const p = body.package;
     if (p.quotaMb !== undefined) client.package.quotaMb = Math.max(0, Number(p.quotaMb) || 0);
@@ -893,7 +927,11 @@ app.post('/api/clients', (req, res) => {
     updatedAt: new Date().toISOString(),
   };
   ensureClientFields(client, state.primaryNodeId);
-  applyRoutePackageBody(client, body);
+  try {
+    applyRoutePackageBody(client, body);
+  } catch (e) {
+    return res.status(e.status || 400).json({ error: e.message, code: e.code || 'BAD_ROUTE' });
+  }
   if (!client.route.landingNodeId) client.route.landingNodeId = state.primaryNodeId;
   // 再规范化一次，保证落盘的是 nodeId 而非 landing 拓扑 id
   if (client.route.landingNodeId) {
@@ -964,7 +1002,11 @@ app.put('/api/clients/:id', (req, res) => {
   const prevEnabled = c.enabled !== false;
   if (body.enabled !== undefined) c.enabled = Boolean(body.enabled);
   if (body.note !== undefined) c.note = String(body.note);
-  applyRoutePackageBody(c, body);
+  try {
+    applyRoutePackageBody(c, body);
+  } catch (e) {
+    return res.status(e.status || 400).json({ error: e.message, code: e.code || 'BAD_ROUTE' });
+  }
   c.updatedAt = new Date().toISOString();
 
   const nextLanding = mieru.clientLandingNodeId(c, state);

@@ -858,6 +858,28 @@ function diagnose(state, opts = {}) {
         fix: '在客户端编辑里选择落地',
       });
     }
+    // 专用端口是否落在所属 IX 段（常见：绑 10400 段落地却写死 7901）
+    try {
+      const topology = require('./topology');
+      const nid = clientLandingNodeId(c, state);
+      const L = nid ? topology.getLandingByNodeId(state, nid) : null;
+      const ix = topology.resolveIx(state, {
+        ixId: c.route?.ixId || L?.ixId,
+        landingNodeId: nid,
+      });
+      const p = c.route?.listenPort != null ? Number(c.route.listenPort) : null;
+      if (p && ix && !topology.portInMerchantRange(p, ix)) {
+        push({
+          id: `port_${c.id}`,
+          level: 'error',
+          title: `用户端口不在 IX 段 · ${c.name}`,
+          detail: `专用端口 ${p} · 落地 ${L?.name || nid || '—'} · IX ${ix.name} 段 ${ix.portMin}-${ix.portMax} · 落地默认 :${L?.listenPort || '—'}`,
+          fix: `编辑用户：专用端口留空（用落地 :${L?.listenPort || ix.portMin}）或改到 ${ix.portMin}-${ix.portMax}，保存后重新分享链接并应用配置`,
+        });
+      }
+    } catch {
+      /* */
+    }
     const pkg = c.package || {};
     if (pkg.expireAt && new Date(pkg.expireAt).getTime() < Date.now()) {
       push({

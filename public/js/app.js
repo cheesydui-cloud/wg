@@ -1088,7 +1088,7 @@ function renderWizard() {
       </div>
       <div class="inline-fields">
         <div>
-          <label>端口（商家段 7900–7999）</label>
+          <label>端口（须在对应 IX 端口段内，见拓扑）</label>
           <input class="field mono" id="w-port" value="${esc(ing.port || state.server?.listenPort || 7901)}" />
         </div>
         <div>
@@ -1738,9 +1738,9 @@ async function renderTopology() {
       const nm = String(val('t-ix-name') || '').trim();
       target.name = nm || target.name || 'IX';
       target.lanIp = val('t-ix-lan');
-      target.sshPort = Number(val('t-ix-ssh')) || 7900;
-      target.portMin = Number(val('t-pmin')) || 7900;
-      target.portMax = Number(val('t-pmax')) || 7999;
+      target.sshPort = Number(val('t-ix-ssh')) || target.sshPort || 7900;
+      target.portMin = Number(val('t-pmin')) || target.portMin || 7900;
+      target.portMax = Number(val('t-pmax')) || target.portMax || 7999;
       target.forwardConfigured = document.getElementById('t-fwd-ok')?.checked;
       target.homeReachableHost = val('t-home') || target.homeReachableHost;
       target.homeReachablePort = Number(val('t-home-port')) || target.homeReachablePort;
@@ -2980,15 +2980,53 @@ function openClientModal(client, preferLandingId) {
   const nodes = state.nodes || [];
   const defaultLanding =
     client?.route?.landingNodeId || preferLandingId || state.primaryNode?.id || nodes[0]?.id || '';
+
+  /** 落地 → 默认端口 + 所属 IX 端口段（禁止写死 7901） */
+  const landingPortMeta = (nodeId) => {
+    const L = landingByNodeId(nodeId);
+    const n = (state.nodes || []).find((x) => x.id === nodeId);
+    const ix = L?.ixId ? ixesList().find((x) => x.id === L.ixId) : null;
+    const defPort =
+      Number(L?.listenPort) ||
+      Number(n?.listenPort) ||
+      Number(ix?.portMin) ||
+      Number(state.server?.listenPort) ||
+      '';
+    const min = Number(ix?.portMin) || null;
+    const max = Number(ix?.portMax) || null;
+    return {
+      defPort,
+      min,
+      max,
+      ixName: ix?.name || '',
+      rangeLabel: min && max ? `${min}–${max}` : '',
+    };
+  };
+
   const landingOpts = nodes
     .map((n) => {
       const L = landingByNodeId(n.id);
+      const meta = landingPortMeta(n.id);
       const ix = L?.ixId ? ` · ${ixName(L.ixId)}` : '';
+      const portHint = meta.defPort ? ` · :${meta.defPort}` : '';
       return `<option value="${esc(n.id)}" ${defaultLanding === n.id ? 'selected' : ''}>${esc(
         n.name
-      )}${n.isPrimary ? '（默认）' : ''}${ix}</option>`;
+      )}${n.isPrimary ? '（默认）' : ''}${ix}${portHint}</option>`;
     })
     .join('');
+
+  const initMeta = landingPortMeta(defaultLanding);
+  // 展示：有专用端口显示专用；否则空（用落地默认）。若专用端口不在 IX 段则仍显示以便用户改掉
+  let portValue = client?.route?.listenPort ? String(client.route.listenPort) : '';
+  if (
+    portValue &&
+    initMeta.min &&
+    initMeta.max &&
+    (Number(portValue) < initMeta.min || Number(portValue) > initMeta.max)
+  ) {
+    // 保留错误值让用户看见，下方会警告
+  }
+
   openModal({
     title: isEdit ? '编辑用户' : '添加用户',
     body: `
@@ -3004,9 +3042,18 @@ function openClientModal(client, preferLandingId) {
       <input class="field" id="c-note" value="${esc(client?.note || '')}" placeholder="例如：我的电脑" />
       <label>绑定落地</label>
       <select class="field" id="c-landing">${landingOpts || '<option value="">默认</option>'}</select>
-      <p class="field-hint">分享链会按该落地所属 IX 的前置 IP/域名生成。</p>
-      <label>专用端口（空=落地默认；须在所属 IX 端口段内）</label>
-      <input class="field mono" id="c-port" value="${esc(client?.route?.listenPort || '')}" placeholder="7901" />
+      <p class="field-hint">分享链按该落地所属 IX 的主入口生成；端口默认跟落地/IX 段。</p>
+      <label>专用端口（推荐留空=落地默认）</label>
+      <input class="field mono" id="c-port" value="${esc(portValue)}" placeholder="${esc(
+        initMeta.defPort ? String(initMeta.defPort) : '落地默认端口'
+      )}" />
+      <p class="field-hint" id="c-port-hint">落地默认 <span class="mono">:${esc(
+        initMeta.defPort || '—'
+      )}</span>${
+        initMeta.rangeLabel
+          ? ` · IX「${esc(initMeta.ixName)}」段 <span class="mono">${esc(initMeta.rangeLabel)}</span>`
+          : ''
+      } · 留空则用落地端口，勿填其它 IX 的端口</p>
       <div class="inline-fields">
         <div>
           <label>流量配额 MB（0=不限）</label>
@@ -3072,6 +3119,35 @@ function openClientModal(client, preferLandingId) {
       if (el) el.value = `${yyyy}-${mm}-${dd}`;
     });
   });
+  const syncPortHint = () => {
+    const nid = (document.getElementById('c-landing')?.value || '').trim();
+    const meta = landingPortMeta(nid);
+    const portEl = document.getElementById('c-port');
+    const hint = document.getElementById('c-port-hint');
+    if (portEl) {
+      portEl.placeholder = meta.defPort ? String(meta.defPort) : '落地默认端口';
+      const cur = (portEl.value || '').trim();
+      // 切换落地时：若端口为空、或等于旧占位、或不在新 IX 段 → 清空（走落地默认）
+      if (cur) {
+        const p = Number(cur);
+        const out =
+          meta.min && meta.max && Number.isFinite(p) && (p < meta.min || p > meta.max);
+        if (out) portEl.value = '';
+      }
+    }
+    if (hint) {
+      hint.innerHTML = `落地默认 <span class="mono">:${esc(
+        meta.defPort || '—'
+      )}</span>${
+        meta.rangeLabel
+          ? ` · IX「${esc(meta.ixName)}」段 <span class="mono">${esc(meta.rangeLabel)}</span>`
+          : ''
+      } · 留空则用落地端口，勿填其它 IX 的端口`;
+    }
+  };
+  document.getElementById('c-landing')?.addEventListener('change', syncPortHint);
+  syncPortHint();
+
   document.getElementById('c-save').onclick = async () => {
     try {
       const landingNodeId = (val('c-landing') || '').trim() || null;
@@ -3082,13 +3158,36 @@ function openClientModal(client, preferLandingId) {
         toast('绑定落地无效，请重新选择落地后再保存', 'err');
         return;
       }
+      const meta = landingPortMeta(landingNodeId);
+      const portRaw = (val('c-port') || '').trim();
+      let listenPort = portRaw ? Number(portRaw) : null;
+      if (portRaw && (!Number.isFinite(listenPort) || listenPort < 1 || listenPort > 65535)) {
+        toast('专用端口无效', 'err');
+        return;
+      }
+      if (
+        listenPort &&
+        meta.min &&
+        meta.max &&
+        (listenPort < meta.min || listenPort > meta.max)
+      ) {
+        toast(
+          `专用端口 ${listenPort} 不在 IX「${meta.ixName || ''}」段 ${meta.min}–${meta.max}（落地默认 :${meta.defPort || '—'}）。请留空或改到段内`,
+          'err'
+        );
+        return;
+      }
+      // 与落地默认相同则存 null，避免写死成「假专用」
+      if (listenPort && meta.defPort && Number(listenPort) === Number(meta.defPort)) {
+        listenPort = null;
+      }
       const body = {
         name: val('c-name') || client?.name,
         note: val('c-note'),
         route: {
           landingNodeId,
           ixId: L?.ixId || null,
-          listenPort: val('c-port') ? Number(val('c-port')) : null,
+          listenPort,
         },
         package: {
           quotaMb: Number(val('c-quota')) || 0,

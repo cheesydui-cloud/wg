@@ -17,6 +17,7 @@ const state = {
   exitOverview: null,
   forwardScript: '',
   forwardScriptIxId: null,
+  forwardError: '',
   selectedIxId: null,
   selectedLandingId: null,
   expandedLandingId: null,
@@ -907,12 +908,16 @@ function bindShell() {
 }
 
 async function refreshCore() {
+  // 拓扑脚本必须按当前选中 IX 拉取；无 ixId 时服务端会回第一台，会把第二台脚本盖掉
+  const ixQ = state.selectedIxId
+    ? `?ixId=${encodeURIComponent(state.selectedIxId)}`
+    : '';
   const [status, server, clients, overview, topology, nodesRes] = await Promise.all([
     api('/api/status'),
     api('/api/server'),
     api('/api/clients'),
     api('/api/exit/overview').catch(() => null),
-    api('/api/topology').catch(() => null),
+    api('/api/topology' + ixQ).catch(() => null),
     api('/api/nodes').catch(() => null),
   ]);
   state.status = status;
@@ -921,7 +926,17 @@ async function refreshCore() {
   state.nodes = status.nodes || nodesRes?.nodes || overview?.nodes || [];
   state.server = server.server;
   state.topology = topology?.topology || server.topology || status.topology || null;
-  state.forwardScript = topology?.forwardScript || '';
+  // 仅当返回的脚本属于当前 IX（或当前未选）才写入；禁止无 ixId 的第一台脚本污染第二台
+  const returnedIx = topology?.forwardIxId || null;
+  const wantIx = state.selectedIxId || null;
+  if (topology && Object.prototype.hasOwnProperty.call(topology, 'forwardScript')) {
+    if (!wantIx || !returnedIx || returnedIx === wantIx) {
+      state.forwardScript = topology.forwardScript || '';
+      state.forwardScriptIxId = returnedIx || wantIx || null;
+      state.forwardError = topology.forwardError || '';
+    }
+    // else: 保留内存里当前 IX 的脚本，不被第一台覆盖
+  }
   state.wizardDone = server.wizardDone;
   state.dirty = Boolean(status.dirty ?? clients.dirty);
   state.clientsNeedRescan = Boolean(status.clientsNeedRescan ?? clients.clientsNeedRescan);
@@ -1651,10 +1666,17 @@ async function renderTopology() {
           : ''
       }
       <p class="field-hint">当前脚本所属：<strong>${esc(ix.name || '—')}</strong> · id <code class="mono">${esc(ix.id || '')}</code> · 段 ${esc(portMin)}–${esc(portMax)}</p>
+      ${
+        state.forwardError && (!script || state.forwardScriptIxId === ix.id)
+          ? `<div class="alert warn compact"><div>${esc(state.forwardError)}</div></div>`
+          : ''
+      }
       <pre class="code-block" id="t-script" style="margin-top:10px;max-height:320px;overflow:auto">${esc(
         script && state.forwardScriptIxId && state.forwardScriptIxId !== ix.id
           ? '（已切换 IX，请重新点「生成/刷新转发脚本」）'
-          : script || '（本 IX 绑定落地并填家宽可达后，点「生成/刷新转发脚本」）'
+          : script ||
+            state.forwardError ||
+            '（本 IX 绑定落地并填家宽可达后，点「生成/刷新转发脚本」）'
       )}</pre>
       </div>
     </div>
@@ -1686,6 +1708,7 @@ async function renderTopology() {
         state.selectedLandingId = null;
         state.forwardScript = '';
         state.forwardScriptIxId = null;
+        state.forwardError = '';
         saveUiPrefs({ selectedIxId: state.selectedIxId });
         syncHashFromState();
         render();
@@ -1923,10 +1946,18 @@ async function renderTopology() {
       }
       const r = await saveCurrentIx(activeChoice);
       toast(r.tip || `本 IX「${nm}」已保存`);
-      const qs = scriptQs();
-      const topoRes = await api('/api/topology' + (qs ? '?' + qs : ''));
-      state.forwardScript = topoRes.forwardScript || '';
+      const curId = (currentIx() || ix).id;
+      const q = new URLSearchParams();
+      if (curId) q.set('ixId', curId);
+      const lid = document.getElementById('t-landing-sel')?.value || '';
+      if (lid) q.set('landingId', lid);
+      const port = Number(val('t-fwd-port')) || '';
+      if (port) q.set('port', String(port));
+      const topoRes = await api('/api/topology' + (q.toString() ? '?' + q.toString() : ''));
       state.topology = topoRes.topology;
+      state.forwardScript = topoRes.forwardScript || '';
+      state.forwardScriptIxId = topoRes.forwardIxId || curId || null;
+      state.forwardError = topoRes.forwardError || '';
       render();
     } catch (e) {
       toast(e.message, 'err');
@@ -1935,9 +1966,12 @@ async function renderTopology() {
 
   document.getElementById('t-load-script').onclick = async () => {
     try {
+      // 先钉死当前 IX id，避免 save/refresh 过程中串台
+      const pinnedIxId = state.selectedIxId || ix.id;
+      if (pinnedIxId) state.selectedIxId = pinnedIxId;
       await saveCurrentIx(activeChoice);
-      // 以当前选中 IX 为准（防闭包旧 ix / 全局缓存串台）
-      const cur = currentIx() || ix;
+      const cur =
+        (ixesList().find((x) => x.id === pinnedIxId) || null) || currentIx() || ix;
       const landingId = document.getElementById('t-landing-sel')?.value || '';
       const port = Number(val('t-fwd-port')) || '';
       const q = new URLSearchParams();
@@ -1954,7 +1988,8 @@ async function renderTopology() {
         toast('脚本与当前 IX 不匹配，已丢弃；请确认落地绑定后重试', 'err');
       }
       state.forwardScript = script;
-      state.forwardScriptIxId = cur?.id || null;
+      state.forwardScriptIxId = topoRes.forwardIxId || cur?.id || pinnedIxId || null;
+      state.forwardError = topoRes.forwardError || '';
       const a = document.getElementById('t-dl-script');
       if (a) a.href = '/api/topology/forward-script?download=1&' + qs;
       if (!script) {

@@ -1034,5 +1034,69 @@ ok('publicTopology per-IX ingress/endpoints');
   ok('second IX forward script isolated from first');
 }
 
+
+// 26) GET topology without ixId must not return first-IX script body
+// (simulates old refreshCore bug)
+{
+  const st = {
+    server: { listenPort: 7901, protocol: 'TCP' },
+    clients: [],
+    nodes: [],
+    topology: {
+      profile: 'cm-ix-home',
+      ingress: { active: 'external', port: 7901, protocol: 'TCP', externalHost: '114.1.1.1' },
+      ixes: [
+        topology.defaultIx({
+          id: 'ix-1',
+          name: 'IX1',
+          lanIp: '10.0.0.1',
+          portMin: 7900,
+          portMax: 7999,
+          ingress: { active: 'external', externalHost: '114.1.1.1' },
+        }),
+        topology.defaultIx({
+          id: 'ix-2',
+          name: 'IX2',
+          lanIp: '10.0.0.2',
+          portMin: 10400,
+          portMax: 10499,
+          ingress: { active: 'external', externalHost: '114.2.2.2' },
+        }),
+      ],
+      landings: [
+        topology.defaultLanding({
+          id: 'l1',
+          name: 'A',
+          nodeId: 'n1',
+          ixId: 'ix-1',
+          listenPort: 7901,
+          homeReachableHost: '1.1.1.1',
+        }),
+        topology.defaultLanding({
+          id: 'l2',
+          name: 'B',
+          nodeId: 'n2',
+          ixId: 'ix-2',
+          listenPort: 10400,
+          homeReachableHost: '2.2.2.2',
+        }),
+      ],
+    },
+  };
+  topology.ensureTopology(st);
+  const withId = topology.buildIxForwardScript(st, { ixId: 'ix-2' });
+  assert.ok(withId.ok && withId.script.includes('10400'));
+  const noId = topology.buildIxForwardScript(st, {});
+  // noId 仍可能生成第一台（内部默认）——面板 GET 已禁止无 ixId 返回 script
+  assert.ok(noId.script.includes('7901') || noId.ok);
+  // 关键点：带 ixId 的两台脚本必须不同
+  const a = topology.buildIxForwardScript(st, { ixId: 'ix-1' });
+  const b = topology.buildIxForwardScript(st, { ixId: 'ix-2' });
+  assert.notStrictEqual(a.script, b.script);
+  assert.ok(a.script.includes('ixId=ix-1'));
+  assert.ok(b.script.includes('ixId=ix-2'));
+  ok('per-ix scripts differ; ix2 has 10400');
+}
+
 console.log('\nsmoke-v4: all passed');
 console.log('tmp data:', tmp);

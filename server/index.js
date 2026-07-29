@@ -727,15 +727,27 @@ app.get('/api/server', (req, res) => {
 
 app.get('/api/topology', (req, res) => {
   topology.ensureTopology(state);
-  const ixId = req.query.ixId || undefined;
+  const ixId = req.query.ixId ? String(req.query.ixId) : '';
   const landingId = req.query.landingId || undefined;
   const port = req.query.port ? Number(req.query.port) : undefined;
-  const fwd = topology.buildIxForwardScript(state, { ixId, landingId, port });
+  // 无 ixId 时不生成「默认第一台」脚本，避免前端 refresh 把第二台脚本盖成第一台
+  let fwd;
+  if (ixId) {
+    fwd = topology.buildIxForwardScript(state, { ixId, landingId, port });
+  } else {
+    fwd = {
+      ok: false,
+      script: '',
+      error: '',
+      ixId: null,
+      routes: [],
+    };
+  }
   res.json({
     topology: topology.publicTopology(state),
     forwardScript: fwd.ok ? fwd.script : '',
     forwardError: fwd.error || '',
-    forwardIxId: fwd.ixId || ixId || null,
+    forwardIxId: fwd.ixId || (ixId || null),
     forwardRoutes: fwd.routes || [],
     server: publicServer(state.server),
     nodes: nodes.ensureNodes(state).map((n) => enrichNodePublic(n)),
@@ -779,16 +791,24 @@ app.put('/api/topology', (req, res) => {
 });
 
 app.get('/api/topology/forward-script', (req, res) => {
+  const ixId = req.query.ixId ? String(req.query.ixId) : '';
+  if (!ixId) {
+    return res.status(400).json({
+      error: '请指定 ixId（拓扑页当前 IX），禁止无参数下载以免下到第一台脚本',
+      script: '',
+    });
+  }
   const fwd = topology.buildIxForwardScript(state, {
-    ixId: req.query.ixId,
+    ixId,
     landingId: req.query.landingId,
     port: req.query.port ? Number(req.query.port) : undefined,
   });
-  if (!fwd.ok) return res.status(400).json({ error: fwd.error, script: '' });
+  if (!fwd.ok) return res.status(400).json({ error: fwd.error, script: '', ixId: fwd.ixId });
   if (req.query.download === '1') {
+    const safeName = String(fwd.ixId || ixId).replace(/[^\w.-]+/g, '_');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="ix-forward-${fwd.listenPort || 7901}.sh"`
+      `attachment; filename="ix-forward-${safeName}-${fwd.listenPort || 'ports'}.sh"`
     );
     res.type('text/x-shellscript');
     return res.send(fwd.script);

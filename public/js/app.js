@@ -963,27 +963,31 @@ async function renderDashboard() {
       </div>
     </div>
     ${pathBanner(null, { compact: true })}
-    <div class="stat-grid" style="margin-top:14px">
+    <div class="stat-grid">
       <div class="stat-card">
         <div class="stat-label">前置 Endpoint</div>
         <div class="stat-value small mono">${esc(activeEp() || '未填')}</div>
+        <div class="stat-foot">客户端只连这里</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">IX / 落地在线</div>
-        <div class="stat-value">${ixN} · ${onlineN}/${nodes.length || 1}</div>
+        <div class="stat-label">IX · 落地在线</div>
+        <div class="stat-value">${ixN}<span class="sub"> IX</span> · ${onlineN}<span class="sub">/${nodes.length || 1}</span></div>
+        <div class="stat-foot">Agent 心跳在线</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">默认 mita</div>
-        <div class="stat-value">${mita?.running ? 'RUNNING' : mita?.status || '未知'}</div>
+        <div class="stat-value ${mita?.running ? 'ok-text' : ''}">${mita?.running ? 'RUNNING' : mita?.status || '未知'}</div>
+        <div class="stat-foot">出网出口状态</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">用户${blocked ? ' · 告警' : ''}</div>
-        <div class="stat-value">${state.clients.length}${blocked ? ` · ${blocked}⚠` : ''}${
-          dirtyN ? ` · 未应用` : ''
-        }</div>
+        <div class="stat-value">${state.clients.length}${
+          blocked ? `<span class="sub warn-text"> · ${blocked}⚠</span>` : ''
+        }${dirtyN ? `<span class="sub warn-text"> · 未应用</span>` : ''}</div>
+        <div class="stat-foot">启用 / 到期 / 下发</div>
       </div>
     </div>
-    <div class="dash-meta muted" style="margin-top:10px;font-size:12px">
+    <div class="dash-meta" style="margin-top:14px">
       监听 <span class="mono">${esc(s.protocol || 'TCP')}:${esc(s.listenPort || 7901)}</span>
       · 出网 <span class="mono">${esc(ov.exitPublicIp || state.primaryNode?.exitPublicIp || '—')}</span>
       · 最近应用 ${esc(fmtTime(state.lastAppliedAt))}

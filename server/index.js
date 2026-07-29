@@ -735,6 +735,8 @@ app.get('/api/topology', (req, res) => {
     topology: topology.publicTopology(state),
     forwardScript: fwd.ok ? fwd.script : '',
     forwardError: fwd.error || '',
+    forwardIxId: fwd.ixId || ixId || null,
+    forwardRoutes: fwd.routes || [],
     server: publicServer(state.server),
     nodes: nodes.ensureNodes(state).map((n) => enrichNodePublic(n)),
   });

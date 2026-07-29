@@ -108,8 +108,10 @@ state.topology.landings.push(
     name: '落地2',
     homeReachableHost: '5.6.7.8',
     listenPort: 7902,
+    ixId: 'ix-2', // 必须显式绑第二台，否则 ensure 会落到第一台、脚本不得串台
   })
 );
+topology.ensureTopology(state);
 const fwd = topology.buildIxForwardScript(state, {
   ixId: 'ix-2',
   landingId: 'landing-2',
@@ -118,6 +120,7 @@ const fwd = topology.buildIxForwardScript(state, {
 assert.ok(fwd.ok, fwd.error);
 assert.ok(fwd.script.includes('7902'));
 assert.ok(fwd.script.includes('5.6.7.8'));
+assert.ok(fwd.script.includes('ixId=ix-2'));
 ok('multi-IX forward script targets landing host/port');
 
 // 3) clientsForNode filter
@@ -934,6 +937,101 @@ ok('publicTopology per-IX ingress/endpoints');
   assert.ok(src.includes("const VERSION = '4.3.3'"));
   assert.ok(src.includes('agentTargetVersion'));
   ok('agent 4.3.3 bundle present');
+}
+
+
+// 25) second IX forward script must NOT equal first IX script
+{
+  const st = {
+    server: { listenPort: 7901, protocol: 'TCP' },
+    clients: [],
+    nodes: [],
+    topology: {
+      profile: 'cm-ix-home',
+      ingress: {
+        active: 'external',
+        port: 7901,
+        protocol: 'TCP',
+        externalHost: '114.1.1.1',
+        mobileHost: '211.1.1.1',
+      },
+      ixes: [
+        topology.defaultIx({
+          id: 'ix-1',
+          name: 'NB,CM5',
+          lanIp: '172.16.2.79',
+          portMin: 7900,
+          portMax: 7999,
+          ingress: {
+            active: 'external',
+            externalHost: '114.111.176.37',
+            mobileHost: '211.136.162.184',
+          },
+        }),
+        topology.defaultIx({
+          id: 'ix-2',
+          name: 'IX2',
+          lanIp: '172.16.2.80',
+          portMin: 10400,
+          portMax: 10499,
+          ingress: {
+            active: 'external',
+            externalHost: '114.2.2.2',
+            mobileHost: '211.2.2.2',
+          },
+        }),
+      ],
+      landings: [
+        topology.defaultLanding({
+          id: 'l1',
+          name: 'NB.JP',
+          nodeId: 'n1',
+          ixId: 'ix-1',
+          listenPort: 7901,
+          homeReachableHost: '82.22.26.185',
+        }),
+        topology.defaultLanding({
+          id: 'l2',
+          name: 'pro3',
+          nodeId: 'n2',
+          ixId: 'ix-1',
+          listenPort: 7902,
+          homeReachableHost: '68.252.208.114',
+        }),
+      ],
+    },
+  };
+  topology.ensureTopology(st);
+  const s1 = topology.buildIxForwardScript(st, { ixId: 'ix-1' });
+  assert.ok(s1.ok);
+  assert.ok(s1.script.includes('ixId=ix-1'));
+  assert.ok(s1.script.includes('7901'));
+  // 第二台无落地：不得回落生成第一台脚本
+  const s2empty = topology.buildIxForwardScript(st, { ixId: 'ix-2' });
+  assert.strictEqual(s2empty.ok, false, 'ix2 without landings must fail');
+  assert.ok(!s2empty.script, 'ix2 must not return first ix script');
+  assert.ok(String(s2empty.error || '').includes('没有绑定落地') || String(s2empty.error || '').includes('落地'));
+  // 跨 IX 的 landingId 不得把第一台规则写进第二台
+  const s2cross = topology.buildIxForwardScript(st, { ixId: 'ix-2', landingId: 'l1', port: 7901 });
+  assert.strictEqual(s2cross.ok, false);
+  assert.ok(!s2cross.script);
+  // 把 pro3 绑到第二台并改 10400
+  st.topology.landings[1].ixId = 'ix-2';
+  st.topology.landings[1].listenPort = 10400;
+  st.topology.landings[1].homeReachablePort = 10400;
+  topology.ensureTopology(st);
+  const s2 = topology.buildIxForwardScript(st, { ixId: 'ix-2' });
+  assert.ok(s2.ok, s2.error);
+  assert.ok(s2.script.includes('ixId=ix-2'));
+  assert.ok(s2.script.includes('10400'));
+  assert.ok(s2.script.includes('68.252.208.114'));
+  assert.ok(!s2.script.includes('dport 7901'), 'ix2 script must not DNAT 7901');
+  assert.notStrictEqual(s1.script, s2.script);
+  // 未知 ixId
+  const sBad = topology.buildIxForwardScript(st, { ixId: 'ix-nope' });
+  assert.strictEqual(sBad.ok, false);
+  assert.ok(!sBad.script);
+  ok('second IX forward script isolated from first');
 }
 
 console.log('\nsmoke-v4: all passed');

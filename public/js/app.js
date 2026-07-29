@@ -16,6 +16,7 @@ const state = {
   installCommand: '',
   exitOverview: null,
   forwardScript: '',
+  forwardScriptIxId: null,
   selectedIxId: null,
   selectedLandingId: null,
   expandedLandingId: null,
@@ -1640,8 +1641,20 @@ async function renderTopology() {
         <button class="btn btn-sm btn-secondary" id="t-copy-script" ${script ? '' : 'disabled'} title="复制脚本到剪贴板">复制脚本</button>
         <a class="btn btn-sm btn-secondary" id="t-dl-script" href="/api/topology/forward-script?download=1" title="下载 .sh 文件">下载 .sh</a>
       </div>
+      ${
+        !sideLandings.length
+          ? `<div class="alert warn compact" style="margin-top:10px"><div>
+              <strong>本 IX「${esc(ix.name || '')}」下没有落地</strong>
+              · 到「落地」页把落地所属 IX 改成「${esc(ix.name || '')}」，端口设在 ${esc(portMin)}–${esc(portMax)}，再回来生成脚本。
+              否则会误用其它 IX 的规则。
+            </div></div>`
+          : ''
+      }
+      <p class="field-hint">当前脚本所属：<strong>${esc(ix.name || '—')}</strong> · id <code class="mono">${esc(ix.id || '')}</code> · 段 ${esc(portMin)}–${esc(portMax)}</p>
       <pre class="code-block" id="t-script" style="margin-top:10px;max-height:320px;overflow:auto">${esc(
-        script || '（先填家宽可达地址，再点「生成/刷新转发脚本」）'
+        script && state.forwardScriptIxId && state.forwardScriptIxId !== ix.id
+          ? '（已切换 IX，请重新点「生成/刷新转发脚本」）'
+          : script || '（本 IX 绑定落地并填家宽可达后，点「生成/刷新转发脚本」）'
       )}</pre>
       </div>
     </div>
@@ -1672,6 +1685,7 @@ async function renderTopology() {
         state.selectedIxId = b.dataset.ixTab;
         state.selectedLandingId = null;
         state.forwardScript = '';
+        state.forwardScriptIxId = null;
         saveUiPrefs({ selectedIxId: state.selectedIxId });
         syncHashFromState();
         render();
@@ -1847,19 +1861,20 @@ async function renderTopology() {
       list.push({
         id: nid,
         name: ixNameNew,
-        lanIp: '172.16.2.79',
+        lanIp: '',
         sshPort: 7900,
-        portMin: 7900,
-        portMax: 7999,
+        // 新 IX 默认空段提示用户改；用 10400 段作第二台常见默认避免与第一台 7900 撞车
+        portMin: 10400,
+        portMax: 10499,
         forwardConfigured: false,
         homeReachableHost: '',
-        homeReachablePort: Number(val('t-port')) || 7901,
+        homeReachablePort: 10400,
         ingress: {
-          active: 'external',
-          externalHost: val('t-ext') || '',
-          mobileHost: val('t-mob') || '',
+          active: 'mobile',
+          externalHost: '',
+          mobileHost: '',
           customHost: '',
-          provinceWhitelist: val('t-province') || '',
+          provinceWhitelist: '',
         },
       });
       await api('/api/topology', { method: 'PUT', body: { ixes: list } });
@@ -1921,16 +1936,32 @@ async function renderTopology() {
   document.getElementById('t-load-script').onclick = async () => {
     try {
       await saveCurrentIx(activeChoice);
-      const qs = scriptQs();
+      // 以当前选中 IX 为准（防闭包旧 ix / 全局缓存串台）
+      const cur = currentIx() || ix;
+      const landingId = document.getElementById('t-landing-sel')?.value || '';
+      const port = Number(val('t-fwd-port')) || '';
+      const q = new URLSearchParams();
+      if (cur?.id) q.set('ixId', cur.id);
+      if (landingId) q.set('landingId', landingId);
+      if (port) q.set('port', String(port));
+      const qs = q.toString();
       const topoRes = await api('/api/topology' + (qs ? '?' + qs : ''));
-      state.forwardScript = topoRes.forwardScript || '';
       state.topology = topoRes.topology;
+      // 校验返回脚本是否属于当前 IX（文件头含 ixId=）
+      let script = topoRes.forwardScript || '';
+      if (script && cur?.id && !script.includes(`ixId=${cur.id}`) && !script.includes(cur.name || '___none___')) {
+        script = '';
+        toast('脚本与当前 IX 不匹配，已丢弃；请确认落地绑定后重试', 'err');
+      }
+      state.forwardScript = script;
+      state.forwardScriptIxId = cur?.id || null;
       const a = document.getElementById('t-dl-script');
       if (a) a.href = '/api/topology/forward-script?download=1&' + qs;
-      if (!topoRes.forwardScript) {
-        toast(topoRes.forwardError || '请先填家宽可达地址', 'err');
+      if (!script) {
+        toast(topoRes.forwardError || '本 IX 无可用脚本：检查落地是否绑定本 IX、家宽可达、端口段', 'err');
       } else {
-        toast('脚本已生成');
+        const nRules = (script.match(/dnat to/g) || []).length || (script.match(/DNAT --to-destination/g) || []).length;
+        toast(`「${cur?.name || 'IX'}」脚本已生成（${nRules || '?'} 条 DNAT）`);
       }
       render();
     } catch (e) {
@@ -1940,20 +1971,37 @@ async function renderTopology() {
 
   document.getElementById('t-copy-script').onclick = async () => {
     try {
-      if (!state.forwardScript) {
-        const qs = scriptQs();
-        const topoRes = await api('/api/topology' + (qs ? '?' + qs : ''));
+      const cur = currentIx() || ix;
+      if (!state.forwardScript || (state.forwardScriptIxId && cur?.id && state.forwardScriptIxId !== cur.id)) {
+        const q = new URLSearchParams();
+        if (cur?.id) q.set('ixId', cur.id);
+        const lid = document.getElementById('t-landing-sel')?.value || '';
+        if (lid) q.set('landingId', lid);
+        const port = Number(val('t-fwd-port')) || '';
+        if (port) q.set('port', String(port));
+        const topoRes = await api('/api/topology' + (q.toString() ? '?' + q.toString() : ''));
         state.forwardScript = topoRes.forwardScript || '';
+        state.forwardScriptIxId = cur?.id || null;
+        if (!state.forwardScript) {
+          toast(topoRes.forwardError || '无脚本可复制', 'err');
+          return;
+        }
       }
       await copyText(state.forwardScript);
-      toast('已复制转发脚本');
+      toast(`已复制「${(currentIx() || ix)?.name || 'IX'}」转发脚本`);
     } catch (e) {
       toast(e.message, 'err');
     }
   };
 
   const dl = document.getElementById('t-dl-script');
-  if (dl) dl.href = '/api/topology/forward-script?download=1&' + scriptQs();
+  if (dl) {
+    const q = new URLSearchParams();
+    if (ix.id) q.set('ixId', ix.id);
+    const lid = document.getElementById('t-landing-sel')?.value || state.selectedLandingId || '';
+    if (lid) q.set('landingId', lid);
+    dl.href = '/api/topology/forward-script?download=1&' + q.toString();
+  }
 
   document.getElementById('topo-diag').onclick = () => {
     navigate('diagnose');

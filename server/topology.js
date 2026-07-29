@@ -460,11 +460,14 @@ function ensureTopology(state) {
   return state.topology;
 }
 
-function getIx(state, ixId) {
+function getIx(state, ixId, opts = {}) {
   ensureTopology(state);
+  const strict = Boolean(opts && opts.strict);
   if (ixId) {
     const found = state.topology.ixes.find((x) => x.id === ixId);
     if (found) return found;
+    // 显式传了 ixId 却找不到：禁止静默回落到第一台（否则第二台脚本=第一台）
+    if (strict) return null;
   }
   return state.topology.ixes[0] || null;
 }
@@ -564,13 +567,32 @@ function portInMerchantRange(port, ixOrMin = null, max = null) {
  */
 function buildIxForwardScript(state, opts = {}) {
   ensureTopology(state);
-  const ix = getIx(state, opts.ixId);
+  const wantIxId = opts.ixId ? String(opts.ixId) : '';
+  // 显式 ixId 必须命中；禁止回落到第一台导致「第二台脚本和第一台一样」
+  const ix = wantIxId ? getIx(state, wantIxId, { strict: true }) : getIx(state, null);
+  if (wantIxId && !ix) {
+    return {
+      ok: false,
+      error: `找不到 IX（id=${wantIxId}），请刷新拓扑后重试`,
+      script: '',
+      ixId: wantIxId,
+      routes: [],
+    };
+  }
   const lanIp = ix?.lanIp || CM_DEFAULTS.ixLanIp;
   const ixName = ix?.name || 'IX';
-  const focusLanding = opts.landingId ? getLanding(state, opts.landingId) : null;
+  const ixId = ix?.id || null;
+  let focusLanding = opts.landingId ? getLanding(state, opts.landingId) : null;
+  // 焦点落地必须属于本 IX，禁止把第一台落地塞进第二台脚本
+  if (focusLanding) {
+    const focusIx = focusLanding.ixId || state.topology.ixes[0]?.id || null;
+    if (ixId && focusIx && focusIx !== ixId) {
+      focusLanding = null;
+    }
+  }
 
   // 同 IX 全部落地一起写规则，避免 nft 整表删除后只剩一条
-  let targets = landingsForIx(state, ix?.id).map((L) => {
+  let targets = landingsForIx(state, ixId).map((L) => {
     const isFocus = focusLanding && L.id === focusLanding.id;
     const listenPort = clampPort(
       isFocus && opts.port ? opts.port : L.listenPort || state.topology.ingress.port,
@@ -639,6 +661,7 @@ function buildIxForwardScript(state, opts = {}) {
   }
 
   if (!targets.length && focusLanding) {
+    // 仅当焦点落地确属本 IX（上文已过滤跨 IX）
     const listenPort = clampPort(
       opts.port || focusLanding.listenPort || state.topology.ingress.port,
       7901
@@ -660,13 +683,24 @@ function buildIxForwardScript(state, opts = {}) {
     ];
   }
 
+  if (!targets.length) {
+    return {
+      ok: false,
+      error: `IX「${ixName}」下没有绑定落地。请到「落地」页把落地「所属 IX」设为「${ixName}」，并设置本 IX 端口段内的监听端口（如 10400）`,
+      script: '',
+      ixId,
+      landingId: focusLanding?.id || null,
+      routes: [],
+    };
+  }
+
   const ready = targets.filter((x) => x.homeHost);
   if (!ready.length) {
     return {
       ok: false,
-      error: '请先填写各落地的「家宽对 IX 可达地址」（落地页展开保存）',
+      error: `IX「${ixName}」下落地未填「家宽可达地址」。落地页展开填写后保存，再生成脚本`,
       script: '',
-      ixId: ix?.id,
+      ixId,
       landingId: focusLanding?.id,
       routes: targets,
     };
@@ -687,10 +721,12 @@ function buildIxForwardScript(state, opts = {}) {
   const mob =
     (ix && getIxIngress(ix, state.topology.ingress).mobileHost) || CM_DEFAULTS.mobileIngress;
 
+  const rangeLabel = `${ix?.portMin || CM_DEFAULTS.portMin}-${ix?.portMax || CM_DEFAULTS.portMax}`;
   const lines = [
     '#!/usr/bin/env bash',
     `# ${ixName} → 多落地 TCP 转发（商家 IX 前置 · v4.1）`,
-    `# 在 IX 本机 root 执行（内网 ${lanIp}）`,
+    `# ixId=${ixId || ''} · 端口段 ${rangeLabel} · 内网 ${lanIp || '（未填）'}`,
+    `# 务必在「${ixName}」这台 IX 上执行；不要用第一台的脚本覆盖第二台`,
     '# 一次性写入本 IX 下全部已填可达地址的落地，避免只配一台时清掉其它端口',
     '#',
     '# 推荐整段执行：',
@@ -799,7 +835,7 @@ function buildIxForwardScript(state, opts = {}) {
     homeHost: focus?.homeHost,
     homePort: focus?.homePort,
     lanIp,
-    ixId: ix?.id,
+    ixId,
     landingId: focusLanding?.id || focus?.id,
     routes: ready,
     conflicts,

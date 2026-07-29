@@ -1424,7 +1424,7 @@ async function renderTopology() {
     landing.homeReachablePort || landing.listenPort || ix.homeReachablePort || t.ingress?.port || 7901;
   const portMin = ix.portMin || 7900;
   const portMax = ix.portMax || 7999;
-  const active = ing.active || 'external';
+  const active = ing.active || 'mobile';
 
   app.innerHTML = shell(`
     <div class="page-header">
@@ -1434,7 +1434,7 @@ async function renderTopology() {
       </div>
       <div class="btn-row">
         <button class="btn btn-primary" id="topo-save" title="保存当前 IX 的前置/机器/落地转发参数">保存本 IX</button>
-        <button class="btn btn-ghost" id="topo-adv-toggle" title="显示/隐藏机器、落地列表与转发脚本">${state.topoAdvancedOpen ? '收起进阶' : '进阶设置'}</button>
+        <button class="btn btn-secondary" id="topo-jump-script" title="跳到转发脚本">转发脚本</button>
         <button class="btn btn-ghost" id="topo-diag" title="检查入口、转发与落地状态">诊断</button>
       </div>
     </div>
@@ -1512,7 +1512,6 @@ async function renderTopology() {
     </div>
 
     <div class="mod" style="margin-top:16px">
-      <div class="mod topo-adv ${state.topoAdvancedOpen ? '' : 'is-collapsed'}" data-topo-adv>
       <div class="mod-head">
         <h3><span class="mod-num">2</span> 本 IX 机器</h3>
         <button class="btn btn-sm btn-danger" id="t-del-ix" ${ixes.length <= 1 ? 'disabled' : ''} title="删除当前 IX（至少保留一台）">删除本 IX</button>
@@ -1526,7 +1525,7 @@ async function renderTopology() {
         </div>
         <div>
           <label>内网 IP</label>
-          <input class="field mono" id="t-ix-lan" value="${esc(ix.lanIp || '172.16.2.79')}" />
+          <input class="field mono" id="t-ix-lan" value="${esc(ix.lanIp || '')}" placeholder="IX 内网 IP（如有）" />
         </div>
         <div>
           <label>SSH 端口</label>
@@ -1540,7 +1539,7 @@ async function renderTopology() {
       </div>
     </div>
 
-    <div class="mod topo-adv ${state.topoAdvancedOpen ? '' : 'is-collapsed'}" data-topo-adv style="margin-top:16px">
+    <div class="mod" style="margin-top:16px">
       <div class="mod-head">
         <h3><span class="mod-num">3</span> 本 IX 落地（${sideLandings.length}）</h3>
         <button class="btn btn-sm btn-secondary" data-nav-jump="server" title="打开落地列表与详情">管理落地</button>
@@ -1573,12 +1572,13 @@ async function renderTopology() {
       </div>
     </div>
 
-    <div class="mod topo-adv ${state.topoAdvancedOpen ? '' : 'is-collapsed'}" data-topo-adv style="margin-top:16px">
+    <div class="mod" id="topo-forward-script" style="margin-top:16px">
       <div class="mod-head">
         <h3><span class="mod-num">4</span> 转发脚本（本 IX → 落地）</h3>
         <span class="badge ${ix.forwardConfigured ? 'ok' : 'warn'}">${ix.forwardConfigured ? '已标记' : '未配置'}</span>
       </div>
       <div class="mod-body">
+      <p class="field-hint" style="margin-top:0">在 <strong>IX 机器 root</strong> 整文件执行下方脚本（DNAT：前置端口 → 家宽 mita）。改端口/落地后重新生成。</p>
       <div class="inline-fields">
         <div>
           <label>目标落地</label>
@@ -1615,8 +1615,8 @@ async function renderTopology() {
         <button class="btn btn-sm btn-secondary" id="t-copy-script" ${script ? '' : 'disabled'} title="复制脚本到剪贴板">复制脚本</button>
         <a class="btn btn-sm btn-secondary" id="t-dl-script" href="/api/topology/forward-script?download=1" title="下载 .sh 文件">下载 .sh</a>
       </div>
-      <pre class="code-block" id="t-script" style="margin-top:10px;max-height:220px;overflow:auto">${esc(
-        script || '（先填家宽可达地址并生成）'
+      <pre class="code-block" id="t-script" style="margin-top:10px;max-height:320px;overflow:auto">${esc(
+        script || '（先填家宽可达地址，再点「生成/刷新转发脚本」）'
       )}</pre>
       </div>
     </div>
@@ -1925,10 +1925,9 @@ async function renderTopology() {
   document.getElementById('topo-diag').onclick = () => {
     navigate('diagnose');
   };
-  document.getElementById('topo-adv-toggle')?.addEventListener('click', () => {
-    state.topoAdvancedOpen = !state.topoAdvancedOpen;
-    saveUiPrefs({ topoAdvancedOpen: state.topoAdvancedOpen });
-    renderTopology();
+  document.getElementById('topo-jump-script')?.addEventListener('click', () => {
+    document.getElementById('topo-forward-script')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    document.getElementById('t-load-script')?.focus();
   });
 }
 

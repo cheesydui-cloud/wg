@@ -233,7 +233,7 @@ git clone https://github.com/cheesydui-cloud/wg.git ~/wg
 cd ~/wg && sudo bash install.sh
 ```
 
-打开 `http://面板IP:51821`，确认版本 **v4.6.0**。
+打开 `http://面板IP:51821`，确认版本 **v4.6.1**。
 
 忘记密码：
 

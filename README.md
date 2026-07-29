@@ -3,7 +3,7 @@
 中文、新手友好的 **mieru / mita 拓扑出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v4.5.0**（Premium Ops Console · OLED Glass · ui-ux-pro-max）
+当前版本：**v4.6.0**（Ops UX 全量：SVG 导航 · 路由 · 状态条 · 批量 · 指挥台）
 
 - 每台 IX 独立商家前置（IP/域名）与端口段
 - 拓扑 = IX 工作台；落地列表点开详情；客户端按落地分组
@@ -31,6 +31,11 @@
 | **兼容 v3.1** | 单前置 / 单 IX / 单落地自动迁成一条路由，Endpoint 保留 |
 
 路径保持不变。业务流量不经面板。
+
+### v4.6.0
+
+- **Ops UX 全量（前端）**：SVG 侧栏图标；全局运维状态条；每页主 CTA 收敛；Hash 路由 `#/clients` 等 + session 筛选持久；客户端勾选批量启用/禁用 + 行内分享/更多；概览指挥台（待处理/落地/最近用户）；拓扑进阶折叠；分享复制反馈 + YAML 文件名；Confirm 弹窗；诊断「去修复」；设置 Agent 版本矩阵；快捷键 `g`+`d/t/s/c/i/e`、`/` 搜索；移动底栏 4+更多。
+- **仅面板需升到 4.6.0**；Agent 逻辑无改动，仍可用 4.3.2。
 
 ### v4.5.0
 
@@ -219,7 +224,7 @@ git clone https://github.com/cheesydui-cloud/wg.git ~/wg
 cd ~/wg && sudo bash install.sh
 ```
 
-打开 `http://面板IP:51821`，确认版本 **v4.5.0**。
+打开 `http://面板IP:51821`，确认版本 **v4.6.0**。
 
 忘记密码：
 

@@ -27,7 +27,222 @@ const state = {
   clientsFilter: 'all', // all | on | off | warn
   clientsQuery: '',
   clientsExpandedId: null,
+  clientsSelected: {}, // id -> true
+  clientsBulkMode: false,
+  topoAdvancedOpen: false,
+  opsBarOpen: false,
+  moreNavOpen: false,
 };
+
+const PAGES = new Set(['dashboard', 'topology', 'server', 'clients', 'diagnose', 'settings']);
+const SS_KEY = 'mieru-ops-ui';
+
+function loadUiPrefs() {
+  try {
+    return JSON.parse(sessionStorage.getItem(SS_KEY) || '{}') || {};
+  } catch {
+    return {};
+  }
+}
+function saveUiPrefs(patch) {
+  try {
+    const cur = loadUiPrefs();
+    Object.assign(cur, patch);
+    sessionStorage.setItem(SS_KEY, JSON.stringify(cur));
+  } catch {
+    /* ignore */
+  }
+}
+function restoreUiPrefs() {
+  const p = loadUiPrefs();
+  if (p.clientsFilter) state.clientsFilter = p.clientsFilter;
+  if (p.clientsQuery != null) state.clientsQuery = p.clientsQuery;
+  if (p.clientsTabId) state.clientsTabId = p.clientsTabId;
+  if (p.selectedIxId) state.selectedIxId = p.selectedIxId;
+  if (p.topoAdvancedOpen != null) state.topoAdvancedOpen = Boolean(p.topoAdvancedOpen);
+}
+
+/** Lucide-style inline SVG icons (stroke 1.75) */
+const ICONS = {
+  dashboard: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>`,
+  topology: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M8.2 7.5 10.5 15M15.8 7.5 13.5 15M8.5 6h7"/></svg>`,
+  server: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><circle cx="7" cy="7" r="1" fill="currentColor" stroke="none"/><circle cx="7" cy="17" r="1" fill="currentColor" stroke="none"/></svg>`,
+  clients: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="3.5"/><path d="M22 21v-2a3.5 3.5 0 0 0-2.5-3.35"/><path d="M16 3.2a3.5 3.5 0 0 1 0 6.6"/></svg>`,
+  diagnose: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 12 11 14 15.5 9.5"/><path d="M20 12a8 8 0 1 1-3.2-6.4"/><path d="M20 4v4h-4"/></svg>`,
+  settings: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9c.26.6.9 1 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1z"/></svg>`,
+  more: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="5" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="19" r="1.5" fill="currentColor" stroke="none"/></svg>`,
+  check: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>`,
+  alert: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>`,
+};
+
+function icon(name) {
+  return ICONS[name] || ICONS.dashboard;
+}
+
+function parseHashRoute() {
+  const raw = (location.hash || '').replace(/^#\/?/, '');
+  if (!raw) return null;
+  const [pathPart, qs] = raw.split('?');
+  const page = (pathPart || '').split('/')[0];
+  if (!PAGES.has(page)) return null;
+  const params = {};
+  if (qs) {
+    qs.split('&').forEach((pair) => {
+      const [k, v] = pair.split('=');
+      if (k) params[decodeURIComponent(k)] = decodeURIComponent(v || '');
+    });
+  }
+  return { page, params };
+}
+
+function syncHashFromState() {
+  const parts = [state.page];
+  const q = [];
+  if (state.page === 'topology' && state.selectedIxId) q.push(`ix=${encodeURIComponent(state.selectedIxId)}`);
+  if (state.page === 'server' && state.expandedLandingId) q.push(`node=${encodeURIComponent(state.expandedLandingId)}`);
+  if (state.page === 'clients') {
+    if (state.clientsTabId) q.push(`tab=${encodeURIComponent(state.clientsTabId)}`);
+    if (state.clientsFilter && state.clientsFilter !== 'all') q.push(`f=${encodeURIComponent(state.clientsFilter)}`);
+    if (state.clientsQuery) q.push(`q=${encodeURIComponent(state.clientsQuery)}`);
+  }
+  const next = '#/' + parts[0] + (q.length ? '?' + q.join('&') : '');
+  if (location.hash !== next) {
+    history.replaceState(null, '', next);
+  }
+}
+
+function applyRoute(route, { renderNow = false } = {}) {
+  if (!route || !PAGES.has(route.page)) return;
+  state.page = route.page;
+  const p = route.params || {};
+  if (p.ix) state.selectedIxId = p.ix;
+  if (p.node) state.expandedLandingId = p.node;
+  if (p.tab) state.clientsTabId = p.tab;
+  if (p.f) state.clientsFilter = p.f;
+  if (p.q != null && p.q !== '') state.clientsQuery = p.q;
+  if (renderNow && state.status?.loggedIn) render();
+}
+
+function navigate(page, params = {}) {
+  if (!PAGES.has(page)) return;
+  state.page = page;
+  if (params.ix) state.selectedIxId = params.ix;
+  if (params.node) state.expandedLandingId = params.node;
+  if (params.tab) state.clientsTabId = params.tab;
+  if (params.f) state.clientsFilter = params.f;
+  if (params.q != null) state.clientsQuery = params.q;
+  if (params.clearClientsSel) state.clientsSelected = {};
+  syncHashFromState();
+  saveUiPrefs({
+    clientsFilter: state.clientsFilter,
+    clientsQuery: state.clientsQuery,
+    clientsTabId: state.clientsTabId,
+    selectedIxId: state.selectedIxId,
+    topoAdvancedOpen: state.topoAdvancedOpen,
+  });
+  render();
+}
+
+function confirmModal({ title, body, confirmText = '确认', danger = false, cancelText = '取消' }) {
+  return new Promise((resolve) => {
+    const root = document.getElementById('modal-root') || document.body;
+    const wrap = el(`
+      <div class="modal-backdrop" role="dialog" aria-modal="true">
+        <div class="modal confirm-modal">
+          <div class="modal-header">
+            <h3>${esc(title || '确认')}</h3>
+            <button type="button" class="btn btn-sm btn-ghost" data-cancel aria-label="关闭">✕</button>
+          </div>
+          <div class="modal-body"><p class="confirm-body">${body || ''}</p></div>
+          <div class="modal-foot btn-row" style="justify-content:flex-end;gap:8px;margin-top:16px">
+            <button type="button" class="btn btn-ghost" data-cancel>${esc(cancelText)}</button>
+            <button type="button" class="btn ${danger ? 'btn-danger' : 'btn-primary'}" data-ok>${esc(confirmText)}</button>
+          </div>
+        </div>
+      </div>`);
+    const done = (v) => {
+      wrap.remove();
+      resolve(v);
+    };
+    wrap.querySelectorAll('[data-cancel]').forEach((b) => (b.onclick = () => done(false)));
+    wrap.querySelector('[data-ok]').onclick = () => done(true);
+    wrap.addEventListener('click', (e) => {
+      if (e.target === wrap) done(false);
+    });
+    root.appendChild(wrap);
+    wrap.querySelector('[data-ok]')?.focus();
+  });
+}
+
+function opsStatusSummary() {
+  const items = typeof collectAlertItems === 'function' ? collectAlertItems() : [];
+  const dirtyNodes = (state.nodes || []).filter((n) => n.dirty).length + (state.dirty ? 1 : 0);
+  const offline = (state.nodes || []).filter((n) => !n.online).length;
+  const outdated = (state.nodes || []).filter((n) => n.online && n.agentOutdated).length;
+  const blocked = (state.clients || []).filter((c) => c.statusFlags?.expired || c.statusFlags?.overQuota).length;
+  return { items, dirtyNodes, offline, outdated, blocked, count: items.length };
+}
+
+function opsStatusBarHtml() {
+  const s = opsStatusSummary();
+  if (!s.count && !s.dirtyNodes) return '';
+  const chips = [];
+  if (s.dirtyNodes)
+    chips.push(`<button type="button" class="ops-chip warn" data-ops-act="apply" title="有未应用更改">未应用 ${s.dirtyNodes}</button>`);
+  if (s.offline)
+    chips.push(`<button type="button" class="ops-chip" data-ops-act="server" title="落地离线">离线 ${s.offline}</button>`);
+  if (s.outdated)
+    chips.push(`<button type="button" class="ops-chip" data-ops-act="server" title="Agent 待更新">Agent ${s.outdated}</button>`);
+  if (s.blocked)
+    chips.push(`<button type="button" class="ops-chip" data-ops-act="clients-warn" title="到期/超额">到期 ${s.blocked}</button>`);
+  if (!chips.length && s.items[0]) {
+    chips.push(`<span class="ops-chip">${esc(s.items[0].title)}</span>`);
+  }
+  const open = state.opsBarOpen ? 'open' : '';
+  const list = s.items
+    .map(
+      (it) => `<div class="ops-item ${esc(it.level || '')}">
+      <div><strong>${esc(it.title)}</strong>${it.detail ? ` · ${esc(it.detail)}` : ''}</div>
+      <div class="ops-item-actions">${it.actions || ''}</div>
+    </div>`
+    )
+    .join('');
+  return `<div class="ops-bar ${open}">
+    <div class="ops-bar-main">
+      <span class="ops-bar-label"><span class="ops-ico">${icon('alert')}</span> 运维状态</span>
+      <div class="ops-chips">${chips.join('')}</div>
+      <div class="ops-bar-actions">
+        ${
+          s.dirtyNodes
+            ? `<button type="button" class="btn btn-sm btn-success" id="ops-apply" title="下发配置到落地 mita">应用配置</button>`
+            : ''
+        }
+        <button type="button" class="btn btn-sm btn-ghost" id="ops-toggle">${state.opsBarOpen ? '收起' : `明细 ${s.count}`}</button>
+      </div>
+    </div>
+    <div class="ops-bar-detail">${list}</div>
+  </div>`;
+}
+
+function bindOpsBar() {
+  document.getElementById('ops-toggle')?.addEventListener('click', () => {
+    state.opsBarOpen = !state.opsBarOpen;
+    render();
+  });
+  document.getElementById('ops-apply')?.addEventListener('click', () => applyConfig(true, { all: true }));
+  document.querySelectorAll('[data-ops-act]').forEach((b) => {
+    b.onclick = () => {
+      const a = b.dataset.opsAct;
+      if (a === 'apply') return applyConfig(true, { all: true });
+      if (a === 'server') return navigate('server');
+      if (a === 'clients-warn') {
+        state.clientsFilter = 'warn';
+        return navigate('clients');
+      }
+    };
+  });
+}
+
 
 async function api(path, options = {}) {
   const opts = {
@@ -371,7 +586,7 @@ function collectAlertItems() {
       level: 'warn',
       title: `${blocked.length} 个用户到期/超额`,
       detail: '',
-      actions: `<button class="btn btn-sm btn-primary" data-nav-jump="clients">去客户端</button>`,
+      actions: `<button class="btn btn-sm btn-primary" data-nav-jump="clients" data-filter="warn">去客户端</button>`,
     });
   }
   if (state.status?.legacyWireGuard) {
@@ -416,8 +631,7 @@ function topAlerts() {
 function bindTopAlerts() {
   document.getElementById('banner-apply')?.addEventListener('click', () => applyConfig(true));
   document.getElementById('banner-diagnose')?.addEventListener('click', () => {
-    state.page = 'diagnose';
-    render();
+    navigate('diagnose');
   });
   document.getElementById('banner-poll')?.addEventListener('click', async () => {
     await refreshCore().catch(() => {});
@@ -453,8 +667,9 @@ function bindTopAlerts() {
   });
   document.querySelectorAll('[data-nav-jump]').forEach((b) => {
     b.onclick = () => {
-      state.page = b.dataset.navJump;
-      render();
+      const page = b.dataset.navJump;
+      if (page === 'clients' && b.dataset.filter) state.clientsFilter = b.dataset.filter;
+      navigate(page);
     };
   });
 }
@@ -583,16 +798,21 @@ function renderLogin() {
 }
 
 function shell(content) {
-  const nav = [
-    ['dashboard', '概览', '◈'],
-    ['topology', '拓扑', '⇄'],
-    ['server', '落地', '◎'],
-    ['clients', '客户端', '◉'],
-    ['diagnose', '诊断', '✎'],
-    ['settings', '设置', '⚙'],
+  // Desktop: full nav. Mobile bottom: primary 4 + More (diagnose/settings)
+  const navPrimary = [
+    ['dashboard', '概览', 'dashboard'],
+    ['topology', '拓扑', 'topology'],
+    ['server', '落地', 'server'],
+    ['clients', '客户端', 'clients'],
   ];
+  const navMore = [
+    ['diagnose', '诊断', 'diagnose'],
+    ['settings', '设置', 'settings'],
+  ];
+  const navAll = [...navPrimary, ...navMore];
   const onlineN = (state.nodes || []).filter((n) => n.online).length;
   const totalN = (state.nodes || []).length || (state.primaryNode ? 1 : 0);
+  const moreActive = navMore.some(([id]) => state.page === id);
   return `
     <div class="layout">
       <aside class="sidebar">
@@ -600,24 +820,52 @@ function shell(content) {
           <div class="brand-title">mieru Console</div>
           <div class="brand-sub">v${esc(state.status?.version || '')} · Ops</div>
         </div></div>
-        <nav class="nav">
-          ${nav
+        <nav class="nav nav-desktop">
+          ${navAll
             .map(
               ([id, label, ico]) => `
-            <button class="nav-btn ${state.page === id ? 'active' : ''}" data-nav="${id}">
-              <span class="nav-ico">${ico}</span>
+            <button type="button" class="nav-btn ${state.page === id ? 'active' : ''}" data-nav="${id}" aria-current="${state.page === id ? 'page' : 'false'}">
+              <span class="nav-ico svg-ico">${icon(ico)}</span>
               <span class="nav-label">${label}</span>
             </button>`
             )
             .join('')}
+        </nav>
+        <nav class="nav nav-mobile">
+          ${navPrimary
+            .map(
+              ([id, label, ico]) => `
+            <button type="button" class="nav-btn ${state.page === id ? 'active' : ''}" data-nav="${id}">
+              <span class="nav-ico svg-ico">${icon(ico)}</span>
+              <span class="nav-label">${label}</span>
+            </button>`
+            )
+            .join('')}
+          <div class="nav-more-wrap">
+            <button type="button" class="nav-btn ${moreActive || state.moreNavOpen ? 'active' : ''}" id="nav-more-btn" aria-expanded="${state.moreNavOpen}">
+              <span class="nav-ico svg-ico">${icon('more')}</span>
+              <span class="nav-label">更多</span>
+            </button>
+            <div class="nav-more-pop ${state.moreNavOpen ? 'open' : ''}">
+              ${navMore
+                .map(
+                  ([id, label, ico]) => `
+                <button type="button" class="nav-btn ${state.page === id ? 'active' : ''}" data-nav="${id}">
+                  <span class="nav-ico svg-ico">${icon(ico)}</span>
+                  <span class="nav-label">${label}</span>
+                </button>`
+                )
+                .join('')}
+            </div>
+          </div>
         </nav>
         <div class="sidebar-footer">
           <div class="mode-pill ${isAgentMode() ? 'agent' : 'local'}">${esc(exitLabel())}${totalN ? ` · ${onlineN}/${totalN}` : ''}</div>
           <button class="btn btn-sm btn-secondary btn-block" id="btn-logout" title="退出当前会话">退出登录</button>
         </div>
       </aside>
-      <main class="main">
-        ${topAlerts()}
+      <main class="main" id="main-content">
+        ${opsStatusBarHtml()}
         ${content}
       </main>
     </div>
@@ -626,11 +874,17 @@ function shell(content) {
 
 function bindShell() {
   bindTopAlerts();
+  bindOpsBar();
   document.querySelectorAll('[data-nav]').forEach((b) => {
     b.onclick = () => {
-      state.page = b.dataset.nav;
-      render();
+      state.moreNavOpen = false;
+      navigate(b.dataset.nav);
     };
+  });
+  document.getElementById('nav-more-btn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    state.moreNavOpen = !state.moreNavOpen;
+    render();
   });
   document.getElementById('btn-logout')?.addEventListener('click', async () => {
     await api('/api/logout', { method: 'POST' });
@@ -947,8 +1201,24 @@ async function renderDashboard() {
   const onlineN = nodes.filter((n) => n.online).length;
   const ixN = ixesList().length;
   const blocked = state.clients.filter((c) => c.statusFlags?.expired || c.statusFlags?.overQuota).length;
-  const dirtyN = nodes.filter((n) => n.dirty).length + (state.dirty ? 1 : 0);
-  const recentClients = state.clients.slice(0, 8);
+  const dirtyNodes = nodes.filter((n) => n.dirty);
+  const dirtyN = dirtyNodes.length + (state.dirty ? 1 : 0);
+  const outdated = nodes.filter((n) => n.online && n.agentOutdated);
+  const offline = nodes.filter((n) => !n.online);
+  const expiring = state.clients
+    .filter((c) => {
+      const raw = c.package?.expireAt;
+      if (!raw) return false;
+      const t0 = new Date(raw).getTime();
+      if (!Number.isFinite(t0)) return false;
+      const days = (t0 - Date.now()) / 86400000;
+      return days >= 0 && days <= 7;
+    })
+    .slice(0, 6);
+  const recentClients = state.clients.slice(0, 6);
+  const primaryCta = dirtyN
+    ? `<button class="btn btn-success" id="dash-apply" title="下发配置到全部落地">应用全部 · ${dirtyN}</button>`
+    : `<button class="btn btn-ghost" id="dash-apply" title="当前无未应用更改" disabled>已同步</button>`;
   app.innerHTML = shell(`
     <div class="page-header">
       <div>
@@ -956,10 +1226,9 @@ async function renderDashboard() {
         <p class="muted">客户端 → 前置 → IX → 落地 · 只连前置</p>
       </div>
       <div class="btn-row dash-actions">
-        <button class="btn btn-success" id="dash-apply" title="下发配置到全部落地">应用全部</button>
-        <button class="btn btn-secondary" id="dash-topo" title="配置前置与转发">拓扑</button>
-        <button class="btn btn-secondary" id="dash-clients" title="管理用户">客户端</button>
-        <button class="btn btn-ghost" id="dash-exit" title="在默认落地安装/启动 mita">一键落地</button>
+        ${primaryCta}
+        <button class="btn btn-ghost" id="dash-topo" title="配置前置与转发">拓扑</button>
+        <button class="btn btn-ghost" id="dash-clients" title="管理用户">客户端</button>
       </div>
     </div>
     ${pathBanner(null, { compact: true })}
@@ -980,114 +1249,161 @@ async function renderDashboard() {
         <div class="stat-foot">出网出口状态</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">用户${blocked ? ' · 告警' : ''}</div>
-        <div class="stat-value">${state.clients.length}${
-          blocked ? `<span class="sub warn-text"> · ${blocked}⚠</span>` : ''
+        <div class="stat-label">客户端</div>
+        <div class="stat-value">${state.clients.length}<span class="sub"> 人</span>${
+          blocked ? `<span class="sub warn-text"> · ${blocked} 异常</span>` : ''
         }${dirtyN ? `<span class="sub warn-text"> · 未应用</span>` : ''}</div>
-        <div class="stat-foot">启用 / 到期 / 下发</div>
+        <div class="stat-foot">启用 / 禁用 / 配额</div>
       </div>
     </div>
-    <div class="dash-meta" style="margin-top:14px">
-      监听 <span class="mono">${esc(s.protocol || 'TCP')}:${esc(s.listenPort || 7901)}</span>
-      · 出网 <span class="mono">${esc(ov.exitPublicIp || state.primaryNode?.exitPublicIp || '—')}</span>
-      · 最近应用 ${esc(fmtTime(state.lastAppliedAt))}
-    </div>
+
     <div class="mod-grid two" style="margin-top:16px">
-      ${
-        nodes.length
-          ? `<div class="mod">
-        <div class="mod-head"><h3>落地</h3>
-          <button class="btn btn-sm btn-ghost" data-nav-jump="server">管理</button>
-        </div>
-        <div class="mod-body pad-sm">
-          <div class="dash-list">
-          ${nodes
-            .map((n) => {
-              const L = landingByNodeId(n.id) || {};
-              const port = L.listenPort || n.listenPort || 7901;
-              return `<div class="dash-list-row">
-                <div>
-                  <strong>${esc(n.name)}</strong>
-                  ${n.isPrimary ? '<span class="badge ok">默认</span>' : ''}
-                  ${
-                    n.online
-                      ? '<span class="status-dot ok">在线</span>'
-                      : '<span class="status-dot warn">离线</span>'
-                  }
-                  ${n.dirty ? '<span class="badge warn">未应用</span>' : ''}
-                </div>
-                <div class="muted mono">:${esc(port)} · mita ${esc(n.mita?.status || '-')} · ${
-                  n.clientCount ?? 0
-                } 用户</div>
-              </div>`;
-            })
-            .join('')}
-          </div>
-        </div>
-      </div>`
-          : '<div class="mod"><div class="empty-mod"><strong>还没有落地</strong><p>到「落地」页添加</p></div></div>'
-      }
       <div class="mod">
-        <div class="mod-head"><h3>用户</h3>
-          <button class="btn btn-sm btn-primary" id="dash-add" title="添加客户端用户">添加</button>
+        <div class="mod-head">
+          <h3>待处理</h3>
+          <span class="mod-meta">${dirtyN + offline.length + outdated.length + blocked} 项</span>
         </div>
         <div class="mod-body pad-sm">
-        ${
-          recentClients.length
-            ? `<div class="dash-list">
-            ${recentClients
+          ${
+            !dirtyN && !offline.length && !outdated.length && !blocked && !expiring.length
+              ? `<div class="empty-mod"><strong>一切正常</strong><p>无待应用、离线或到期项</p></div>`
+              : `<div class="cmd-list">
+            ${
+              dirtyN
+                ? `<div class="cmd-row">
+              <div><strong>未应用配置</strong><span class="muted"> · ${dirtyNodes.map((n) => esc(n.name)).join('、') || '面板变更'}</span></div>
+              <button class="btn btn-sm btn-success" id="dash-apply-2">应用</button>
+            </div>`
+                : ''
+            }
+            ${offline
               .map(
-                (c) => `<div class="dash-list-row">
-              <div>
-                <span class="mono">${esc(c.name)}</span>
-                ${c.note ? `<span class="muted" style="font-size:12px"> · ${esc(c.note)}</span>` : ''}
-                ${
-                  c.statusFlags?.expired
-                    ? '<span class="badge warn">到期</span>'
-                    : c.statusFlags?.overQuota
-                      ? '<span class="badge warn">超额</span>'
-                      : c.enabled === false
-                        ? '<span class="badge">停用</span>'
-                        : ''
-                }
-              </div>
-              <div class="dash-list-ops">
-                <span class="muted" style="font-size:12px">${esc(nodeName(c.route?.landingNodeId))}</span>
-                <button class="btn btn-sm btn-primary" data-qr="${c.id}" title="分享">分享</button>
-              </div>
+                (n) => `<div class="cmd-row">
+              <div><strong>${esc(n.name)}</strong><span class="muted"> · Agent 离线</span></div>
+              <button class="btn btn-sm btn-ghost" data-nav-jump="server">查看</button>
+            </div>`
+              )
+              .join('')}
+            ${outdated
+              .map(
+                (n) => `<div class="cmd-row">
+              <div><strong>${esc(n.name)}</strong><span class="muted"> · Agent v${esc(n.agentVersion || '?')} 待更新</span></div>
+              <button class="btn btn-sm btn-ghost" data-nav-jump="server">更新</button>
             </div>`
               )
               .join('')}
             ${
-              state.clients.length > recentClients.length
-                ? `<p class="field-hint" style="margin:8px 0 0">共 ${state.clients.length} 用户 · <a href="#" data-nav-jump="clients">查看全部</a></p>`
+              blocked
+                ? `<div class="cmd-row">
+              <div><strong>${blocked} 用户到期/超额</strong></div>
+              <button class="btn btn-sm btn-ghost" data-nav-jump="clients" data-filter="warn">处理</button>
+            </div>`
                 : ''
             }
+            ${expiring
+              .map(
+                (c) => `<div class="cmd-row">
+              <div><strong class="mono">${esc(c.name)}</strong><span class="muted"> · 7 日内到期</span></div>
+              <button class="btn btn-sm btn-ghost" data-edit-jump="${c.id}">编辑</button>
+            </div>`
+              )
+              .join('')}
           </div>`
-            : '<p class="muted" style="margin:0">还没有用户</p>'
-        }
+          }
         </div>
+      </div>
+
+      <div class="mod">
+        <div class="mod-head">
+          <h3>落地状态</h3>
+          <button class="btn btn-sm btn-ghost" data-nav-jump="server">管理</button>
+        </div>
+        <div class="mod-body pad-sm">
+          ${
+            nodes.length
+              ? `<div class="cmd-list">${nodes
+                  .map(
+                    (n) => `<div class="cmd-row">
+                <div>
+                  <strong>${esc(n.name)}</strong>
+                  <span class="status-dot ${n.online ? 'ok' : 'warn'}">${n.online ? '在线' : '离线'}</span>
+                  ${n.dirty ? '<span class="badge warn">未应用</span>' : ''}
+                  ${n.agentOutdated ? '<span class="badge warn">Agent</span>' : ''}
+                </div>
+                <span class="muted mono">${esc(n.agentVersion || '—')}</span>
+              </div>`
+                  )
+                  .join('')}</div>`
+              : `<div class="empty-mod"><strong>还没有落地</strong><p>到「落地」页添加</p>
+                  <button class="btn btn-sm btn-primary" data-nav-jump="server">去落地</button></div>`
+          }
+        </div>
+      </div>
+    </div>
+
+    <div class="mod" style="margin-top:16px">
+      <div class="mod-head">
+        <h3>最近客户端</h3>
+        <div class="btn-row">
+          <button class="btn btn-sm btn-ghost" data-nav-jump="clients">全部</button>
+          <button class="btn btn-sm btn-primary" id="dash-add" title="添加客户端用户">添加</button>
+        </div>
+      </div>
+      <div class="mod-body pad-sm">
+        ${
+          recentClients.length
+            ? `<div class="utable-wrap"><table class="utable"><thead><tr>
+                <th>登录名</th><th>状态</th><th>端口</th><th>落地</th><th></th>
+              </tr></thead><tbody>
+              ${recentClients
+                .map(
+                  (c) => `<tr data-user-id="${esc(c.id)}">
+                  <td class="cell-user"><div class="name">${esc(c.name)}</div></td>
+                  <td>${clientStatusDot(c)}</td>
+                  <td class="mono">:${esc(effectiveClientPort(c))}</td>
+                  <td class="muted">${esc(nodeName(c.route?.landingNodeId))}</td>
+                  <td class="ops"><button class="btn btn-sm btn-primary" data-qr="${c.id}" title="分享">分享</button></td>
+                </tr>`
+                )
+                .join('')}
+              </tbody></table></div>`
+            : `<div class="empty-mod"><strong>还没有用户</strong><p>添加后分享二维码 / YAML</p>
+                <button class="btn btn-sm btn-primary" id="dash-add-2">添加客户端</button></div>`
+        }
       </div>
     </div>
   `);
   bindShell();
-  document.getElementById('dash-exit').onclick = () => setupExit();
-  document.getElementById('dash-apply').onclick = () => applyConfig(true, { all: true });
-  document.getElementById('dash-topo').onclick = () => {
-    state.page = 'topology';
-    render();
+  document.getElementById('dash-apply')?.addEventListener('click', () => applyConfig(true, { all: true }));
+  document.getElementById('dash-apply-2')?.addEventListener('click', () => applyConfig(true, { all: true }));
+  document.getElementById('dash-topo').onclick = () => navigate('topology');
+  document.getElementById('dash-clients').onclick = () => navigate('clients');
+  const add = () => {
+    if (typeof openClientModal === 'function') openClientModal(null);
+    else navigate('clients');
   };
-  document.getElementById('dash-clients').onclick = () => {
-    state.page = 'clients';
-    render();
-  };
-  document.getElementById('dash-add').onclick = () => openClientModal();
+  document.getElementById('dash-add')?.addEventListener('click', add);
+  document.getElementById('dash-add-2')?.addEventListener('click', add);
   document.querySelectorAll('[data-qr]').forEach((b) => {
-    b.onclick = () => showClientQr(b.dataset.qr);
+    b.onclick = (e) => {
+      e.stopPropagation();
+      showClientQr(b.dataset.qr);
+    };
   });
+  document.querySelectorAll('[data-edit-jump]').forEach((b) => {
+    b.onclick = () => {
+      if (typeof openClientModal === 'function') openClientModal(b.dataset.editJump);
+    };
+  });
+  document.querySelectorAll('[data-nav-jump]').forEach((b) => {
+    b.onclick = () => {
+      if (b.dataset.filter) state.clientsFilter = b.dataset.filter;
+      navigate(b.dataset.navJump);
+    };
+  });
+  syncHashFromState();
 }
 
-/* ========== 拓扑 ========== */
 async function renderTopology() {
   await refreshCore().catch(() => {});
   const t = topo();
@@ -1118,7 +1434,8 @@ async function renderTopology() {
       </div>
       <div class="btn-row">
         <button class="btn btn-primary" id="topo-save" title="保存当前 IX 的前置/机器/落地转发参数">保存本 IX</button>
-        <button class="btn btn-secondary" id="topo-diag" title="检查入口、转发与落地状态">诊断</button>
+        <button class="btn btn-ghost" id="topo-adv-toggle" title="显示/隐藏机器、落地列表与转发脚本">${state.topoAdvancedOpen ? '收起进阶' : '进阶设置'}</button>
+        <button class="btn btn-ghost" id="topo-diag" title="检查入口、转发与落地状态">诊断</button>
       </div>
     </div>
 
@@ -1195,6 +1512,7 @@ async function renderTopology() {
     </div>
 
     <div class="mod" style="margin-top:16px">
+      <div class="mod topo-adv ${state.topoAdvancedOpen ? '' : 'is-collapsed'}" data-topo-adv>
       <div class="mod-head">
         <h3><span class="mod-num">2</span> 本 IX 机器</h3>
         <button class="btn btn-sm btn-danger" id="t-del-ix" ${ixes.length <= 1 ? 'disabled' : ''} title="删除当前 IX（至少保留一台）">删除本 IX</button>
@@ -1222,7 +1540,7 @@ async function renderTopology() {
       </div>
     </div>
 
-    <div class="mod" style="margin-top:16px">
+    <div class="mod topo-adv ${state.topoAdvancedOpen ? '' : 'is-collapsed'}" data-topo-adv style="margin-top:16px">
       <div class="mod-head">
         <h3><span class="mod-num">3</span> 本 IX 落地（${sideLandings.length}）</h3>
         <button class="btn btn-sm btn-secondary" data-nav-jump="server" title="打开落地列表与详情">管理落地</button>
@@ -1255,7 +1573,7 @@ async function renderTopology() {
       </div>
     </div>
 
-    <div class="mod" style="margin-top:16px">
+    <div class="mod topo-adv ${state.topoAdvancedOpen ? '' : 'is-collapsed'}" data-topo-adv style="margin-top:16px">
       <div class="mod-head">
         <h3><span class="mod-num">4</span> 转发脚本（本 IX → 落地）</h3>
         <span class="badge ${ix.forwardConfigured ? 'ok' : 'warn'}">${ix.forwardConfigured ? '已标记' : '未配置'}</span>
@@ -1329,6 +1647,8 @@ async function renderTopology() {
         state.selectedIxId = b.dataset.ixTab;
         state.selectedLandingId = null;
         state.forwardScript = '';
+        saveUiPrefs({ selectedIxId: state.selectedIxId });
+        syncHashFromState();
         render();
       }, 280);
     };
@@ -1530,7 +1850,13 @@ async function renderTopology() {
 
   document.getElementById('t-del-ix')?.addEventListener('click', async () => {
     if (ixes.length <= 1) return;
-    if (!confirm('删除当前 IX？其落地绑定需另行调整。')) return;
+    const ok = await confirmModal({
+      title: '删除 IX',
+      body: `确认删除 <strong>${esc(ix.name || '当前 IX')}</strong>？其落地绑定需另行调整，不可撤销。`,
+      confirmText: '删除',
+      danger: true,
+    });
+    if (!ok) return;
     try {
       const list = collectIxes().filter((x) => x.id !== ix.id);
       await api('/api/topology', { method: 'PUT', body: { ixes: list } });
@@ -1597,9 +1923,13 @@ async function renderTopology() {
   if (dl) dl.href = '/api/topology/forward-script?download=1&' + scriptQs();
 
   document.getElementById('topo-diag').onclick = () => {
-    state.page = 'diagnose';
-    render();
+    navigate('diagnose');
   };
+  document.getElementById('topo-adv-toggle')?.addEventListener('click', () => {
+    state.topoAdvancedOpen = !state.topoAdvancedOpen;
+    saveUiPrefs({ topoAdvancedOpen: state.topoAdvancedOpen });
+    renderTopology();
+  });
 }
 
 /* ========== 落地 ========== */
@@ -1817,8 +2147,7 @@ async function renderServer() {
 
   document.getElementById('srv-to-topo')?.addEventListener('click', (e) => {
     e.preventDefault();
-    state.page = 'topology';
-    render();
+    navigate('topology');
   });
 
   document.getElementById('mode-agent').onclick = async () => {
@@ -2147,9 +2476,10 @@ function clientTableRowHtml(c) {
   const note = (c.note || '').trim();
   const open = state.clientsExpandedId === c.id;
   const disabled = c.enabled === false;
+  const selected = Boolean(state.clientsSelected?.[c.id]);
   const detail = open
     ? `<tr class="urow-detail" data-detail-for="${esc(c.id)}">
-        <td colspan="7">
+        <td colspan="8">
           <div class="urow-detail-inner">
             <div class="mini-stat"><div class="l">累计流量</div><div class="v">${usageCellHtml(c)}</div></div>
             <div class="mini-stat"><div class="l">配额</div><div class="v mono">${esc(
@@ -2173,9 +2503,12 @@ function clientTableRowHtml(c) {
         </td>
       </tr>`
     : '';
-  return `<tr class="${disabled ? 'is-disabled' : ''} ${open ? 'is-open' : ''}" data-user-id="${esc(
+  return `<tr class="${disabled ? 'is-disabled' : ''} ${open ? 'is-open' : ''} ${selected ? 'is-selected' : ''}" data-user-id="${esc(
     c.id
   )}" data-row-toggle="${esc(c.id)}">
+    <td class="cell-check" data-stop>
+      <input type="checkbox" class="row-check" data-sel="${esc(c.id)}" ${selected ? 'checked' : ''} aria-label="选择 ${esc(c.name)}" />
+    </td>
     <td class="cell-user">
       <div class="name">${esc(c.name)}</div>
       <span class="note" title="${esc(note || '')}">${note ? esc(note) : '—'}</span>
@@ -2184,55 +2517,11 @@ function clientTableRowHtml(c) {
     <td class="mono">:${esc(effectiveClientPort(c))}</td>
     <td>${rateCellHtml(c)}</td>
     <td class="mono ${exp.cls}" title="${esc(exp.title)}">${esc(exp.text)}</td>
-    <td class="mono muted">${esc(c.package?.quotaMb ? c.package.quotaMb + ' MB' : '不限')}</td>
-    <td>
-      <div class="ops" onclick="event.stopPropagation()">
-        <button class="btn btn-sm btn-primary" data-qr="${c.id}" title="分享">分享</button>
-        <button class="btn btn-sm btn-secondary" data-edit="${c.id}" title="编辑">编辑</button>
-        <button class="btn btn-sm btn-ghost" data-more="${c.id}" title="更多">⋯</button>
-      </div>
+    <td class="ops" data-stop>
+      <button class="btn btn-sm btn-primary" data-qr="${c.id}" title="分享">分享</button>
+      <button class="btn btn-sm btn-ghost" data-more="${c.id}" title="更多">···</button>
     </td>
   </tr>${detail}`;
-}
-
-async function toggleClientEnable(id) {
-  const c = (state.clients || []).find((x) => x.id === id);
-  if (!c) return toast('用户不存在，请刷新', 'err');
-  const next = c.enabled === false;
-  const tip = next
-    ? `启用「${c.name}」？将自动下发到落地 mita，约 10–30 秒后可连。`
-    : `禁用「${c.name}」？将自动下发到落地 mita，去掉该账号，约 10–30 秒后无法认证。`;
-  if (!confirm(tip)) return;
-  try {
-    const putRes = await api(`/api/clients/${encodeURIComponent(id)}`, {
-      method: 'PUT',
-      body: { enabled: next },
-    });
-    const landingId =
-      putRes.applyNodeId || putRes.client?.route?.landingNodeId || c.route?.landingNodeId || '';
-    if (putRes.applyQueued) {
-      toast(putRes.message || (next ? '已启用并下发' : '已禁用并下发'), 'ok');
-    } else if (landingId) {
-      try {
-        const ap = await api(`/api/nodes/${encodeURIComponent(landingId)}/apply`, {
-          method: 'POST',
-          body: {},
-        });
-        toast(ap.message || (next ? '已下发启用' : '已下发禁用'), 'ok');
-      } catch (ae) {
-        toast(
-          `状态已改，自动应用失败：${ae.data?.error || ae.message}。请点「应用本落地」`,
-          'err'
-        );
-      }
-    } else {
-      toast(next ? '已启用，请绑定落地后应用' : '已禁用，请绑定落地后应用', 'err');
-    }
-    await refreshCore();
-    render();
-  } catch (e) {
-    toast(e.data?.error || e.message, 'err');
-  }
 }
 
 function bindClientActions(primaryId) {
@@ -2254,7 +2543,13 @@ function bindClientActions(primaryId) {
   document.querySelectorAll('[data-del]').forEach((b) => {
     b.onclick = async (e) => {
       e.stopPropagation();
-      if (!confirm('删除该用户？删除后需应用配置才会从 mita 移除。')) return;
+      const ok = await confirmModal({
+        title: '删除用户',
+        body: '删除后需<strong>应用配置</strong>才会从 mita 移除。此操作不可撤销。',
+        confirmText: '删除',
+        danger: true,
+      });
+      if (!ok) return;
       try {
         await api(`/api/clients/${b.dataset.del}`, { method: 'DELETE' });
         toast('已删除');
@@ -2270,6 +2565,46 @@ function bindClientActions(primaryId) {
       toggleClientEnable(b.dataset.toggleEnable);
     };
   });
+  document.querySelectorAll('[data-sel]').forEach((inp) => {
+    inp.onclick = (e) => e.stopPropagation();
+    inp.onchange = () => {
+      const id = inp.dataset.sel;
+      if (!state.clientsSelected) state.clientsSelected = {};
+      if (inp.checked) state.clientsSelected[id] = true;
+      else delete state.clientsSelected[id];
+      const bar = document.getElementById('bulk-bar');
+      if (bar) {
+        const n = Object.keys(state.clientsSelected).length;
+        bar.hidden = n === 0;
+        const lab = bar.querySelector('.bulk-count');
+        if (lab) lab.textContent = String(n);
+      }
+      inp.closest('tr')?.classList.toggle('is-selected', inp.checked);
+    };
+  });
+  document.getElementById('sel-all')?.addEventListener('change', (e) => {
+    const on = e.target.checked;
+    if (!state.clientsSelected) state.clientsSelected = {};
+    document.querySelectorAll('[data-sel]').forEach((inp) => {
+      inp.checked = on;
+      if (on) state.clientsSelected[inp.dataset.sel] = true;
+      else delete state.clientsSelected[inp.dataset.sel];
+      inp.closest('tr')?.classList.toggle('is-selected', on);
+    });
+    const bar = document.getElementById('bulk-bar');
+    if (bar) {
+      const n = Object.keys(state.clientsSelected).length;
+      bar.hidden = n === 0;
+      const lab = bar.querySelector('.bulk-count');
+      if (lab) lab.textContent = String(n);
+    }
+  });
+  document.getElementById('bulk-enable')?.addEventListener('click', () => bulkSetEnabled(true));
+  document.getElementById('bulk-disable')?.addEventListener('click', () => bulkSetEnabled(false));
+  document.getElementById('bulk-clear')?.addEventListener('click', () => {
+    state.clientsSelected = {};
+    renderClients({ skipRefresh: true });
+  });
   document.querySelectorAll('[data-more]').forEach((b) => {
     b.onclick = (e) => {
       e.stopPropagation();
@@ -2280,8 +2615,8 @@ function bindClientActions(primaryId) {
         title: `${c.name}`,
         body: `<p class="field-hint" style="margin-top:0">备注：${esc(c.note || '—')} · 端口 :${esc(
           effectiveClientPort(c)
-        )}</p>
-          <div class="btn-row" style="flex-direction:column;align-items:stretch">
+        )} · ${c.enabled === false ? '已禁用' : '已启用'}</p>
+          <div class="btn-row" style="flex-direction:column;align-items:stretch;gap:8px">
             <button class="btn btn-primary" data-m-qr="${id}">分享链接 / YAML</button>
             <button class="btn btn-secondary" data-m-en="${id}">${
               c.enabled === false ? '启用用户' : '禁用用户'
@@ -2304,7 +2639,13 @@ function bindClientActions(primaryId) {
         openClientModal(c);
       });
       document.querySelector(`[data-m-del="${id}"]`)?.addEventListener('click', async () => {
-        if (!confirm('确认删除？')) return;
+        const ok = await confirmModal({
+          title: '删除用户',
+          body: `确认删除 <strong class="mono">${esc(c.name)}</strong>？删除后需应用配置才会从 mita 移除。`,
+          confirmText: '删除',
+          danger: true,
+        });
+        if (!ok) return;
         try {
           await api(`/api/clients/${id}`, { method: 'DELETE' });
           closeModal();
@@ -2318,12 +2659,37 @@ function bindClientActions(primaryId) {
   });
   document.querySelectorAll('[data-row-toggle]').forEach((tr) => {
     tr.onclick = (e) => {
-      if (e.target.closest('button,a,input')) return;
+      if (e.target.closest('button,a,input,[data-stop]')) return;
       const id = tr.dataset.rowToggle;
       state.clientsExpandedId = state.clientsExpandedId === id ? null : id;
       renderClients({ skipRefresh: true });
     };
   });
+}
+
+async function bulkSetEnabled(enabled) {
+  const ids = Object.keys(state.clientsSelected || {});
+  if (!ids.length) return toast('请先勾选用户', 'err');
+  const ok = await confirmModal({
+    title: enabled ? '批量启用' : '批量禁用',
+    body: `将对 <strong>${ids.length}</strong> 个用户执行「${enabled ? '启用' : '禁用'}」，并排队应用到对应落地。`,
+    confirmText: enabled ? '启用' : '禁用',
+    danger: !enabled,
+  });
+  if (!ok) return;
+  let okN = 0;
+  for (const id of ids) {
+    try {
+      await api(`/api/clients/${id}`, { method: 'PUT', body: { enabled } });
+      okN++;
+    } catch (e) {
+      toast(`${id}: ${e.message}`, 'err');
+    }
+  }
+  state.clientsSelected = {};
+  toast(`已更新 ${okN}/${ids.length} · 正在应用`);
+  await applyConfig(false, { all: true }).catch(() => {});
+  await renderClients();
 }
 
 async function renderClients(opts = {}) {
@@ -2371,12 +2737,12 @@ async function renderClients(opts = {}) {
     ? `<div class="utable-wrap"><table class="utable">
         <thead>
           <tr>
+            <th class="cell-check"><input type="checkbox" id="sel-all" title="全选" aria-label="全选" /></th>
             <th>用户</th>
             <th>状态</th>
             <th>端口</th>
             <th>网速</th>
             <th>到期</th>
-            <th>配额</th>
             <th style="text-align:right">操作</th>
           </tr>
         </thead>
@@ -2397,7 +2763,7 @@ async function renderClients(opts = {}) {
       </div>
       <div class="btn-row">
         <button class="btn btn-primary" id="c-add" title="创建用户">添加用户</button>
-        <button class="btn btn-secondary" id="c-apply" title="下发全部落地">应用全部</button>
+        <button class="btn ${state.dirty ? 'btn-success' : 'btn-ghost'}" id="c-apply" title="下发全部落地">${state.dirty ? '应用全部' : '已同步'}</button>
       </div>
     </div>
     ${
@@ -2459,9 +2825,15 @@ async function renderClients(opts = {}) {
             }" data-c-filter="warn">告警</button>
           </div>
         </div>
+        <div class="bulk-bar" id="bulk-bar" hidden>
+          <span>已选 <strong class="bulk-count">0</strong></span>
+          <button type="button" class="btn btn-sm btn-secondary" id="bulk-enable">批量启用</button>
+          <button type="button" class="btn btn-sm btn-secondary" id="bulk-disable">批量禁用</button>
+          <button type="button" class="btn btn-sm btn-ghost" id="bulk-clear">取消选择</button>
+        </div>
         <div class="mod-body tight">${tableHtml}</div>
       </div>
-      <p class="field-hint">点行展开详情 · 登录名英文/数字，中文写备注 · 改落地后需应用 · 只连前置</p>`
+      <p class="field-hint">勾选可批量 · 点行展开 · 分享在行内 · 更多在 ··· · 改落地后需应用</p>`
         : `<div class="mod"><div class="empty-mod"><strong>还没有落地</strong><p>请先到「落地」添加节点</p></div></div>`
     }
   `);
@@ -2473,12 +2845,17 @@ async function renderClients(opts = {}) {
     b.onclick = () => {
       state.clientsTabId = b.dataset.cTab;
       state.clientsExpandedId = null;
+      state.clientsSelected = {};
+      saveUiPrefs({ clientsTabId: state.clientsTabId });
+      syncHashFromState();
       renderClients({ skipRefresh: true });
     };
   });
   document.querySelectorAll('[data-c-filter]').forEach((b) => {
     b.onclick = () => {
       state.clientsFilter = b.dataset.cFilter;
+      saveUiPrefs({ clientsFilter: state.clientsFilter });
+      syncHashFromState();
       renderClients({ skipRefresh: true });
     };
   });
@@ -2486,10 +2863,11 @@ async function renderClients(opts = {}) {
   if (qEl) {
     qEl.oninput = () => {
       state.clientsQuery = qEl.value;
-      // 防抖：输入时不全量 refresh，只重绘；重绘后恢复焦点
+      saveUiPrefs({ clientsQuery: state.clientsQuery });
       if (window.__cQTimer) clearTimeout(window.__cQTimer);
       window.__cQTimer = setTimeout(() => {
         const pos = qEl.selectionStart;
+        syncHashFromState();
         renderClients({ skipRefresh: true }).then(() => {
           const again = document.getElementById('c-q');
           if (again) {
@@ -2499,6 +2877,14 @@ async function renderClients(opts = {}) {
             } catch {
               /* */
             }
+          }
+          // restore bulk bar count
+          const n = Object.keys(state.clientsSelected || {}).length;
+          const bar = document.getElementById('bulk-bar');
+          if (bar) {
+            bar.hidden = n === 0;
+            const lab = bar.querySelector('.bulk-count');
+            if (lab) lab.textContent = String(n);
           }
         });
       }, 180);
@@ -2813,9 +3199,15 @@ async function showClientQr(id) {
           <div class="share-pane ${tab === 'conf' ? 'on' : ''}" data-share-pane="conf">
             <p class="field-hint" style="margin-top:0">YAML = 完整 OpenClash/mihomo（211/114 + 防环），下载后直接导入</p>
             <div class="btn-row" style="flex-wrap:wrap;margin-bottom:10px">
-              <a class="btn btn-primary" href="/api/clients/${id}/config?format=yaml" title="完整 OpenClash 配置">下载 YAML</a>
-              <a class="btn btn-secondary" href="/api/clients/${id}/config?format=download">下载 JSON</a>
+              <a class="btn btn-primary" id="share-dl-yaml" href="/api/clients/${id}/config?format=yaml" download="${esc(
+                (data.name || 'client') + '-clash.yaml'
+              )}" title="完整 OpenClash 配置">下载 YAML</a>
+              <a class="btn btn-secondary" href="/api/clients/${id}/config?format=download" download="${esc(
+                (data.name || 'client') + '.json'
+              )}">下载 JSON</a>
               <button class="btn btn-ghost" id="qr-copy-json">复制 JSON</button>
+              <button class="btn btn-ghost" id="qr-copy-211">复制 211</button>
+              <button class="btn btn-ghost" id="qr-copy-114">复制 114</button>
             </div>
             <pre class="code-block" style="max-height:160px;overflow:auto;font-size:11px">${esc(
               data.config || mobile || ''
@@ -2854,6 +3246,38 @@ async function showClientQr(id) {
           toast(e.message, 'err');
         }
       });
+      const flashCopy = async (btn, text, okMsg) => {
+        try {
+          await copyText(text);
+          if (btn) {
+            const prev = btn.textContent;
+            btn.textContent = '已复制';
+            btn.classList.add('btn-success');
+            setTimeout(() => {
+              btn.textContent = prev;
+              btn.classList.remove('btn-success');
+            }, 1500);
+          }
+          toast(okMsg);
+        } catch (e) {
+          toast(e.message, 'err');
+        }
+      };
+      document.getElementById('qr-copy-211')?.addEventListener('click', (e) =>
+        flashCopy(e.currentTarget, mobile, '已复制 211')
+      );
+      document.getElementById('qr-copy-114')?.addEventListener('click', (e) =>
+        flashCopy(e.currentTarget, external, '已复制 114')
+      );
+      // also improve primary copy buttons
+      const bm = document.getElementById('qr-copy-m');
+      if (bm) {
+        bm.onclick = (e) => flashCopy(e.currentTarget, mobile, '已复制 211 链接');
+      }
+      const be = document.getElementById('qr-copy-e');
+      if (be) {
+        be.onclick = (e) => flashCopy(e.currentTarget, external, '已复制 114 链接');
+      }
     };
     paint();
   } catch (e) {
@@ -2896,6 +3320,17 @@ async function renderDiagnose() {
               <div class="diag-title"><span class="diag-dot"></span><strong>${esc(it.title)}</strong></div>
               <div class="diag-detail">${esc(it.detail)}</div>
               ${it.fix ? `<div class="diag-fix">→ ${esc(it.fix)}</div>` : ''}
+              ${(() => {
+                const title = String(it.title || '') + String(it.detail || '') + String(it.fix || '');
+                let jump = '';
+                if (/前置|入口|Endpoint|端口段|转发|IX/i.test(title)) jump = 'topology';
+                else if (/Agent|落地|mita|安装|心跳|离线/i.test(title)) jump = 'server';
+                else if (/用户|客户端|配额|到期/i.test(title)) jump = 'clients';
+                else if (/密码|账号/i.test(title)) jump = 'settings';
+                return jump
+                  ? `<div class="diag-actions"><button type="button" class="btn btn-sm btn-ghost" data-nav-jump="${jump}">去修复</button></div>`
+                  : '';
+              })()}
             </div>`
             )
             .join('')}
@@ -2910,6 +3345,9 @@ async function renderDiagnose() {
       document.getElementById('d-exit').onclick = () => setupExit();
       document.getElementById('d-apply').onclick = () => applyConfig(true);
       bindTopAlerts();
+      document.querySelectorAll('#d-box [data-nav-jump]').forEach((b) => {
+        b.onclick = () => navigate(b.dataset.navJump);
+      });
     } catch (e) {
       box.innerHTML = `<p class="danger">${esc(e.message)}</p>`;
     }
@@ -2983,6 +3421,35 @@ async function renderSettings() {
           <button class="btn btn-primary" id="set-save" title="保存套餐策略与默认落地">保存设置</button>
         </div>
       </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><h3>Agent 版本矩阵</h3>
+        <span class="badge ${nodes.some((n)=>n.agentOutdated) ? 'warn' : 'ok'}">面板 v${esc(state.status?.version || '')}</span>
+      </div>
+      <p class="card-desc">各落地 Agent 与面板版本对照；过旧请到落地页更新。</p>
+      ${
+        nodes.length
+          ? `<div class="utable-wrap"><table class="utable" style="min-width:0">
+              <thead><tr><th>落地</th><th>状态</th><th>Agent</th><th>面板要求</th></tr></thead>
+              <tbody>
+                ${nodes
+                  .map(
+                    (n) => `<tr>
+                    <td><strong>${esc(n.name)}</strong></td>
+                    <td><span class="status-dot ${n.online ? 'ok' : 'warn'}">${n.online ? '在线' : '离线'}</span></td>
+                    <td class="mono">${esc(n.agentVersion || '—')}${n.agentOutdated ? ' <span class="badge warn">需更新</span>' : ''}</td>
+                    <td class="mono muted">v${esc(n.panelVersion || state.status?.version || '')}</td>
+                  </tr>`
+                  )
+                  .join('')}
+              </tbody>
+            </table></div>
+            <div class="section-actions">
+              <button class="btn btn-sm btn-primary" data-nav-jump="server">去落地更新</button>
+            </div>`
+          : `<div class="empty-mod"><strong>暂无落地</strong><p>添加落地后显示版本</p></div>`
+      }
     </div>
 
     <div class="card" style="margin-top:16px">
@@ -3113,11 +3580,16 @@ function startJobPoll(nodeId) {
 async function applyConfig(confirmFirst = false, opts = {}) {
   if (confirmFirst) {
     const tip = opts.nodeId
-      ? '将 mita 配置下发到该落地。继续？'
+      ? '将把 mita 配置下发到<strong>该落地</strong>。业务连接可能短暂中断。'
       : opts.all
-        ? '将配置下发到全部落地。继续？'
-        : '将 mita 配置下发到默认落地。继续？';
-    if (!confirm(tip)) return;
+        ? '将把配置下发到<strong>全部落地</strong>。请确认各落地 Agent 在线。'
+        : '将把 mita 配置下发到<strong>默认落地</strong>。';
+    const ok = await confirmModal({
+      title: '应用配置',
+      body: tip,
+      confirmText: '立即应用',
+    });
+    if (!ok) return;
   }
   try {
     toast('正在下发…', 'warn');
@@ -3137,7 +3609,12 @@ async function applyConfig(confirmFirst = false, opts = {}) {
 }
 
 async function setupExit(nodeId) {
-  if (!confirm('在落地家宽安装/配置 mita 并放行端口？不会改面板机/IX 网络。')) return;
+  const ok = await confirmModal({
+    title: '一键落地',
+    body: '在落地家宽安装/配置 mita 并放行端口。<strong>不会</strong>改面板机 / IX 网络。',
+    confirmText: '开始',
+  });
+  if (!ok) return;
   try {
     toast('正在一键落地…', 'warn');
     const res = nodeId
@@ -3187,12 +3664,14 @@ async function setupExit(nodeId) {
 function openModal({ title, body, actions }) {
   const root = document.getElementById('modal-root') || document.body;
   const wrap = el(`
-    <div class="modal-backdrop">
+    <div class="modal-backdrop" role="dialog" aria-modal="true">
       <div class="modal">
-        <div class="modal-head"><h3>${esc(title || '')}</h3>
-          <button class="btn btn-sm btn-ghost" data-close>✕</button></div>
+        <div class="modal-header">
+          <h3>${esc(title || '')}</h3>
+          <button type="button" class="btn btn-sm btn-ghost" data-close aria-label="关闭">✕</button>
+        </div>
         <div class="modal-body">${body || ''}</div>
-        <div class="modal-foot">${actions || '<button class="btn btn-primary" data-close>关闭</button>'}</div>
+        <div class="modal-foot btn-row" style="justify-content:flex-end;margin-top:14px">${actions || '<button class="btn btn-primary" data-close>关闭</button>'}</div>
       </div>
     </div>`);
   root.innerHTML = '';
@@ -3214,6 +3693,7 @@ async function render() {
   if (!state.status?.loggedIn) return;
   if (state.page !== 'clients') stopClientsLivePoll();
   if (!state.wizardDone && !state._skipWizardOnce) return renderWizard();
+  syncHashFromState();
   if (state.page === 'dashboard') return renderDashboard();
   if (state.page === 'topology') return renderTopology();
   if (state.page === 'server') return renderServer();
@@ -3235,11 +3715,64 @@ async function boot() {
     state.nodes = status.nodes || [];
     state.wizardDone = status.wizardDone;
     state.topology = status.topology || null;
+    restoreUiPrefs();
+    const route = parseHashRoute();
+    if (route) applyRoute(route);
     await refreshCore();
     await render();
+    syncHashFromState();
   } catch (e) {
     renderBoot('加载失败: ' + e.message);
   }
 }
+
+window.addEventListener('hashchange', () => {
+  if (!state.status?.loggedIn) return;
+  const route = parseHashRoute();
+  if (route && route.page !== state.page) applyRoute(route, { renderNow: true });
+  else if (route) applyRoute(route, { renderNow: true });
+});
+
+// g then key shortcuts + /
+let __gPending = false;
+let __gTimer = null;
+window.addEventListener('keydown', (e) => {
+  if (!state.status?.loggedIn) return;
+  const tag = (e.target && e.target.tagName) || '';
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target?.isContentEditable) {
+    if (e.key === 'Escape') e.target.blur();
+    return;
+  }
+  if (e.key === '/' && !e.metaKey && !e.ctrlKey) {
+    e.preventDefault();
+    navigate('clients');
+    setTimeout(() => document.getElementById('c-q')?.focus(), 50);
+    return;
+  }
+  if (e.key === 'g' || e.key === 'G') {
+    __gPending = true;
+    clearTimeout(__gTimer);
+    __gTimer = setTimeout(() => {
+      __gPending = false;
+    }, 800);
+    return;
+  }
+  if (__gPending) {
+    __gPending = false;
+    const map = {
+      d: 'dashboard',
+      t: 'topology',
+      s: 'server',
+      c: 'clients',
+      i: 'diagnose',
+      e: 'settings',
+    };
+    const page = map[e.key.toLowerCase()];
+    if (page) {
+      e.preventDefault();
+      navigate(page);
+    }
+  }
+});
 
 boot();

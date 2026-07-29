@@ -432,11 +432,14 @@ function endpointHostOnly(ep) {
   return s.replace(/:\d+$/, '');
 }
 
-/** 多落地入口：默认折叠，避免顶栏挤满 */
+/** 多落地入口：默认折叠；每落地用其所属 IX 的主入口 host（勿全局第一台 IX） */
 function multiLandingEndpointBanner() {
-  const host = endpointHostOnly(activeEp()) || '（先到拓扑填前置）';
   const nodes = state.nodes || [];
   const landings = landingsList();
+  const hostForLanding = (L) => {
+    const h = endpointHostOnly(activeEp(L?.ixId)) || endpointHostOnly(activeEp()) || '';
+    return h || '（先到拓扑填前置）';
+  };
   if (!nodes.length) {
     return `<div class="alert info compact"><div>默认 Endpoint：<code class="mono">${esc(
       activeEp() || '未配置'
@@ -446,6 +449,7 @@ function multiLandingEndpointBanner() {
     const n = nodes[0];
     const L = landings.find((x) => x.nodeId === n.id) || {};
     const port = Number(L.listenPort || n.listenPort || 7901);
+    const host = hostForLanding(L);
     return `<div class="alert info compact"><div>
       客户端连 <code class="mono">${esc(host)}:${port}</code>
       <span class="muted">· 只连前置，勿连 IX / 家宽公网</span>
@@ -455,6 +459,7 @@ function multiLandingEndpointBanner() {
     .map((n) => {
       const L = landings.find((x) => x.nodeId === n.id) || {};
       const port = Number(L.listenPort || n.listenPort || 7901);
+      const host = hostForLanding(L);
       const users = (state.clients || []).filter((c) => c.route?.landingNodeId === n.id).length;
       const tag = n.isPrimary ? ' · 默认' : '';
       return `<div class="ep-row"><strong>${esc(n.name)}</strong>${tag}
@@ -2217,6 +2222,17 @@ async function renderServer() {
       const displayName = document.getElementById(`n-name-${id}`)?.value?.trim() || '';
       if (!displayName) return toast('请填写落地显示名称', 'err');
       if (displayName.length > 40) return toast('名称太长（最多 40 字）', 'err');
+      const ixIdSel = document.getElementById(`n-ix-${id}`)?.value || null;
+      const ixSel = ixIdSel ? ixesList().find((x) => x.id === ixIdSel) : null;
+      if (
+        ixSel &&
+        (listenPort < Number(ixSel.portMin || 7900) || listenPort > Number(ixSel.portMax || 7999))
+      ) {
+        return toast(
+          `端口 ${listenPort} 不在 IX「${ixSel.name || ''}」段 ${ixSel.portMin}-${ixSel.portMax}（第二台常见 10400–10499）`,
+          'err'
+        );
+      }
       try {
         const r = await api(`/api/nodes/${id}`, {
           method: 'PUT',
@@ -2224,7 +2240,7 @@ async function renderServer() {
             name: displayName,
             listenPort,
             homeReachableHost: document.getElementById(`n-home-${id}`)?.value?.trim() || '',
-            ixId: document.getElementById(`n-ix-${id}`)?.value || null,
+            ixId: ixIdSel,
           },
         });
         const savedPort = r.landing?.listenPort || r.node?.listenPort || listenPort;
@@ -3210,7 +3226,7 @@ function openClientModal(client, preferLandingId) {
           return;
         }
         await api(`/api/clients/${encodeURIComponent(editId)}`, { method: 'PUT', body });
-        toast('已保存（记得到 pro3 点「应用本落地」）');
+        toast('已保存（请到对应落地点「应用配置」，并确认第二台 IX 已跑转发脚本）');
         closeModal();
         await refreshCore();
         render();

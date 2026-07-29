@@ -261,8 +261,8 @@ function applyRoutePackageBody(client, body) {
     client.route.listenPort = body.listenPort ? Number(body.listenPort) : null;
   }
   if (body.ixId !== undefined) client.route.ixId = body.ixId || null;
-  // default ixId from landing.ixId when landing set but ix empty
-  if (client.route.landingNodeId && !client.route.ixId) {
+  // 落地所属 IX 为真相源：有落地绑定时强制对齐 route.ixId（防第二台 IX 用户仍挂第一台前置）
+  if (client.route.landingNodeId) {
     try {
       const L = topology.getLandingByNodeId(state, client.route.landingNodeId);
       if (L?.ixId) client.route.ixId = L.ixId;
@@ -283,8 +283,8 @@ function applyRoutePackageBody(client, body) {
     try {
       const L = topology.getLandingByNodeId(state, client.route.landingNodeId);
       const ix = topology.resolveIx(state, {
-        ixId: client.route.ixId || L?.ixId,
         landingNodeId: client.route.landingNodeId,
+        ixId: client.route.ixId || L?.ixId,
       });
       if (ix && !topology.portInMerchantRange(p, ix)) {
         const err = new Error(
@@ -1240,13 +1240,56 @@ app.put('/api/nodes/:id', (req, res) => {
     state.topology.landings.push(landing);
     node.server.listenPort = port0;
   }
+  // 先处理 IX 绑定，再校验端口（换 IX 时常仍带着旧段端口）
+  if (landing && body.ixId !== undefined) {
+    const prevIx = landing.ixId || null;
+    const nextIx = body.ixId || null;
+    landing.ixId = nextIx;
+    // 换 IX 且未显式改端口：若当前端口不在新段，自动分配新段空闲端口
+    if (prevIx !== nextIx && body.listenPort === undefined) {
+      const ix = topology.getIx(state, nextIx);
+      const cur = Number(landing.listenPort) || Number(node.server?.listenPort) || 0;
+      if (ix && cur && !topology.portInMerchantRange(cur, ix)) {
+        const port = topology.allocateListenPort(state, {
+          ixId: nextIx,
+          excludeLandingId: landing.id,
+        });
+        landing.listenPort = port;
+        landing.homeReachablePort = port;
+        node.server.listenPort = port;
+        nodes.markNodeDirty(node);
+        try {
+          enqueueApply(node, 'mieru_apply');
+        } catch (e) {
+          console.warn('[panel] auto-apply after ix rebind port fix:', e.message);
+        }
+        // 绑到新 IX 的用户也要对齐 ixId
+        for (const c of state.clients || []) {
+          if (c?.route?.landingNodeId === node.id) c.route.ixId = nextIx;
+        }
+        state.clientsNeedRescan = true;
+      }
+    } else if (prevIx !== nextIx) {
+      for (const c of state.clients || []) {
+        if (c?.route?.landingNodeId === node.id) c.route.ixId = nextIx;
+      }
+      state.clientsNeedRescan = true;
+    }
+  }
+
   if (body.listenPort !== undefined) {
-    const port = Number(body.listenPort);
+    let port = Number(body.listenPort);
     if (!Number.isFinite(port) || port < 1 || port > 65535) {
       return res.status(400).json({ error: '监听端口无效' });
     }
     // 同 IX 端口冲突提示
     const ixId = body.ixId !== undefined ? body.ixId : landing?.ixId;
+    const ix = topology.getIx(state, ixId);
+    if (ix && !topology.portInMerchantRange(port, ix)) {
+      return res.status(400).json({
+        error: `端口 ${port} 不在 IX「${ix.name || ix.id}」端口段 ${ix.portMin}-${ix.portMax}`,
+      });
+    }
     const clash = (state.topology.landings || []).find(
       (L) =>
         L.nodeId !== node.id &&
@@ -1286,7 +1329,6 @@ app.put('/api/nodes/:id', (req, res) => {
         node.server.listenPort || 7901
       );
     }
-    if (body.ixId !== undefined) landing.ixId = body.ixId || null;
     if (body.name !== undefined) landing.name = node.name;
   }
   if (body.setPrimary) {

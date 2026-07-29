@@ -704,5 +704,145 @@ ok('publicTopology per-IX ingress/endpoints');
 }
 
 
+
+// 20) second IX 10400 range: landing port auto-fix + share host + forward dedicated ports
+{
+  const st = {
+    mode: 'agent',
+    primaryNodeId: 'n1',
+    server: { listenPort: 7901, protocol: 'TCP', mtu: 1400, multiplexing: 'MULTIPLEXING_LOW' },
+    clients: [
+      {
+        id: 'c-ix2',
+        name: 'uix2',
+        password: 'pass-pass-pass3',
+        enabled: true,
+        route: {
+          landingNodeId: 'n2',
+          ixId: 'ix-1', // 故意错绑第一台
+          listenPort: 10401, // 专用端口
+          ingressActive: null,
+        },
+        package: {},
+        usage: {},
+      },
+    ],
+    nodes: [
+      { id: 'n1', name: 'L1', server: { listenPort: 7901 }, online: true },
+      { id: 'n2', name: 'L2', server: { listenPort: 7901 }, online: true },
+    ],
+    topology: {
+      profile: 'cm-ix-home',
+      ingress: {
+        active: 'external',
+        port: 7901,
+        protocol: 'TCP',
+        mobileHost: '211.1.1.1',
+        externalHost: '114.1.1.1',
+      },
+      ixes: [
+        {
+          id: 'ix-1',
+          name: 'IX1',
+          lanIp: '10.0.0.1',
+          portMin: 7900,
+          portMax: 7999,
+          forwardConfigured: true,
+          ingress: {
+            active: 'external',
+            externalHost: '114.1.1.1',
+            mobileHost: '211.1.1.1',
+          },
+        },
+        {
+          id: 'ix-2',
+          name: 'IX2',
+          lanIp: '10.0.0.2',
+          portMin: 10400,
+          portMax: 10499,
+          forwardConfigured: true,
+          ingress: {
+            active: 'external',
+            externalHost: '114.2.2.2',
+            mobileHost: '211.2.2.2',
+          },
+        },
+      ],
+      landings: [
+        {
+          id: 'land-1',
+          name: '落地1',
+          nodeId: 'n1',
+          listenPort: 7901,
+          homeReachableHost: '8.8.8.8',
+          homeReachablePort: 7901,
+          ixId: 'ix-1',
+        },
+        {
+          id: 'land-2',
+          name: '落地2',
+          nodeId: 'n2',
+          listenPort: 7901, // 错：第二台 IX 仍 7901
+          homeReachableHost: '9.9.9.9',
+          homeReachablePort: 7901,
+          ixId: 'ix-2',
+        },
+      ],
+    },
+  };
+  topology.ensureTopology(st);
+  const L2 = st.topology.landings.find((x) => x.id === 'land-2');
+  assert.ok(Number(L2.listenPort) >= 10400 && Number(L2.listenPort) <= 10499, 'landing2 port auto in 104xx');
+  assert.strictEqual(Number(L2.homeReachablePort), Number(L2.listenPort));
+  assert.strictEqual(st.clients[0].route.ixId, 'ix-2', 'client ixId realigned to landing');
+  // dedicated 10401 still valid → keep
+  assert.strictEqual(Number(st.clients[0].route.listenPort), 10401);
+
+  const dual = mieru.buildDualShareLinks(st, st.clients[0]);
+  assert.ok(dual.endpoints.active.startsWith('114.2.2.2:'), dual.endpoints.active);
+  assert.ok(dual.endpoints.active.endsWith(':10401'), dual.endpoints.active);
+  assert.strictEqual(dual.ixId, 'ix-2');
+
+  const fwd = topology.buildIxForwardScript(st, { ixId: 'ix-2' });
+  assert.ok(fwd.ok, fwd.error);
+  assert.ok(fwd.script.includes(String(L2.listenPort)), 'script has landing default');
+  assert.ok(fwd.script.includes('10401'), 'script has dedicated user port');
+  assert.ok(fwd.script.includes('9.9.9.9'));
+  // wrong host from ix-1 must not appear as preferred for this client
+  assert.ok(!dual.endpoints.active.startsWith('114.1.1.1:'));
+  ok('second IX 104xx: sanitize + share host + dedicated DNAT');
+}
+
+// 21) resolveIx prefers landing.ixId over stale route.ixId
+{
+  const st = {
+    topology: {
+      profile: 'cm-ix-home',
+      ingress: { active: 'mobile', port: 7901, protocol: 'TCP' },
+      ixes: [
+        topology.defaultIx({ id: 'ix-a', name: 'A', portMin: 7900, portMax: 7999 }),
+        topology.defaultIx({ id: 'ix-b', name: 'B', portMin: 10400, portMax: 10499 }),
+      ],
+      landings: [
+        topology.defaultLanding({
+          id: 'Lb',
+          nodeId: 'nb',
+          ixId: 'ix-b',
+          listenPort: 10400,
+          homeReachableHost: '1.1.1.1',
+        }),
+      ],
+    },
+    clients: [],
+    nodes: [],
+    server: { listenPort: 7901, protocol: 'TCP' },
+  };
+  topology.ensureTopology(st);
+  const ix = topology.resolveIx(st, { ixId: 'ix-a', landingNodeId: 'nb' });
+  assert.strictEqual(ix.id, 'ix-b');
+  ok('resolveIx landing wins over route.ixId');
+}
+
+
 console.log('\nsmoke-v4: all passed');
 console.log('tmp data:', tmp);

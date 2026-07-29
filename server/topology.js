@@ -196,10 +196,7 @@ function getIxIngress(ix, globalIngress = null) {
 /** Resolve IX for client/landing/opts */
 function resolveIx(state, opts = {}) {
   ensureTopology(state);
-  if (opts.ixId) {
-    const found = state.topology.ixes.find((x) => x.id === opts.ixId);
-    if (found) return found;
-  }
+  // 落地绑定优先：用户 route.ixId 若与落地所属 IX 冲突，以落地为准（第二台 IX 常见错绑到第一台）
   if (opts.landingId) {
     const L = state.topology.landings.find((x) => x.id === opts.landingId);
     if (L?.ixId) {
@@ -213,6 +210,10 @@ function resolveIx(state, opts = {}) {
       const found = state.topology.ixes.find((x) => x.id === L.ixId);
       if (found) return found;
     }
+  }
+  if (opts.ixId) {
+    const found = state.topology.ixes.find((x) => x.id === opts.ixId);
+    if (found) return found;
   }
   return state.topology.ixes[0] || null;
 }
@@ -404,7 +405,25 @@ function ensureTopology(state) {
   state.server.endpoint = host ? `${host}:${t.ingress.port}` : '';
 
   uniquifyLandingIds(t);
-  // 顺手清掉跨 IX 端口段的用户专用端口（不改拓扑本身）
+  // 落地端口 / 用户 ixId / 用户专用端口 与多 IX 段对齐
+  try {
+    const nL = sanitizeLandingPortsForIxRanges(state);
+    if (nL > 0) {
+      state.clientsNeedRescan = true;
+      console.log(`[panel] 已纠正 ${nL} 个落地端口到所属 IX 端口段`);
+    }
+  } catch (e) {
+    console.warn('[panel] sanitize landing ports:', e.message);
+  }
+  try {
+    const nB = sanitizeClientIxBindings(state);
+    if (nB > 0) {
+      state.clientsNeedRescan = true;
+      console.log(`[panel] 已对齐 ${nB} 个用户 route.ixId 到落地所属 IX`);
+    }
+  } catch (e) {
+    console.warn('[panel] sanitize client ix bindings:', e.message);
+  }
   try {
     const n = sanitizeClientPortsForIxRanges(state);
     if (n > 0) {
@@ -542,6 +561,43 @@ function buildIxForwardScript(state, opts = {}) {
       homePort,
     };
   });
+
+  // 用户专用端口也要进 DNAT（否则客户端连 :10401 而脚本只有落地默认 :10400 会不通）
+  {
+    const byPort = new Map(targets.map((r) => [Number(r.listenPort), r]));
+    const extra = [];
+    for (const c of state.clients || []) {
+      if (!c || c.enabled === false) continue;
+      const p = c.route?.listenPort != null && c.route.listenPort !== '' ? Number(c.route.listenPort) : null;
+      if (!p || !Number.isFinite(p)) continue;
+      const nid = c.route?.landingNodeId || null;
+      const base =
+        (nid && targets.find((r) => r.nodeId === nid)) ||
+        (c.route?.ixId && opts.ixId && c.route.ixId === opts.ixId ? targets[0] : null) ||
+        null;
+      // 仅本 IX 落地用户
+      const onThisIx =
+        base ||
+        targets.find((r) => {
+          if (!nid) return false;
+          return r.nodeId === nid;
+        });
+      if (!onThisIx) continue;
+      if (byPort.has(p)) continue;
+      if (!portInMerchantRange(p, ix)) continue;
+      const row = {
+        id: `${onThisIx.id}-u-${c.id || c.name || p}`,
+        name: `${onThisIx.name}/${c.name || p}`,
+        nodeId: onThisIx.nodeId,
+        listenPort: p,
+        homeHost: onThisIx.homeHost,
+        homePort: onThisIx.homePort,
+      };
+      byPort.set(p, row);
+      extra.push(row);
+    }
+    if (extra.length) targets = targets.concat(extra);
+  }
 
   if (!targets.length && focusLanding) {
     const listenPort = clampPort(
@@ -904,6 +960,95 @@ function applyTopologyPatch(state, body = {}) {
   return { endpointChanged, topology: publicTopology(state) };
 }
 
+/**
+ * 落地 listenPort 必须落在所属 IX 段；跨段时改到该段首个空闲端口，并同步 homeReachablePort / node.server
+ * 常见：落地绑到第二台 IX(10400–10499) 后仍是 7901 → 分享链/mita/转发全错
+ * 由 ensureTopology 调用：禁止再调 getLandingByNodeId/resolveIx
+ */
+function sanitizeLandingPortsForIxRanges(state) {
+  if (!state || !state.topology) return 0;
+  const t = state.topology;
+  const ixes = Array.isArray(t.ixes) ? t.ixes : [];
+  const landings = Array.isArray(t.landings) ? t.landings : [];
+  if (!ixes.length || !landings.length) return 0;
+  let fixed = 0;
+
+  const usedOnIx = (ixId, excludeLandingId) => {
+    const used = new Set();
+    for (const L of landings) {
+      if (excludeLandingId && L.id === excludeLandingId) continue;
+      if (ixId && L.ixId && L.ixId !== ixId) continue;
+      const p = Number(L.listenPort);
+      if (p) used.add(p);
+    }
+    return used;
+  };
+
+  const allocInRange = (ix, excludeLandingId, preferred) => {
+    const min = Number(ix?.portMin) || CM_DEFAULTS.portMin;
+    const max = Number(ix?.portMax) || CM_DEFAULTS.portMax;
+    const used = usedOnIx(ix?.id, excludeLandingId);
+    const pref = Number(preferred);
+    if (pref && pref >= min && pref <= max && !used.has(pref)) return pref;
+    for (let p = min; p <= max; p++) {
+      if (!used.has(p)) return p;
+    }
+    return min;
+  };
+
+  for (const L of landings) {
+    if (!L) continue;
+    const ixId = L.ixId || ixes[0]?.id || null;
+    const ix = (ixId && ixes.find((x) => x.id === ixId)) || ixes[0] || null;
+    if (!ix) continue;
+    if (!L.ixId && ix.id) L.ixId = ix.id;
+    const port = Number(L.listenPort);
+    if (!port || !portInMerchantRange(port, ix)) {
+      const next = allocInRange(ix, L.id, port);
+      L.listenPort = next;
+      // home 跟随 listen（旧 7901 脏数据）
+      const hp = Number(L.homeReachablePort);
+      if (!hp || hp === 7901 || hp === port || !portInMerchantRange(hp, ix)) {
+        L.homeReachablePort = next;
+      }
+      if (L.nodeId && Array.isArray(state.nodes)) {
+        const n = state.nodes.find((x) => x && x.id === L.nodeId);
+        if (n) {
+          n.server = { ...(n.server || {}), listenPort: next };
+        }
+      }
+      fixed += 1;
+    } else {
+      // 段内但 home 仍 7901 且 listen 非 7901
+      const hp = Number(L.homeReachablePort);
+      if ((hp === 7901 || !hp) && port !== 7901) {
+        L.homeReachablePort = port;
+      }
+    }
+  }
+  return fixed;
+}
+
+/** 用户 route.ixId 与落地所属 IX 对齐（落地优先） */
+function sanitizeClientIxBindings(state) {
+  if (!state || !state.topology) return 0;
+  const t = state.topology;
+  const landings = Array.isArray(t.landings) ? t.landings : [];
+  let fixed = 0;
+  for (const c of state.clients || []) {
+    if (!c?.route) continue;
+    const nid = c.route.landingNodeId || state.primaryNodeId || null;
+    if (!nid) continue;
+    const L = landings.find((x) => x && x.nodeId === nid);
+    if (!L?.ixId) continue;
+    if (c.route.ixId !== L.ixId) {
+      c.route.ixId = L.ixId;
+      fixed += 1;
+    }
+  }
+  return fixed;
+}
+
 /** 清掉不在所属 IX 端口段的用户专用端口（常见：10400 段落地却写死 7901） */
 function sanitizeClientPortsForIxRanges(state) {
   // 由 ensureTopology 调用：禁止再调 getLandingByNodeId/resolveIx（它们会 ensureTopology 递归）
@@ -996,8 +1141,12 @@ function diagnoseTopology(state, opts = {}) {
       t.landings.find((L) => L.homeReachableHost)?.homeReachableHost ||
       ix.homeReachableHost ||
       '';
-    // 本 IX 默认/绑定落地端口是否在本 IX 段
-    const ixLandings = (t.landings || []).filter((L) => !L.ixId || L.ixId === ix.id);
+    // 本 IX 绑定落地；未绑 ix 的老数据只算在第一台 IX，避免第二台误吞
+    const ixLandings = (t.landings || []).filter((L) => {
+      if (L.ixId === ix.id) return true;
+      if (!L.ixId && t.ixes[0]?.id === ix.id) return true;
+      return false;
+    });
     const checkPorts = [
       port,
       ...ixLandings.map((L) => Number(L.listenPort) || 0).filter(Boolean),
@@ -1188,6 +1337,8 @@ module.exports = {
   applyTopologyPatch,
   diagnoseTopology,
   sanitizeClientPortsForIxRanges,
+  sanitizeLandingPortsForIxRanges,
+  sanitizeClientIxBindings,
   getIx,
   getLanding,
   getLandingByNodeId,

@@ -273,10 +273,10 @@ function urlencode(s) {
 
 function resolveClientIxOpts(state, client = null) {
   const opts = {};
-  if (client?.route?.ixId) opts.ixId = client.route.ixId;
+  // 落地优先：resolveIx 会先看 landingNodeId/landing.ixId，再看 route.ixId
   if (client?.route?.landingNodeId) opts.landingNodeId = client.route.landingNodeId;
+  if (client?.route?.ixId) opts.ixId = client.route.ixId;
   if (client?.route?.ingressActive) opts.ingressActive = client.route.ingressActive;
-  // landing.ixId fallback via topology.resolveIx
   return opts;
 }
 
@@ -864,8 +864,8 @@ function diagnose(state, opts = {}) {
       const nid = clientLandingNodeId(c, state);
       const L = nid ? topology.getLandingByNodeId(state, nid) : null;
       const ix = topology.resolveIx(state, {
-        ixId: c.route?.ixId || L?.ixId,
         landingNodeId: nid,
+        ixId: c.route?.ixId || L?.ixId,
       });
       const p = c.route?.listenPort != null ? Number(c.route.listenPort) : null;
       if (p && ix && !topology.portInMerchantRange(p, ix)) {

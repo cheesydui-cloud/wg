@@ -13,9 +13,10 @@
 const crypto = require('crypto');
 
 const CM_DEFAULTS = {
-  mobileIngress: '211.136.162.184',
-  externalIngress: '114.111.176.37',
-  ixLanIp: '172.16.2.79',
+  // 仅作空模板占位，禁止写死某商家当前 IP；用户在拓扑页填写/修改
+  mobileIngress: '',
+  externalIngress: '',
+  ixLanIp: '',
   ixSshPort: 7900,
   portMin: 7900,
   portMax: 7999,
@@ -32,7 +33,7 @@ function defaultIxIngress(overrides = {}, globalIngress = null) {
   return {
     active: ['mobile', 'external', 'custom'].includes(overrides.active)
       ? overrides.active
-      : g.active || 'external',
+      : g.active || 'mobile',
     mobileHost: String(
       overrides.mobileHost != null ? overrides.mobileHost : g.mobileHost || CM_DEFAULTS.mobileIngress
     ).trim(),
@@ -110,7 +111,7 @@ function defaultTopology() {
   return {
     profile: 'cm-ix-home',
     ingress: {
-      active: 'external',
+      active: 'mobile',
       mobileHost: CM_DEFAULTS.mobileIngress,
       externalHost: CM_DEFAULTS.externalIngress,
       customHost: '',
@@ -222,7 +223,7 @@ function resolveIngress(state, opts = {}) {
   const g = state.topology.ingress;
   if (ix) return getIxIngress(ix, g);
   return {
-    active: g.active || 'external',
+    active: g.active || 'mobile',
     mobileHost: g.mobileHost || CM_DEFAULTS.mobileIngress,
     externalHost: g.externalHost || CM_DEFAULTS.externalIngress,
     customHost: g.customHost || '',
@@ -461,8 +462,10 @@ function altEndpoint(state, portOverride, opts = {}) {
     CM_DEFAULTS.defaultPort
   );
   const ing = resolveIngress(state, o);
-  const mobile = `${ing.mobileHost || CM_DEFAULTS.mobileIngress}:${port}`;
-  const external = `${ing.externalHost || CM_DEFAULTS.externalIngress}:${port}`;
+  const mHost = String(ing.mobileHost || CM_DEFAULTS.mobileIngress || '').trim();
+  const eHost = String(ing.externalHost || CM_DEFAULTS.externalIngress || '').trim();
+  const mobile = mHost ? `${mHost}:${port}` : '';
+  const external = eHost ? `${eHost}:${port}` : '';
   const host = ingressHostFrom(ing, o.ingressActive);
   return {
     mobile,
@@ -942,7 +945,7 @@ function diagnoseTopology(state, opts = {}) {
       id: `ix_${ix.id}`,
       level: home || ix.forwardConfigured ? 'ok' : 'warn',
       title: `IX · ${ix.name}`,
-      detail: `内网 ${ix.lanIp} · 端口段 ${ix.portMin}-${ix.portMax} · 前置 114=${ing.externalHost} / 211=${ing.mobileHost}${
+      detail: `内网 ${ix.lanIp} · 端口段 ${ix.portMin}-${ix.portMax} · 主入口=${ing.mobileHost || ing.customHost || ing.externalHost || "未填"} · 备用=${ing.externalHost || "—"}${
         ing.customHost ? ` / 自定义=${ing.customHost}` : ''
       } · 转发${ix.forwardConfigured ? '已标记' : '未标记'} · 可达 ${home || '未填'}`,
       fix: ix.forwardConfigured

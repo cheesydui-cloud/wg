@@ -1,6 +1,7 @@
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const path = require('path');
+const fs = require('fs');
 const crypto = require('crypto');
 const QRCode = require('qrcode');
 
@@ -182,6 +183,7 @@ function enrichNodePublic(node) {
   pub.isPrimary = state.primaryNodeId === node.id;
   pub.agentOutdated = isAgentOutdated(node.agentVersion);
   pub.panelVersion = panelVersion();
+  pub.agentTargetVersion = agentBundleVersion();
   try {
     topology.ensureTopology(state);
     const L = topology.getLandingByNodeId(state, node.id);
@@ -464,15 +466,38 @@ function panelVersion() {
   }
 }
 
+/** Agent 协议版本（agent/index.js 的 VERSION），与面板 UI 版本无关 */
+function agentBundleVersion() {
+  try {
+    const verFile = path.join(ROOT, 'agent', 'VERSION');
+    if (fs.existsSync(verFile)) {
+      const v = fs.readFileSync(verFile, 'utf8').trim();
+      if (v) return v.replace(/^v/i, '');
+    }
+  } catch {
+    /* */
+  }
+  try {
+    const src = fs.readFileSync(path.join(ROOT, 'agent', 'index.js'), 'utf8');
+    const m = src.match(/const VERSION\s*=\s*['"]([^'"]+)['"]/);
+    if (m) return m[1];
+  } catch {
+    /* */
+  }
+  return panelVersion();
+}
+
+function parseSemver3(v) {
+  const m = String(v || '')
+    .replace(/^v/i, '')
+    .match(/^(\d+)\.(\d+)\.(\d+)/);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
 function isAgentOutdated(agentVer) {
-  const parse = (v) => {
-    const m = String(v || '')
-      .replace(/^v/i, '')
-      .match(/^(\d+)\.(\d+)\.(\d+)/);
-    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
-  };
-  const a = parse(agentVer);
-  const b = parse(panelVersion());
+  // 只对比「仓库内 Agent 脚本版本」，禁止用面板 UI 版本（4.6.x）误伤 4.3.2 Agent
+  const a = parseSemver3(agentVer);
+  const b = parseSemver3(agentBundleVersion());
   if (!a || !b) return Boolean(agentVer) === false ? true : false;
   for (let i = 0; i < 3; i++) {
     if (a[i] < b[i]) return true;
@@ -526,6 +551,7 @@ app.get('/api/status', async (req, res) => {
     lastAppliedAt: loggedIn ? state.lastAppliedAt : undefined,
     clientCount: (state.clients || []).length,
     version: require(path.join(ROOT, 'package.json')).version,
+    agentVersion: agentBundleVersion(),
     protocol: 'mieru',
     mode: modeInfo.mode,
     primaryNodeId: modeInfo.primaryNodeId,
@@ -681,7 +707,7 @@ app.put('/api/topology', (req, res) => {
   if (body.wizardDone !== undefined) state.wizardDone = Boolean(body.wizardDone);
   persist();
   const tips = [];
-  if (endpointChanged) tips.push('前置入口已更新，请重新复制客户端链接（商家 IX 前置 114/211）');
+  if (endpointChanged) tips.push('前置入口已更新，请重新复制客户端主入口链接');
   if (serverConfChanged) tips.push('监听参数有变，请在落地「应用配置/一键落地」');
   res.json({
     ok: true,
@@ -748,10 +774,10 @@ app.put('/api/server', (req, res) => {
   if (body.endpoint !== undefined && s.endpoint) {
     const parsed = mieru.parseEndpoint(s.endpoint);
     const host = parsed.host || '';
-    if (host === state.topology.ingress.mobileHost || host === '211.136.162.184') {
+    if (host && host === state.topology.ingress.mobileHost) {
       state.topology.ingress.active = 'mobile';
       state.topology.ingress.mobileHost = host;
-    } else if (host === state.topology.ingress.externalHost || host === '114.111.176.37') {
+    } else if (host && host === state.topology.ingress.externalHost) {
       state.topology.ingress.active = 'external';
       state.topology.ingress.externalHost = host;
     } else if (host) {
@@ -1007,13 +1033,10 @@ app.get('/api/clients/:id/config', async (req, res) => {
   try {
     dual = mieru.buildDualShareLinks(state, c, proto);
     shareLink = dual.preferred;
-    const preferHost =
-      dual.active === 'external'
-        ? dual.endpoints.external.split(':')[0]
-        : dual.active === 'custom'
-          ? dual.endpoints.active.split(':')[0]
-          : dual.endpoints.mobile.split(':')[0];
-    clientJson = mieru.buildClientJson(state, c, proto, preferHost);
+    const preferHost = String(dual.endpoints?.active || dual.endpoints?.mobile || dual.endpoints?.external || '')
+      .split(':')[0]
+      .trim();
+    clientJson = mieru.buildClientJson(state, c, proto, preferHost || undefined);
   } catch (err) {
     return res.status(400).json({ error: err.message, code: err.code });
   }
@@ -1038,10 +1061,20 @@ app.get('/api/clients/:id/config', async (req, res) => {
     return res.send(yaml);
   }
   if (format === 'qr') {
+    const emptyPng =
+      'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    const toQr = async (text) => {
+      if (!text) return emptyPng;
+      try {
+        return await QRCode.toDataURL(text, { margin: 1, width: 280 });
+      } catch {
+        return emptyPng;
+      }
+    };
     const [qrMobile, qrExternal, qr] = await Promise.all([
-      QRCode.toDataURL(dual.mobile, { margin: 1, width: 280 }),
-      QRCode.toDataURL(dual.external, { margin: 1, width: 280 }),
-      QRCode.toDataURL(shareLink, { margin: 1, width: 280 }),
+      toQr(dual.mobile),
+      toQr(dual.external),
+      toQr(shareLink),
     ]);
     const pub = mieru.publicClient(c, state);
     return res.json({
@@ -1279,14 +1312,14 @@ app.post('/api/nodes/:id/update-agent', (req, res) => {
   const job = nodes.enqueueJob(node, 'agent_update', {
     force: true,
     forceNew: true,
-    panelVersion: panelVersion(),
+    panelVersion: agentBundleVersion(),
   });
   persist();
   res.json({
     ok: true,
     pending: true,
     jobId: job.id,
-    message: `已下发「更新 Agent」到「${node.name}」（当前上报 v${node.agentVersion || '?'} → 面板 v${panelVersion()}）。约 10–30 秒后刷新看版本`,
+    message: `已下发「更新 Agent」到「${node.name}」（当前 v${node.agentVersion || '?'} → Agent 脚本 v${agentBundleVersion()}）。约 10–30 秒后刷新；若仍过旧请看任务结果`,
     node: enrichNodePublic(node),
   });
 });
@@ -1303,7 +1336,7 @@ app.post('/api/nodes/update-agent-all', (req, res) => {
     const job = nodes.enqueueJob(node, 'agent_update', {
       force: true,
       forceNew: true,
-      panelVersion: panelVersion(),
+      panelVersion: agentBundleVersion(),
     });
     jobs.push({ nodeId: node.id, name: node.name, jobId: job.id });
   }

@@ -64,7 +64,7 @@ function defaultState() {
     server: {
       listenPort: 7901,
       protocol: 'TCP',
-      endpoint: '114.111.176.37:7901',
+      endpoint: '',
       mtu: 1400,
       multiplexing: 'MULTIPLEXING_LOW',
       trafficPattern: 'conservative',

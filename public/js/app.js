@@ -803,7 +803,7 @@ function shell(content) {
     ['dashboard', '概览', 'dashboard'],
     ['topology', '拓扑', 'topology'],
     ['server', '落地', 'server'],
-    ['clients', '客户端', 'clients'],
+    ['clients', '客户', 'clients'],
   ];
   const navMore = [
     ['diagnose', '诊断', 'diagnose'],
@@ -1074,16 +1074,16 @@ function renderWizard() {
     };
   } else if (step === 3) {
     body.innerHTML = `
-      <h3>商家 IX 前置 + 沪日转发</h3>
-      <label>客户端连接的商家前置（不是手机）</label>
+      <h3>商家前置 + IX 转发</h3>
+      <label>客户端连接的商家前置（IP/域名，可改；不是手机、不是 IX 本机）</label>
       <div class="choice-grid" style="margin-bottom:12px">
-        <button type="button" class="choice-card ${ing.active === 'external' || !ing.active ? 'selected' : ''}" data-act="external">
-          <strong>外部前置 114</strong>
-          <span class="mono">${esc(ing.externalHost || '114.111.176.37')}</span>
+        <button type="button" class="choice-card ${ing.active === 'mobile' || !ing.active ? 'selected' : ''}" data-act="mobile">
+          <strong>主入口</strong>
+          <span class="mono">${esc(ing.mobileHost || '（到拓扑填写）')}</span>
         </button>
-        <button type="button" class="choice-card ${ing.active === 'mobile' ? 'selected' : ''}" data-act="mobile">
-          <strong>移动宽带前置 211</strong>
-          <span class="mono">${esc(ing.mobileHost || '211.136.162.184')}</span>
+        <button type="button" class="choice-card ${ing.active === 'external' ? 'selected' : ''}" data-act="external">
+          <strong>备用入口</strong>
+          <span class="mono">${esc(ing.externalHost || '（可选）')}</span>
         </button>
       </div>
       <div class="inline-fields">
@@ -1460,33 +1460,33 @@ async function renderTopology() {
         <span class="badge ok">端口段 ${esc(portMin)}–${esc(portMax)}</span>
       </div>
       <div class="mod-body">
-      <p class="field-hint" style="margin-top:0">每 IX 独立前置 · Host 可填 IP/域名 · <strong>客户端只填前置</strong></p>
+      <p class="field-hint" style="margin-top:0">每 IX 独立前置 · <strong>Host 可随时改</strong>（IP/域名）· 客户端只连「当前选用」的主入口</p>
       <div class="choice-grid" style="margin:10px 0">
-        <button type="button" class="choice-card ${active === 'external' || !active ? 'selected' : ''}" data-act="external">
-          <strong>外部前置 114</strong>
-          <span>当前选用下方 114 地址</span>
+        <button type="button" class="choice-card ${active === 'mobile' || !active ? 'selected' : ''}" data-act="mobile">
+          <strong>主入口</strong>
+          <span>分享二维码用这一条</span>
         </button>
-        <button type="button" class="choice-card ${active === 'mobile' ? 'selected' : ''}" data-act="mobile">
-          <strong>移动宽带前置 211</strong>
-          <span>当前选用下方 211 地址</span>
+        <button type="button" class="choice-card ${active === 'external' ? 'selected' : ''}" data-act="external">
+          <strong>备用入口</strong>
+          <span>可选第二前置</span>
         </button>
         <button type="button" class="choice-card ${active === 'custom' ? 'selected' : ''}" data-act="custom">
-          <strong>自定义 / 域名</strong>
-          <span>填自定义 Host</span>
+          <strong>自定义</strong>
+          <span>域名或其它 Host</span>
         </button>
       </div>
       <div class="inline-fields">
         <div>
-          <label>外部前置 114（IP 或域名）</label>
-          <input class="field mono" id="t-ext" value="${esc(ing.externalHost || '114.111.176.37')}" placeholder="114.x 或 domain" />
+          <label>主入口 Host（IP 或域名，可随时更换）</label>
+          <input class="field mono" id="t-mob" value="${esc(ing.mobileHost || '')}" placeholder="例如你的商家前置 IP / 域名" />
         </div>
         <div>
-          <label>移动宽带前置 211（IP 或域名）</label>
-          <input class="field mono" id="t-mob" value="${esc(ing.mobileHost || '211.136.162.184')}" placeholder="211.x 或 domain" />
+          <label>备用入口 Host（可选）</label>
+          <input class="field mono" id="t-ext" value="${esc(ing.externalHost || '')}" placeholder="可选第二前置" />
         </div>
         <div>
-          <label>自定义 Host / 域名</label>
-          <input class="field mono" id="t-custom" value="${esc(ing.customHost || '')}" placeholder="可选，如 front.example.com" />
+          <label>自定义 Host（选「自定义」时用）</label>
+          <input class="field mono" id="t-custom" value="${esc(ing.customHost || '')}" placeholder="如 front.example.com" />
         </div>
       </div>
       <div class="inline-fields" style="margin-top:8px">
@@ -1831,8 +1831,8 @@ async function renderTopology() {
         homeReachablePort: Number(val('t-port')) || 7901,
         ingress: {
           active: 'external',
-          externalHost: val('t-ext') || '114.111.176.37',
-          mobileHost: val('t-mob') || '211.136.162.184',
+          externalHost: val('t-ext') || '',
+          mobileHost: val('t-mob') || '',
           customHost: '',
           provinceWhitelist: val('t-province') || '',
         },
@@ -1994,7 +1994,7 @@ async function renderServer() {
               ${n.isPrimary ? '<span class="badge ok">默认</span>' : ''}
               ${n.online ? '<span class="badge ok">在线</span>' : '<span class="badge warn">离线</span>'}
               ${n.dirty ? '<span class="badge warn">未应用</span>' : ''}
-              ${n.agentOutdated ? '<span class="badge warn" title="点「更新 Agent」对齐面板版本">Agent 过旧</span>' : ''}
+              ${n.agentOutdated ? '<span class="badge warn" title="点「更新 Agent」对齐仓库 Agent 脚本版本">Agent 过旧</span>' : ''}
             </div>
             <div class="landing-row-meta">
               <span>mita <span class="mono">${esc(n.mita?.status || '-')}</span></span>
@@ -2007,7 +2007,7 @@ async function renderServer() {
           <div class="landing-row-body">
             <div class="kv"><span>主机 / Agent</span><span class="mono">${esc(n.hostname || '-')} · v${esc(
               n.agentVersion || '-'
-            )}${n.agentOutdated ? ' ⚠ 需更新至面板 v' + esc(n.panelVersion || state.status?.version || '') : ''}</span></div>
+            )}${n.agentOutdated ? ' ⚠ 需更新至 Agent v' + esc(n.agentTargetVersion || n.panelVersion || '') : ''}</span></div>
             <div class="kv"><span>出网 IP</span><span class="mono">${esc(n.exitPublicIp || '-')}</span></div>
             <div class="inline-fields" style="margin-top:10px">
               <div>
@@ -3134,8 +3134,16 @@ function openClientModal(client, preferLandingId) {
 async function showClientQr(id) {
   try {
     const data = await api(`/api/clients/${id}/config?format=qr`);
-    const mobile = data.shareLinks?.mobile || data.shareLink;
-    const external = data.shareLinks?.external || data.shareLink;
+    // 只分享「当前主入口」一条：preferred > active endpoint 对应链 > mobile > shareLink
+    const primary =
+      data.shareLinks?.preferred ||
+      data.shareLink ||
+      data.shareLinks?.mobile ||
+      data.shareLinks?.external ||
+      '';
+    const primaryEp =
+      data.endpoints?.active || data.endpoints?.mobile || data.endpoints?.external || '';
+    const qrSrc = data.qr || data.qrMobile || data.qrExternal || '';
     const exp = data.expireAt ? String(data.expireAt).slice(0, 10) : '不限';
     const note = (data.note || '').trim();
     let tab = 'qr'; // qr | link | conf
@@ -3157,7 +3165,7 @@ async function showClientQr(id) {
               }
             </div>
             <div class="qr-user-line muted" style="font-size:12px">${esc(
-              data.tip || '电脑连商家 IX 前置 114/211'
+              data.tip || '客户端只连拓扑里配置的主入口前置'
             )}</div>
           </div>
           <div class="share-tabs">
@@ -3166,38 +3174,23 @@ async function showClientQr(id) {
             <button type="button" class="share-tab ${tab === 'conf' ? 'on' : ''}" data-share-tab="conf">配置</button>
           </div>
           <div class="share-pane ${tab === 'qr' ? 'on' : ''}" data-share-pane="qr">
-            <div class="dual-qr">
-              <div class="dual-qr-col">
-                <strong>移动宽带 211</strong>
-                <div class="qr-wrap"><img src="${data.qrMobile || data.qr}" alt="qr-mobile" /></div>
-                <p class="mono center" style="font-size:11px;word-break:break-all">${esc(
-                  data.endpoints?.mobile || ''
-                )}</p>
-              </div>
-              <div class="dual-qr-col">
-                <strong>外部前置 114</strong>
-                <div class="qr-wrap"><img src="${data.qrExternal || data.qr}" alt="qr-ext" /></div>
-                <p class="mono center" style="font-size:11px;word-break:break-all">${esc(
-                  data.endpoints?.external || ''
-                )}</p>
-              </div>
+            <div class="single-qr">
+              <strong>主入口</strong>
+              <div class="qr-wrap"><img src="${qrSrc}" alt="qr" /></div>
+              <p class="mono center" style="font-size:12px;word-break:break-all">${esc(primaryEp)}</p>
+              <p class="field-hint center">换前置请到「拓扑」改主入口 Host，分享会自动更新</p>
             </div>
           </div>
           <div class="share-pane ${tab === 'link' ? 'on' : ''}" data-share-pane="link">
-            <label>移动宽带 211</label>
+            <label>主入口 mierus 链接</label>
             <div class="field-with-btn">
-              <input class="field mono" readonly value="${esc(mobile || '')}" id="share-link-m" />
-              <button type="button" class="btn btn-primary" id="qr-copy-m">复制</button>
-            </div>
-            <label style="margin-top:10px">外部前置 114</label>
-            <div class="field-with-btn">
-              <input class="field mono" readonly value="${esc(external || '')}" id="share-link-e" />
-              <button type="button" class="btn btn-secondary" id="qr-copy-e">复制</button>
+              <input class="field mono" readonly value="${esc(primary || '')}" id="share-link-primary" />
+              <button type="button" class="btn btn-primary" id="qr-copy-primary">复制</button>
             </div>
             <p class="field-hint">只填前置 Endpoint，勿填 IX 或家宽公网</p>
           </div>
           <div class="share-pane ${tab === 'conf' ? 'on' : ''}" data-share-pane="conf">
-            <p class="field-hint" style="margin-top:0">YAML = 完整 OpenClash/mihomo（211/114 + 防环），下载后直接导入</p>
+            <p class="field-hint" style="margin-top:0">YAML = OpenClash/mihomo 配置（主入口 + 防环），下载后直接导入</p>
             <div class="btn-row" style="flex-wrap:wrap;margin-bottom:10px">
               <a class="btn btn-primary" id="share-dl-yaml" href="/api/clients/${id}/config?format=yaml" download="${esc(
                 (data.name || 'client') + '-clash.yaml'
@@ -3206,11 +3199,9 @@ async function showClientQr(id) {
                 (data.name || 'client') + '.json'
               )}">下载 JSON</a>
               <button class="btn btn-ghost" id="qr-copy-json">复制 JSON</button>
-              <button class="btn btn-ghost" id="qr-copy-211">复制 211</button>
-              <button class="btn btn-ghost" id="qr-copy-114">复制 114</button>
             </div>
             <pre class="code-block" style="max-height:160px;overflow:auto;font-size:11px">${esc(
-              data.config || mobile || ''
+              data.config || primary || ''
             )}</pre>
           </div>
         `,
@@ -3221,30 +3212,6 @@ async function showClientQr(id) {
           tab = b.dataset.shareTab;
           paint();
         };
-      });
-      document.getElementById('qr-copy-m')?.addEventListener('click', async () => {
-        try {
-          await copyText(mobile);
-          toast('已复制 211 链接');
-        } catch (e) {
-          toast(e.message, 'err');
-        }
-      });
-      document.getElementById('qr-copy-e')?.addEventListener('click', async () => {
-        try {
-          await copyText(external);
-          toast('已复制 114 链接');
-        } catch (e) {
-          toast(e.message, 'err');
-        }
-      });
-      document.getElementById('qr-copy-json')?.addEventListener('click', async () => {
-        try {
-          await copyText(data.config);
-          toast('已复制 JSON');
-        } catch (e) {
-          toast(e.message, 'err');
-        }
       });
       const flashCopy = async (btn, text, okMsg) => {
         try {
@@ -3263,21 +3230,12 @@ async function showClientQr(id) {
           toast(e.message, 'err');
         }
       };
-      document.getElementById('qr-copy-211')?.addEventListener('click', (e) =>
-        flashCopy(e.currentTarget, mobile, '已复制 211')
+      document.getElementById('qr-copy-primary')?.addEventListener('click', (e) =>
+        flashCopy(e.currentTarget, primary, '已复制主入口链接')
       );
-      document.getElementById('qr-copy-114')?.addEventListener('click', (e) =>
-        flashCopy(e.currentTarget, external, '已复制 114')
+      document.getElementById('qr-copy-json')?.addEventListener('click', (e) =>
+        flashCopy(e.currentTarget, data.config, '已复制 JSON')
       );
-      // also improve primary copy buttons
-      const bm = document.getElementById('qr-copy-m');
-      if (bm) {
-        bm.onclick = (e) => flashCopy(e.currentTarget, mobile, '已复制 211 链接');
-      }
-      const be = document.getElementById('qr-copy-e');
-      if (be) {
-        be.onclick = (e) => flashCopy(e.currentTarget, external, '已复制 114 链接');
-      }
     };
     paint();
   } catch (e) {
@@ -3425,13 +3383,13 @@ async function renderSettings() {
 
     <div class="card" style="margin-top:16px">
       <div class="card-head"><h3>Agent 版本矩阵</h3>
-        <span class="badge ${nodes.some((n)=>n.agentOutdated) ? 'warn' : 'ok'}">面板 v${esc(state.status?.version || '')}</span>
+        <span class="badge ${nodes.some((n)=>n.agentOutdated) ? 'warn' : 'ok'}">Agent 目标 v${esc(nodes.find((n)=>n.agentTargetVersion)?.agentTargetVersion || state.status?.agentVersion || '—')} · 面板 UI v${esc(state.status?.version || '')}</span>
       </div>
-      <p class="card-desc">各落地 Agent 与面板版本对照；过旧请到落地页更新。</p>
+      <p class="card-desc">只对比仓库 Agent 脚本版本（与面板 UI 版本无关）。过旧请到落地页「更新 Agent」。</p>
       ${
         nodes.length
           ? `<div class="utable-wrap"><table class="utable" style="min-width:0">
-              <thead><tr><th>落地</th><th>状态</th><th>Agent</th><th>面板要求</th></tr></thead>
+              <thead><tr><th>落地</th><th>状态</th><th>当前 Agent</th><th>目标 Agent</th></tr></thead>
               <tbody>
                 ${nodes
                   .map(
@@ -3439,7 +3397,7 @@ async function renderSettings() {
                     <td><strong>${esc(n.name)}</strong></td>
                     <td><span class="status-dot ${n.online ? 'ok' : 'warn'}">${n.online ? '在线' : '离线'}</span></td>
                     <td class="mono">${esc(n.agentVersion || '—')}${n.agentOutdated ? ' <span class="badge warn">需更新</span>' : ''}</td>
-                    <td class="mono muted">v${esc(n.panelVersion || state.status?.version || '')}</td>
+                    <td class="mono muted">v${esc(n.agentTargetVersion || n.panelVersion || '—')}</td>
                   </tr>`
                   )
                   .join('')}
@@ -3630,7 +3588,7 @@ async function setupExit(nodeId) {
           <li>Agent 约 10 秒拉取任务</li>
           <li>在「拓扑」生成 IX 转发脚本并在对应 IX root 整文件执行</li>
           <li>勾选「IX 转发已配置」</li>
-          <li>本机客户端连商家前置 <strong>114/211</strong> mierus 链接</li>
+          <li>本机客户端连拓扑「主入口」的 mierus 链接（Host 可随时改）</li>
         </ol>
         <div class="btn-row">
           <button class="btn btn-primary" id="ex-topo">去拓扑</button>

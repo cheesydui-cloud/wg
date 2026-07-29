@@ -365,10 +365,11 @@ function buildShareLink(state, client, protocol) {
 function buildDualShareLinks(state, client, protocol) {
   ensureMieruDefaults(state);
   const s = state.server;
-  let mobileHost = '211.136.162.184';
-  let externalHost = '114.111.176.37';
+  // Host 一律来自拓扑配置，禁止写死商家 IP
+  let mobileHost = '';
+  let externalHost = '';
   let customHost = '';
-  let active = client?.route?.ingressActive || 'external';
+  let active = client?.route?.ingressActive || 'mobile';
   let ixId = client?.route?.ixId || null;
   try {
     const topology = require('./topology');
@@ -376,26 +377,29 @@ function buildDualShareLinks(state, client, protocol) {
     const opts = resolveClientIxOpts(state, client);
     const ing = topology.resolveIngress(state, opts);
     const ix = topology.resolveIx(state, opts);
-    mobileHost = ing.mobileHost || mobileHost;
-    externalHost = ing.externalHost || externalHost;
-    customHost = ing.customHost || '';
-    if (!client?.route?.ingressActive) active = ing.active || 'external';
+    mobileHost = String(ing.mobileHost || '').trim();
+    externalHost = String(ing.externalHost || '').trim();
+    customHost = String(ing.customHost || '').trim();
+    if (!client?.route?.ingressActive) active = ing.active || 'mobile';
     ixId = ix?.id || ixId;
   } catch {
     const ep = endpointHost(state, client);
-    if (ep === externalHost) active = 'external';
-    else if (ep && ep !== mobileHost) active = 'custom';
+    if (ep && externalHost && ep === externalHost) active = 'external';
+    else if (ep && mobileHost && ep !== mobileHost) active = 'custom';
   }
   const mode = normalizeProtocol(s.protocol);
   const proto = String(protocol || protocolsForMode(mode)[0]).toUpperCase();
   const listenPort = clientListenPort(client, state);
   const port = portForProtocol(listenPort, proto, mode);
-  const mobile = shareLinkForHost(state, client, mobileHost, proto, listenPort);
-  const external = shareLinkForHost(state, client, externalHost, proto, listenPort);
-  let preferredHost = mobileHost;
-  if (active === 'external') preferredHost = externalHost;
-  else if (active === 'custom') preferredHost = customHost || mobileHost;
-  const preferred = shareLinkForHost(state, client, preferredHost, proto, listenPort);
+  const mobile = mobileHost ? shareLinkForHost(state, client, mobileHost, proto, listenPort) : '';
+  const external = externalHost ? shareLinkForHost(state, client, externalHost, proto, listenPort) : '';
+  let preferredHost = mobileHost || externalHost || customHost;
+  if (active === 'external') preferredHost = externalHost || preferredHost;
+  else if (active === 'custom') preferredHost = customHost || mobileHost || externalHost;
+  else preferredHost = mobileHost || customHost || externalHost;
+  const preferred = preferredHost
+    ? shareLinkForHost(state, client, preferredHost, proto, listenPort)
+    : '';
   return {
     mobile,
     external,
@@ -405,11 +409,11 @@ function buildDualShareLinks(state, client, protocol) {
     landingNodeId: clientLandingNodeId(client, state),
     ixId,
     endpoints: {
-      mobile: `${mobileHost}:${port}`,
-      external: `${externalHost}:${port}`,
-      active: `${preferredHost}:${port}`,
+      mobile: mobileHost ? `${mobileHost}:${port}` : '',
+      external: externalHost ? `${externalHost}:${port}` : '',
+      active: preferredHost ? `${preferredHost}:${port}` : '',
     },
-    tip: '电脑/客户端连该线路所属 IX 的商家前置（外部/移动宽带），不是手机、不是家宽公网。',
+    tip: '客户端只连拓扑里配置的「主入口」前置，勿填 IX 内网或家宽公网。换前置时在拓扑改 Host 即可。',
   };
 }
 
@@ -509,7 +513,7 @@ function buildClashYaml(state, client, protocol) {
     seen.add(h);
     hosts.push({ label, host: h });
   };
-  // 优先 211/114，再补 active（自定义前置）
+  // 优先主入口/备用，再补 active（自定义前置）
   const mHost = hostFromEndpoint(dual.endpoints?.mobile);
   const eHost = hostFromEndpoint(dual.endpoints?.external);
   const aHost = hostFromEndpoint(dual.endpoints?.active);
@@ -904,7 +908,7 @@ function diagnose(state, opts = {}) {
       level: 'info',
       title: '连接参数已变（提醒）',
       detail: '入站/端口/密码改过。这不是故障：客户端要用新 mierus 链接；更新后点「我已更新」即可消除本条',
-      fix: '到「客户端」重新复制 mierus://（host=商家前置 114/211）→ 顶栏点「我已更新」',
+      fix: '到「客户」页重新复制主入口 mierus:// 链接 → 顶栏点「我已更新」',
     });
   }
 

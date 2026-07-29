@@ -2239,27 +2239,43 @@ async function renderClients() {
       if (!c) return toast('用户不存在，请刷新', 'err');
       const next = c.enabled === false;
       const tip = next
-        ? `启用「${c.name}」？保存后请点「应用本落地」，用户才能重新连上。`
-        : `禁用「${c.name}」？保存后请点「应用本落地」，该用户将无法认证上网。`;
+        ? `启用「${c.name}」？将自动下发到落地 mita，约 10–30 秒后可连。`
+        : `禁用「${c.name}」？将自动下发到落地 mita，去掉该账号，约 10–30 秒后无法认证。`;
       if (!confirm(tip)) return;
       try {
-        await api(`/api/clients/${encodeURIComponent(id)}`, {
+        b.disabled = true;
+        // 服务端 PUT 会排队 apply；这里再兜底点一次 apply
+        const putRes = await api(`/api/clients/${encodeURIComponent(id)}`, {
           method: 'PUT',
           body: { enabled: next },
         });
-        const landingId = c.route?.landingNodeId;
-        toast(next ? '已启用（请应用本落地）' : '已禁用（请应用本落地）');
-        // 在线落地时自动排队 apply，真正从 mita 去掉/加回账号
-        if (landingId) {
+        const landingId =
+          putRes.applyNodeId ||
+          putRes.client?.route?.landingNodeId ||
+          c.route?.landingNodeId ||
+          '';
+        if (putRes.applyQueued) {
+          toast(putRes.message || (next ? '已启用并下发' : '已禁用并下发'), 'ok');
+        } else if (landingId) {
           try {
-            await api(`/api/nodes/${encodeURIComponent(landingId)}/apply`, {
+            const ap = await api(`/api/nodes/${encodeURIComponent(landingId)}/apply`, {
               method: 'POST',
               body: {},
             });
-            toast(next ? '已下发启用' : '已下发禁用', 'ok');
+            toast(ap.message || (next ? '已下发启用' : '已下发禁用'), 'ok');
           } catch (ae) {
-            toast(`状态已改，自动应用失败：${ae.data?.error || ae.message}，请手动点「应用本落地」`, 'err');
+            toast(
+              `状态已改，自动应用失败：${ae.data?.error || ae.message}。请点该落地「应用本落地」`,
+              'err'
+            );
           }
+        } else {
+          toast(
+            next
+              ? '已启用，但未绑定落地，请编辑用户选落地后点应用'
+              : '已禁用，但未绑定落地，请编辑用户选落地后点应用',
+            'err'
+          );
         }
         await refreshCore();
         render();

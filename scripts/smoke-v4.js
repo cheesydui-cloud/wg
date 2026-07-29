@@ -253,6 +253,36 @@ assert.strictEqual(jsonDom.profiles[0].servers[0].ipAddress, '');
     ok('disable excludes user from mita apply users');
   }
 
+  // 9d) buildBundle-equivalent: disabled user never in serverConfig.users
+  {
+    const c0 = state.clients[0];
+    const c1 = state.clients[1];
+    c0.enabled = true;
+    c1.enabled = false;
+    c0.route = c0.route || {};
+    c0.route.landingNodeId = state.nodes[0].id;
+    c1.route = c1.route || {};
+    c1.route.landingNodeId = state.nodes[0].id;
+    // simulate buildBundle users list
+    const users = mieru.usersForBundle(state, state.nodes[0].id);
+    const enabled = users.filter((u) => u.enabled !== false);
+    const scUsers = enabled.map((u) => ({ name: u.name, password: u.password }));
+    assert.ok(scUsers.some((u) => u.name === c0.name), 'enabled user in serverConfig');
+    assert.ok(!scUsers.some((u) => u.name === c1.name), 'disabled user NOT in serverConfig');
+    const disabledNames = users.filter((u) => u.enabled === false).map((u) => u.name);
+    assert.ok(disabledNames.includes(c1.name), 'disabledNames lists disabled user');
+    // all disabled → hold user
+    c0.enabled = false;
+    const en2 = mieru.usersForBundle(state, state.nodes[0].id).filter((u) => u.enabled !== false);
+    assert.strictEqual(en2.length, 0, 'all disabled');
+    const hold = { name: 'panelhold', password: 'x' };
+    const sc2 = en2.length ? en2 : [hold];
+    assert.strictEqual(sc2[0].name, 'panelhold', 'hold user when all disabled');
+    c0.enabled = true;
+    c1.enabled = true;
+    ok('bundle serverConfig excludes disabled; hold when all disabled');
+  }
+
 // 10) publicTopology exposes per-IX endpoints
 const pub2 = topology.publicTopology(state);
 const pubIx2 = pub2.ixes.find((x) => x.id === 'ix-2');

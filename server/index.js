@@ -286,6 +286,9 @@ function applyRoutePackageBody(client, body) {
   if (body.quotaDays !== undefined) client.package.quotaDays = Math.max(0, Number(body.quotaDays) || 0);
 }
 
+/** mita 至少需要 1 个用户；本落地全部禁用时用占位账号顶住配置，真实用户无法认证 */
+const HOLD_USER_NAME = 'panelhold';
+
 function buildBundleForNode(node) {
   mieru.ensureMieruDefaults(state);
   topology.ensureTopology(state);
@@ -305,22 +308,39 @@ function buildBundleForNode(node) {
   };
 
   const users = mieru.usersForBundle(state, node.id);
-  const enabled = users.filter((u) => u.enabled !== false);
+  const enabled = users.filter((u) => u.enabled !== false && u.name && u.password);
+  // 禁用用户名列表：Agent 应用后对这些账号再跑 user-disable 兜底踢出
+  const disabledNames = users
+    .filter((u) => u.enabled === false && u.name)
+    .map((u) => String(u.name));
+  let holdUser = false;
   const fakeClients = enabled.map((u) => ({
     id: u.id,
     name: u.name,
     password: u.password,
     enabled: true,
   }));
-  // if no enabled users, still allow empty? mita needs users — throw at build
+  // 本落地无任何启用用户时：写入随机密码占位用户，确保 mita apply 能覆盖掉旧账号
+  if (!fakeClients.length) {
+    holdUser = true;
+    const holdPass =
+      node._holdPassword && String(node._holdPassword).length >= 12
+        ? node._holdPassword
+        : mieru.randomPassword(24);
+    node._holdPassword = holdPass;
+    fakeClients.push({
+      id: '__panel_hold',
+      name: HOLD_USER_NAME,
+      password: holdPass,
+      enabled: true,
+    });
+  } else if (node._holdPassword) {
+    delete node._holdPassword;
+  }
+
   const fake = {
     server: { ...state.server, listenPort, protocol: node.server.protocol },
-    clients: fakeClients.length
-      ? fakeClients
-      : [
-          // fallback: if node has zero users, include a placeholder disabled path
-          // buildServerConfig will throw NO_USERS which is correct
-        ],
+    clients: fakeClients,
     primaryNodeId: node.id,
   };
 
@@ -336,7 +356,9 @@ function buildBundleForNode(node) {
     throw err;
   }
   // 强制 portBindings 与本落地 listenPort 一致（防全局 7901 渗入）
-  // BOTH：TCP=base，UDP=base+1（与 share 链 / portForProtocol 一致）
+  // BOTH：TCP=base，UDP=base+1（与分享链 / portForProtocol 一致）
+  // 强制 users 只含启用账号（+ 可选占位），绝不能把 disabled 写进 mita
+  serverConfig.users = fakeClients.map((u) => ({ name: u.name, password: u.password }));
   const proto = mieru.normalizeProtocol(fake.server.protocol || 'TCP');
   const bindings = [];
   for (const p of mieru.protocolsForMode(proto)) {
@@ -348,7 +370,13 @@ function buildBundleForNode(node) {
   serverConfig.portBindings = bindings;
   const hash = crypto
     .createHash('sha256')
-    .update(JSON.stringify({ serverConfig, users: users.map((u) => ({ n: u.name, e: u.enabled, p: u.package })) }))
+    .update(
+      JSON.stringify({
+        serverConfig,
+        users: users.map((u) => ({ n: u.name, e: u.enabled, p: u.package })),
+        holdUser,
+      })
+    )
     .digest('hex');
 
   return {
@@ -364,6 +392,8 @@ function buildBundleForNode(node) {
     users,
     serverConfig,
     configHash: hash,
+    disabledNames,
+    holdUser,
   };
 }
 
@@ -905,6 +935,7 @@ app.put('/api/clients/:id', (req, res) => {
     c.password = mieru.randomPassword(18);
     state.clientsNeedRescan = true;
   }
+  const prevEnabled = c.enabled !== false;
   if (body.enabled !== undefined) c.enabled = Boolean(body.enabled);
   if (body.note !== undefined) c.note = String(body.note);
   applyRoutePackageBody(c, body);
@@ -917,11 +948,37 @@ app.put('/api/clients/:id', (req, res) => {
   }
   if (body.route?.listenPort || body.listenPort) state.clientsNeedRescan = true;
 
+  // 启用/禁用变更：服务端直接排队 apply，不依赖前端是否点「应用本落地」
+  let applyJob = null;
+  let applyNodeId = null;
+  const enabledChanged =
+    body.enabled !== undefined && prevEnabled !== (c.enabled !== false);
+  if (enabledChanged && state.mode === 'agent') {
+    const nid = nextLanding || prevLanding || state.primaryNodeId;
+    const node = nid ? nodes.findNode(state, nid) : null;
+    if (node) {
+      applyNodeId = node.id;
+      applyJob = enqueueApply(node, 'mieru_apply');
+    }
+  }
+
   persist();
   res.json({
     client: mieru.publicClient(c, state),
     dirty: true,
     clientsNeedRescan: state.clientsNeedRescan,
+    applyQueued: Boolean(applyJob),
+    applyJob,
+    applyNodeId,
+    message: enabledChanged
+      ? c.enabled === false
+        ? applyJob
+          ? '已禁用并下发到落地（约 10–30 秒后生效）'
+          : '已禁用（未找到落地，请手动点应用本落地）'
+        : applyJob
+          ? '已启用并下发到落地（约 10–30 秒后生效）'
+          : '已启用（未找到落地，请手动点应用本落地）'
+      : undefined,
   });
 });
 
@@ -1288,8 +1345,10 @@ app.post('/api/nodes/:id/apply', (req, res) => {
       if (nrm) c.route.landingNodeId = nrm;
     }
   }
-  const bound = mieru.clientsForNode(state, node.id).filter((c) => c.enabled !== false);
-  if (!bound.length) {
+  // 含禁用用户：整落地都禁用时仍要 apply，用占位账号覆盖 mita 踢掉真实用户
+  const allBound = mieru.clientsForNode(state, node.id);
+  const bound = allBound.filter((c) => c.enabled !== false);
+  if (!allBound.length) {
     const dist = (state.clients || [])
       .map((c) => {
         const lid = mieru.clientLandingNodeId(c, state);
@@ -1309,11 +1368,19 @@ app.post('/api/nodes/:id/apply', (req, res) => {
   }
   const job = enqueueApply(node, 'mieru_apply');
   persist();
+  const nEn = bound.length;
+  const nDis = allBound.length - nEn;
+  const tip =
+    nEn === 0
+      ? `已下发「${node.name}」：全部用户已禁用，将用占位账号覆盖 mita（真实用户无法认证）`
+      : nDis > 0
+        ? `已下发应用到「${node.name}」（启用 ${nEn} · 禁用 ${nDis}）`
+        : `已下发应用到「${node.name}」（${nEn} 用户）`;
   res.json({
     ok: true,
     pending: true,
     job,
-    message: node.lastSeenAt ? `已下发应用到「${node.name}」（${bound.length} 用户）` : '任务已创建，等待 Agent 上线',
+    message: node.lastSeenAt ? tip : '任务已创建，等待 Agent 上线',
     node: enrichNodePublic(node),
   });
 });
@@ -1360,8 +1427,10 @@ app.post('/api/apply', async (req, res) => {
     if (nodeId) {
       const node = nodes.findNode(state, nodeId);
       if (!node) return res.status(404).json({ ok: false, error: '节点不存在' });
-      const bound = mieru.clientsForNode(state, node.id).filter((c) => c.enabled !== false);
-      if (!bound.length) {
+      // 含禁用用户即可 apply（全禁用用 panelhold 覆盖 mita）
+      const allBound = mieru.clientsForNode(state, node.id);
+      const bound = allBound.filter((c) => c.enabled !== false);
+      if (!allBound.length) {
         return res.status(400).json({
           ok: false,
           code: 'NO_USERS',
@@ -1375,7 +1444,10 @@ app.post('/api/apply', async (req, res) => {
         mode: 'agent',
         pending: true,
         job,
-        message: `已下发应用到「${node.name}」（${bound.length} 用户）`,
+        message:
+          bound.length === 0
+            ? `已下发「${node.name}」：全部禁用，将覆盖 mita 踢掉真实用户`
+            : `已下发应用到「${node.name}」（启用 ${bound.length}）`,
         dirty: true,
       });
     }
@@ -1388,8 +1460,8 @@ app.post('/api/apply', async (req, res) => {
           } catch {
             /* */
           }
-          // 应用全部：只下发「有用户且 dirty」的落地；空落地跳过
-          const uc = mieru.clientsForNode(state, n.id).filter((c) => c.enabled !== false).length;
+          // 有绑定用户（含全禁用）且 dirty 就下发
+          const uc = mieru.clientsForNode(state, n.id).length;
           return uc > 0 && nodes.isNodeDirty(n, hasher());
         })
       : (() => {
@@ -1409,12 +1481,12 @@ app.post('/api/apply', async (req, res) => {
       }
       return res.status(400).json({ ok: false, error: '远程模式但没有节点，请先安装 Agent' });
     }
-    // 应用全部时跳过 0 用户（避免任务必失败）
+    // 应用全部时跳过真正 0 绑定（全禁用仍下发）
     const jobs = [];
     const skipped = [];
     for (const node of targets) {
-      const bound = mieru.clientsForNode(state, node.id).filter((c) => c.enabled !== false);
-      if (!bound.length) {
+      const allBound = mieru.clientsForNode(state, node.id);
+      if (!allBound.length) {
         skipped.push(node.name);
         continue;
       }

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Edge Agent v4.3.1 — mieru / mita 落地（支持多落地 + 流量/套餐）
+ * Edge Agent v4.3.2 — mieru / mita 落地（支持多落地 + 流量/套餐）
  * 连接中心面板，拉取任务：安装/应用 mita、上报状态与用量
  *
  * 环境变量：
@@ -19,7 +19,7 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
-const VERSION = '4.3.1';
+const VERSION = '4.3.2';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';
@@ -764,21 +764,36 @@ async function portIsListening(port, opts = {}) {
 async function installOrReconfigure(bundle) {
 
   const s = bundle.server || {};
+  // 禁用名单：配置里不得出现这些账号（面板 disabledNames 优先，其次 bundle.users.enabled=false）
+  const disabledSet = new Set(
+    [
+      ...(Array.isArray(bundle.disabledNames) ? bundle.disabledNames : []),
+      ...((bundle.users || []).filter((u) => u && u.enabled === false).map((u) => u.name) || []),
+    ]
+      .map((n) => String(n || '').trim())
+      .filter(Boolean)
+  );
   const users = (bundle.users || []).filter(
     (u) =>
       u.enabled !== false &&
       u.name &&
       u.password &&
+      !disabledSet.has(String(u.name)) &&
       /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(String(u.name))
   );
-  if (!users.length) {
+  // serverConfig 可能已含 panelhold 占位；无启用用户时也允许继续 apply
+  const scUsers = Array.isArray(bundle.serverConfig?.users) ? bundle.serverConfig.users : [];
+  if (!users.length && !scUsers.length) {
     return {
       ok: false,
       message: '没有合法 mita 用户（用户名须英文/数字，不能用「我的手机」）',
     };
   }
 
-  const primary = users[0];
+  const primary = users[0] || {
+    name: scUsers[0]?.name || 'panelhold',
+    password: scUsers[0]?.password || '',
+  };
   const port = Number(s.listenPort) || 7901;
   const protocol = String(s.protocol || 'TCP').toUpperCase();
   const script = await ensureInstallScript();
@@ -811,9 +826,14 @@ async function installOrReconfigure(bundle) {
     } else {
       cfg.portBindings = [{ port, protocol: 'TCP' }];
     }
+    // 关键：从配置里剔除禁用用户（即使旧 serverConfig 误带了也删掉）
     if (Array.isArray(cfg.users)) {
       cfg.users = cfg.users.filter(
-        (u) => u?.name && u?.password && /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(String(u.name))
+        (u) =>
+          u?.name &&
+          u?.password &&
+          !disabledSet.has(String(u.name)) &&
+          /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(String(u.name))
       );
     }
     if (!cfg.users?.length) {
@@ -821,12 +841,33 @@ async function installOrReconfigure(bundle) {
     }
     // mita apply 需要明文 password；若只有 hashed 会导致看似成功但端口/用户不更新
     const byName = new Map(users.map((u) => [u.name, u.password]));
-    cfg.users = cfg.users.map((u) => ({
-      name: u.name,
-      password: u.password || byName.get(u.name) || '',
-    })).filter((u) => u.password);
+    cfg.users = cfg.users
+      .map((u) => ({
+        name: u.name,
+        password: u.password || byName.get(u.name) || '',
+      }))
+      .filter((u) => u.password && !disabledSet.has(String(u.name)));
     if (!cfg.users.length) return null;
     return cfg;
+  }
+
+  /** apply 后：对禁用账号再跑 user-disable 兜底（mita 若未完全替换配置） */
+  async function purgeDisabledUsers() {
+    const notes = [];
+    if (!disabledSet.size) return notes;
+    for (const name of disabledSet) {
+      if (!name || name === 'panelhold') continue;
+      try {
+        const r = await runShell(
+          `bash ${JSON.stringify(script)} --user-disable -y --user ${JSON.stringify(name)} 2>/dev/null || bash ${JSON.stringify(script)} --user-del -y --user ${JSON.stringify(name)} 2>/dev/null || true`,
+          { timeout: 60000 }
+        );
+        notes.push(`disable ${name}: ${r.ok ? 'ok' : 'skip'}`);
+      } catch (e) {
+        notes.push(`disable ${name}: ${e.message}`);
+      }
+    }
+    return notes;
   }
 
   // 1) mita 已装：优先 apply-full（多用户一次到位）
@@ -843,10 +884,13 @@ async function installOrReconfigure(bundle) {
       const listening = await portIsListening(port);
       if (listening) {
         const pkgNotes = await applyUserPackages(bundle.users, script);
+        const disableNotes = await purgeDisabledUsers();
         return {
           ok: true,
-          message: `已同步 mita（${cfg0.users.length} 用户）· 端口 ${port} · RUNNING`,
+          message: `已同步 mita（${cfg0.users.length} 用户${disabledSet.size ? ` · 禁用 ${disabledSet.size}` : ''}）· 端口 ${port} · RUNNING`,
           detail: {
+            disabled: [...disabledSet],
+            disableNotes,
             action: 'apply-full',
             mita: ap.mita,
             configHash: bundle.configHash,
@@ -910,6 +954,7 @@ async function installOrReconfigure(bundle) {
       secondApplyMsg = ap2.message || '';
       if (ap2.ok) {
         const pkgNotes = await applyUserPackages(bundle.users, script);
+        const disableNotes = await purgeDisabledUsers();
         const st = await mitaStatus();
         const via = applyFailMsg ? '（安装后 apply 成功）' : '';
         const listening2 = await portIsListening(port);
@@ -920,13 +965,15 @@ async function installOrReconfigure(bundle) {
         } else {
           return {
             ok: true,
-            message: `落地完成 · mita RUNNING · 端口 ${port} · ${cfg1.users.length} 用户${via}`,
+            message: `落地完成 · mita RUNNING · 端口 ${port} · ${cfg1.users.length} 用户${via}${disabledSet.size ? ` · 禁用 ${disabledSet.size}` : ''}`,
             detail: {
               action: applyFailMsg ? 'oneclick+apply-full' : 'apply-full',
               mita: st,
               configHash: bundle.configHash,
               users: cfg1.users.map((u) => u.name),
               packageNotes: pkgNotes,
+              disabled: [...disabledSet],
+              disableNotes,
               applyFailBefore: applyFailMsg || undefined,
               scriptOk: r.ok,
               listenPort: port,
@@ -939,6 +986,7 @@ async function installOrReconfigure(bundle) {
   }
 
   const pkgNotes = await applyUserPackages(bundle.users, script);
+  const disableNotes = await purgeDisabledUsers();
   const st = await mitaStatus();
   const listening = await portIsListening(port);
   // 必须本机真正在听目标端口才算成功（避免 7901 跑着却报 OK）
@@ -972,6 +1020,8 @@ async function installOrReconfigure(bundle) {
       scriptOk: r.ok,
       users: users.map((u) => u.name),
       packageNotes: pkgNotes,
+      disabled: [...disabledSet],
+      disableNotes,
       scriptTail,
       applyFailBefore: applyFailMsg || undefined,
       secondApplyOk: secondApplyOk || undefined,

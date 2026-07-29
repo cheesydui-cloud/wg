@@ -182,7 +182,28 @@ function enrichNodePublic(node) {
     : null;
   pub.isPrimary = state.primaryNodeId === node.id;
   pub.agentOutdated = isAgentOutdated(node.agentVersion);
+  pub.agentTargetVersion = agentBundleVersion();
   pub.panelVersion = panelVersion();
+  // 最近一次任务（含 agent_update 成败），便于 UI 展示为何没更新
+  try {
+    const jobs = Array.isArray(node.jobs) ? node.jobs : [];
+    const last = jobs.find((j) => j && (j.type === 'agent_update' || j.type === 'self_update')) || jobs[0] || null;
+    if (last) {
+      pub.lastJob = {
+        id: last.id,
+        type: last.type,
+        status: last.status,
+        message: last.result?.message || '',
+        createdAt: last.createdAt,
+        finishedAt: last.finishedAt,
+        ok: last.result?.ok,
+      };
+    }
+    if (node.lastAgentUpdateAt) pub.lastAgentUpdateAt = node.lastAgentUpdateAt;
+    if (node.lastAgentUpdateMessage) pub.lastAgentUpdateMessage = node.lastAgentUpdateMessage;
+  } catch {
+    /* */
+  }
   pub.agentTargetVersion = agentBundleVersion();
   try {
     topology.ensureTopology(state);
@@ -1393,17 +1414,22 @@ app.post('/api/nodes/:id/update-agent', (req, res) => {
       code: 'AGENT_OFFLINE',
     });
   }
+  const target = agentBundleVersion();
   const job = nodes.enqueueJob(node, 'agent_update', {
     force: true,
     forceNew: true,
-    panelVersion: agentBundleVersion(),
+    agentTargetVersion: target,
+    targetVersion: target,
+    // 兼容旧 agent：仍带 panelVersion 字段，但值必须是 Agent 脚本版本
+    panelVersion: target,
   });
   persist();
   res.json({
     ok: true,
     pending: true,
     jobId: job.id,
-    message: `已下发「更新 Agent」到「${node.name}」（当前 v${node.agentVersion || '?'} → Agent 脚本 v${agentBundleVersion()}）。约 10–30 秒后刷新；若仍过旧请看任务结果`,
+    message: `已下发「更新 Agent」到「${node.name}」（当前 v${node.agentVersion || '?'} → Agent 脚本 v${target}）。约 15–40 秒后点刷新；展开落地可看任务结果`,
+    targetVersion: target,
     node: enrichNodePublic(node),
   });
 });
@@ -1417,19 +1443,23 @@ app.post('/api/nodes/update-agent-all', (req, res) => {
       skipped.push({ id: node.id, name: node.name, reason: 'offline' });
       continue;
     }
+    const target = agentBundleVersion();
     const job = nodes.enqueueJob(node, 'agent_update', {
       force: true,
       forceNew: true,
-      panelVersion: agentBundleVersion(),
+      agentTargetVersion: target,
+      targetVersion: target,
+      panelVersion: target,
     });
-    jobs.push({ nodeId: node.id, name: node.name, jobId: job.id });
+    jobs.push({ nodeId: node.id, name: node.name, jobId: job.id, targetVersion: target });
   }
   persist();
   res.json({
     ok: true,
-    message: `已向 ${jobs.length} 台在线落地排队更新 Agent` + (skipped.length ? `，${skipped.length} 台离线跳过` : ''),
+    message: `已向 ${jobs.length} 台在线落地排队更新 Agent v${agentBundleVersion()}` + (skipped.length ? `，${skipped.length} 台离线跳过` : ''),
     jobs,
     skipped,
+    targetVersion: agentBundleVersion(),
   });
 });
 
@@ -1900,6 +1930,9 @@ app.post('/api/agent/heartbeat', (req, res) => {
     jobs: pending.map((j) => ({ id: j.id, type: j.type, payload: j.payload || {} })),
     protocol: 'mieru',
     panelVersion: panelVersion(),
+    // Agent 自更新只认这个（脚本版本），不是面板 UI 版本
+    agentTargetVersion: agentBundleVersion(),
+    agentBundleVersion: agentBundleVersion(),
     agentOutdated: isAgentOutdated(node.agentVersion),
   });
 });
@@ -1926,8 +1959,14 @@ app.get('/api/agent/bundle', (req, res) => {
 app.get('/api/agent/download', (req, res) => {
   const node = agentAuth(req, res);
   if (!node) return;
-  res.type('application/javascript; charset=utf-8');
-  res.sendFile(path.join(ROOT, 'agent', 'index.js'));
+  const agentPath = path.join(ROOT, 'agent', 'index.js');
+  if (!fs.existsSync(agentPath)) {
+    return res.status(404).json({ error: '面板缺少 agent/index.js' });
+  }
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('X-Agent-Version', agentBundleVersion());
+  res.sendFile(agentPath);
 });
 
 app.post('/api/agent/job-result', (req, res) => {
@@ -1937,6 +1976,12 @@ app.post('/api/agent/job-result', (req, res) => {
   const cleanMsg = sanitizeAgentMessage(message, ok);
   const job = nodes.completeJob(node, jobId, { ok, message: cleanMsg, detail });
   if (!job) return res.status(404).json({ error: '任务不存在' });
+
+  if (ok && (job.type === 'agent_update' || job.type === 'self_update')) {
+    if (detail?.version) node.agentVersion = String(detail.version);
+    node.lastAgentUpdateAt = new Date().toISOString();
+    node.lastAgentUpdateMessage = cleanMsg || '';
+  }
 
   if (
     ok &&

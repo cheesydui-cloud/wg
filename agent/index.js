@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Edge Agent v4.3.2 — mieru / mita 落地（支持多落地 + 流量/套餐）
+ * Edge Agent v4.3.3 — mieru / mita 落地（支持多落地 + 流量/套餐）
  * 连接中心面板，拉取任务：安装/应用 mita、上报状态与用量
  *
  * 环境变量：
@@ -19,7 +19,7 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
-const VERSION = '4.3.2';
+const VERSION = '4.3.3';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';
@@ -69,65 +69,103 @@ const SELF_UPDATE_COOLDOWN_MS = 10 * 60 * 1000;
  * @param {{ force?: boolean, targetVersion?: string }} opts
  * force=true：面板「一键更新 Agent」下发，忽略版本比较与冷却
  */
+async function resolveAgentSelfPath() {
+  const candidates = [];
+  if (process.argv[1]) candidates.push(path.resolve(process.argv[1]));
+  candidates.push('/opt/wg-agent/index.js');
+  candidates.push(path.join(__dirname || '', 'index.js'));
+  for (const p of candidates) {
+    if (!p) continue;
+    try {
+      if (fs.existsSync(p) && fs.statSync(p).isFile()) return p;
+    } catch {
+      /* */
+    }
+  }
+  return candidates[0] || '';
+}
+
 async function performSelfUpdate(opts = {}) {
   const force = Boolean(opts.force);
-  const targetVersion = opts.targetVersion || '';
+  // 目标必须是 Agent 脚本版本（如 4.3.3），禁止用面板 UI 版本（4.6.x）比较
+  let targetVersion = String(opts.targetVersion || '').trim().replace(/^v/i, '');
+  if (targetVersion && !parseSemver(targetVersion)) {
+    // 误传了面板 UI 版本 → 忽略，走强制下载比对文件
+    targetVersion = '';
+  }
   if (!force) {
-    if (!targetVersion || cmpSemver(VERSION, targetVersion) >= 0) return { ok: false, skipped: true, message: '已是最新' };
+    if (targetVersion && cmpSemver(VERSION, targetVersion) >= 0) {
+      return { ok: true, skipped: true, message: `已是最新 v${VERSION}`, version: VERSION };
+    }
+    if (!targetVersion) {
+      // 无有效目标时仍允许探测下载，但下面会用 newVer 比较
+    }
     if (Date.now() - _lastSelfUpdateAt < SELF_UPDATE_COOLDOWN_MS) {
       return { ok: false, skipped: true, message: '冷却中，稍后再试' };
     }
   }
   _lastSelfUpdateAt = Date.now();
-  const selfPath = process.argv[1] ? path.resolve(process.argv[1]) : '';
-  if (!selfPath || !fs.existsSync(selfPath)) {
-    return { ok: false, message: '无法定位 agent 自身路径' };
+  const selfPath = await resolveAgentSelfPath();
+  if (!selfPath) {
+    return { ok: false, message: '无法定位 agent 路径（argv 与 /opt/wg-agent/index.js 均无效）' };
   }
   console.log(
-    `[agent] ${force ? '面板下发强制更新' : '自动更新'}（当前 ${VERSION} → 目标 ${targetVersion || 'panel'}）…`
+    `[agent] ${force ? '面板下发强制更新' : '自动更新'}（当前 ${VERSION} → 目标 ${targetVersion || 'download'} · 路径 ${selfPath}）…`
   );
   try {
     const body = await requestRaw('GET', '/api/agent/download');
     const text = typeof body === 'string' ? body : String(body || '');
-    if (!text.includes('Edge Agent') && !text.includes('installOrReconfigure')) {
-      return { ok: false, message: '下载内容不像 agent 脚本' };
+    if (text.length < 500) {
+      return { ok: false, message: `下载内容过短 (${text.length}B)，可能是鉴权/反代错误` };
     }
-    if (!text.includes('VERSION') && !/const VERSION\s*=/.test(text)) {
+    if (!text.includes('Edge Agent') && !text.includes('installOrReconfigure') && !text.includes('mieru')) {
+      return { ok: false, message: `下载内容不像 agent 脚本: ${text.slice(0, 80)}` };
+    }
+    if (!/const VERSION\s*=/.test(text) && !text.includes('VERSION')) {
       return { ok: false, message: '下载内容缺少 VERSION' };
     }
-    const m = text.match(/const VERSION = ['"]([^'"]+)['"]/);
+    const m = text.match(/const VERSION\s*=\s*['"]([^'"]+)['"]/);
     const newVer = m ? m[1] : targetVersion || '?';
-    if (!force && newVer && cmpSemver(VERSION, newVer) >= 0) {
+    if (!force && newVer && parseSemver(newVer) && cmpSemver(VERSION, newVer) >= 0) {
       return { ok: true, skipped: true, message: `已是最新 v${VERSION}`, version: VERSION };
     }
+    // 同版本强制更新：仍重写文件，便于修 bug（4.3.3 起）
+    const dir = path.dirname(selfPath);
+    const tmp = path.join(dir, `.index.js.${process.pid}.tmp`);
     const bak = selfPath + '.bak';
     try {
-      fs.copyFileSync(selfPath, bak);
+      if (fs.existsSync(selfPath)) fs.copyFileSync(selfPath, bak);
+    } catch (e) {
+      console.warn('[agent] 备份失败:', e.message);
+    }
+    fs.writeFileSync(tmp, text, { mode: 0o755 });
+    fs.renameSync(tmp, selfPath);
+    try {
+      fs.chmodSync(selfPath, 0o755);
     } catch {
       /* */
     }
-    fs.writeFileSync(selfPath, text, { mode: 0o755 });
     try {
-      const verFile = path.join(path.dirname(selfPath), 'VERSION');
+      const verFile = path.join(dir, 'VERSION');
       if (m) fs.writeFileSync(verFile, m[1] + '\n');
     } catch {
       /* */
     }
     console.log(`[agent] 已写入 ${selfPath} (v${newVer})，即将重启`);
-    // 调用方先上报 job-result，再 exit
     return {
       ok: true,
       message: `Agent 已更新到 v${newVer}，正在重启`,
       version: newVer,
       restart: true,
+      path: selfPath,
     };
   } catch (e) {
     return { ok: false, message: `自更新失败: ${e.message}` };
   }
 }
 
-async function maybeSelfUpdate(panelVersion) {
-  const r = await performSelfUpdate({ force: false, targetVersion: panelVersion });
+async function maybeSelfUpdate(targetVersion) {
+  const r = await performSelfUpdate({ force: false, targetVersion: targetVersion || '' });
   if (r.ok && r.restart) {
     setTimeout(() => process.exit(0), 800);
     return true;
@@ -1140,7 +1178,11 @@ async function handleJob(job) {
   if (job.type === 'agent_update' || job.type === 'self_update') {
     const r = await performSelfUpdate({
       force: job.payload?.force !== false,
-      targetVersion: job.payload?.panelVersion || '',
+      targetVersion:
+        job.payload?.agentTargetVersion ||
+        job.payload?.targetVersion ||
+        job.payload?.panelVersion ||
+        '',
     });
     return {
       ok: Boolean(r.ok),
@@ -1194,8 +1236,10 @@ async function tick() {
       return;
     }
   }
-  // 任务完成后再自动自更新（版本落后时）
-  if (res.panelVersion && (await maybeSelfUpdate(res.panelVersion))) {
+  // 任务完成后再自动自更新（只用 Agent 目标版本，禁止面板 UI 版本 4.6.x）
+  const agentTarget =
+    res.agentTargetVersion || res.agentBundleVersion || '';
+  if (agentTarget && (await maybeSelfUpdate(agentTarget))) {
     return;
   }
 }

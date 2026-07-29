@@ -398,6 +398,14 @@ function landingByNodeId(nodeId) {
   return landingsList().find((L) => L.nodeId === nodeId) || null;
 }
 
+function portInIxRange(port, min, max) {
+  const p = Number(port);
+  const a = Number(min) || 7900;
+  const b = Number(max) || 7999;
+  if (!Number.isFinite(p)) return null;
+  return p >= a && p <= b ? p : null;
+}
+
 function ixName(id) {
   if (!id) return '—';
   const x = ixesList().find((i) => i.id === id);
@@ -1465,33 +1473,35 @@ async function renderTopology() {
         <span class="badge ok">端口段 ${esc(portMin)}–${esc(portMax)}</span>
       </div>
       <div class="mod-body">
-      <p class="field-hint" style="margin-top:0">每 IX 独立前置 · <strong>Host 可随时改</strong>（IP/域名）· 客户端只连「当前选用」的主入口</p>
-      <div class="choice-grid" style="margin:10px 0">
+      <p class="field-hint" style="margin-top:0">
+        每 IX 独立前置 · 下方填 Host · 点选「分享用哪一条」· 第二台 IX 必须单独填自己的前置（不要留空）
+      </p>
+      <div class="choice-grid choice-grid-compact" style="margin:10px 0">
         <button type="button" class="choice-card ${active === 'mobile' || !active ? 'selected' : ''}" data-act="mobile">
           <strong>主入口</strong>
-          <span>分享二维码用这一条</span>
+          <span class="mono">${esc(ing.mobileHost || '未填 Host')}</span>
         </button>
         <button type="button" class="choice-card ${active === 'external' ? 'selected' : ''}" data-act="external">
           <strong>备用入口</strong>
-          <span>可选第二前置</span>
+          <span class="mono">${esc(ing.externalHost || '未填')}</span>
         </button>
         <button type="button" class="choice-card ${active === 'custom' ? 'selected' : ''}" data-act="custom">
           <strong>自定义</strong>
-          <span>域名或其它 Host</span>
+          <span class="mono">${esc(ing.customHost || '未填')}</span>
         </button>
       </div>
       <div class="inline-fields">
         <div>
-          <label>主入口 Host（IP 或域名，可随时更换）</label>
-          <input class="field mono" id="t-mob" value="${esc(ing.mobileHost || '')}" placeholder="例如你的商家前置 IP / 域名" />
+          <label>主入口 Host（分享默认用这条）</label>
+          <input class="field mono" id="t-mob" value="${esc(ing.mobileHost || '')}" placeholder="商家前置 IP 或域名" autocomplete="off" />
         </div>
         <div>
           <label>备用入口 Host（可选）</label>
-          <input class="field mono" id="t-ext" value="${esc(ing.externalHost || '')}" placeholder="可选第二前置" />
+          <input class="field mono" id="t-ext" value="${esc(ing.externalHost || '')}" placeholder="可选第二前置" autocomplete="off" />
         </div>
         <div>
-          <label>自定义 Host（选「自定义」时用）</label>
-          <input class="field mono" id="t-custom" value="${esc(ing.customHost || '')}" placeholder="如 front.example.com" />
+          <label>自定义 Host</label>
+          <input class="field mono" id="t-custom" value="${esc(ing.customHost || '')}" placeholder="如 front.example.com" autocomplete="off" />
         </div>
       </div>
       <div class="inline-fields" style="margin-top:8px">
@@ -1504,15 +1514,25 @@ async function renderTopology() {
           <input class="field mono" id="t-pmax" value="${esc(portMax)}" />
         </div>
         <div>
-          <label>默认端口</label>
-          <input class="field mono" id="t-port" value="${esc(t.ingress?.port || landing.listenPort || 7901)}" />
+          <label>默认端口（仅全局兼容）</label>
+          <input class="field mono" id="t-port" value="${esc(
+            portInIxRange(landing.listenPort || t.ingress?.port, portMin, portMax) ||
+              landing.listenPort ||
+              portMin ||
+              7901
+          )}" />
         </div>
         <div>
           <label>白名单提示</label>
-          <input class="field" id="t-province" value="${esc(ing.provinceWhitelist || '商家白名单（如有）')}" />
+          <input class="field" id="t-province" value="${esc(ing.provinceWhitelist || '')}" placeholder="可选" />
         </div>
       </div>
-      <div class="kv"><span>本 IX 当前 Endpoint</span><span class="mono">${esc(ix.endpoints?.active || activeEp(ix.id) || '—')}</span></div>
+      <div class="kv"><span>本 IX 当前分享 Endpoint</span><span class="mono">${esc(ix.endpoints?.active || activeEp(ix.id) || '—')}</span></div>
+      ${
+        !(ing.mobileHost || ing.externalHost || ing.customHost)
+          ? `<div class="alert warn compact" style="margin-top:10px"><div>本 IX 尚未填写任何前置 Host — 第二台 IX 用户会连不上。请填写主入口并保存。</div></div>`
+          : ''
+      }
       </div>
     </div>
 
@@ -1878,6 +1898,14 @@ async function renderTopology() {
     try {
       const nm = String(val('t-ix-name') || '').trim();
       if (!nm) return toast('请填写 IX 显示名称', 'err');
+      const hostAny = (val('t-mob') || val('t-ext') || val('t-custom') || '').trim();
+      if (!hostAny) return toast('请至少填写一个前置 Host（主入口/备用/自定义）', 'err');
+      const act = activeChoice || 'mobile';
+      const actHost =
+        act === 'external' ? val('t-ext') : act === 'custom' ? val('t-custom') : val('t-mob');
+      if (!(actHost || '').trim()) {
+        return toast(`当前选中的「${act === 'external' ? '备用' : act === 'custom' ? '自定义' : '主'}入口」Host 为空，请填写或改选有 Host 的入口`, 'err');
+      }
       const r = await saveCurrentIx(activeChoice);
       toast(r.tip || `本 IX「${nm}」已保存`);
       const qs = scriptQs();
@@ -2011,7 +2039,14 @@ async function renderServer() {
           <div class="landing-row-body">
             <div class="kv"><span>主机 / Agent</span><span class="mono">${esc(n.hostname || '-')} · v${esc(
               n.agentVersion || '-'
-            )}${n.agentOutdated ? ' ⚠ 需更新至 Agent v' + esc(n.agentTargetVersion || n.panelVersion || '') : ''}</span></div>
+            )}${n.agentOutdated ? ' ⚠ 需更新至 Agent v' + esc(n.agentTargetVersion || '') : ''}</span></div>
+            ${
+              n.lastJob
+                ? `<div class="kv"><span>最近任务</span><span class="${n.lastJob.ok === false || n.lastJob.status === 'error' ? 'danger' : 'muted'}">${esc(
+                    n.lastJob.type || ''
+                  )} · ${esc(n.lastJob.status || '')}${n.lastJob.message ? ' · ' + esc(n.lastJob.message) : ''}</span></div>`
+                : ''
+            }
             <div class="kv"><span>出网 IP</span><span class="mono">${esc(n.exitPublicIp || '-')}</span></div>
             <div class="inline-fields" style="margin-top:10px">
               <div>
@@ -2265,11 +2300,32 @@ async function renderServer() {
       try {
         b.disabled = true;
         const r = await api(`/api/nodes/${id}/update-agent`, { method: 'POST', body: {} });
-        toast(r.message || '已下发更新');
+        toast(r.message || `已下发更新 → Agent v${r.targetVersion || ''}`);
         state.expandedLandingId = id;
-        // 多刷几次等 agent 重启上报新版本
-        setTimeout(() => refreshCore().then(() => render()).catch(() => {}), 8000);
-        setTimeout(() => refreshCore().then(() => render()).catch(() => {}), 20000);
+        const poll = async (attempt) => {
+          try {
+            await refreshCore();
+            const nn = (state.nodes || []).find((x) => x.id === id);
+            if (nn && !nn.agentOutdated) {
+              toast(`「${nn.name}」Agent 已是 v${nn.agentVersion}`);
+              render();
+              return;
+            }
+            if (nn?.lastJob && (nn.lastJob.status === 'error' || nn.lastJob.ok === false)) {
+              toast(nn.lastJob.message || 'Agent 更新失败', 'err');
+              render();
+              return;
+            }
+            if (attempt < 6) setTimeout(() => poll(attempt + 1), 5000);
+            else {
+              toast('仍在等待 Agent 重启上报；请展开落地看「最近任务」，或 journalctl -u wg-agent -n 50', 'err');
+              render();
+            }
+          } catch {
+            if (attempt < 6) setTimeout(() => poll(attempt + 1), 5000);
+          }
+        };
+        setTimeout(() => poll(0), 4000);
       } catch (e) {
         toast(e.data?.error || e.message, 'err');
       } finally {

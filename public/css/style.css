@@ -2905,3 +2905,24 @@ table.utable tbody tr.is-selected td {
   font-variant-numeric: tabular-nums;
   min-width: 2.2em;
 }
+
+
+/* 拓扑前置：卡片内显示 Host，避免空白大卡片 */
+.choice-grid-compact {
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+.choice-grid-compact .choice-card {
+  min-height: 0;
+  padding: 12px 14px;
+}
+.choice-grid-compact .choice-card span.mono {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  word-break: break-all;
+  color: var(--text-2);
+}
+.choice-grid-compact .choice-card.selected span.mono {
+  color: var(--primary);
+}

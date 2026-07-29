@@ -844,5 +844,97 @@ ok('publicTopology per-IX ingress/endpoints');
 }
 
 
+
+// 22) resolveIngress falls back when second IX active host empty
+{
+  const st = {
+    topology: {
+      profile: 'cm-ix-home',
+      ingress: {
+        active: 'mobile',
+        port: 7901,
+        protocol: 'TCP',
+        mobileHost: '211.0.0.1',
+        externalHost: '114.0.0.1',
+      },
+      ixes: [
+        topology.defaultIx({
+          id: 'ix-a',
+          name: 'A',
+          portMin: 7900,
+          portMax: 7999,
+          ingress: { active: 'mobile', mobileHost: '211.0.0.1', externalHost: '114.0.0.1' },
+        }),
+        topology.defaultIx({
+          id: 'ix-b',
+          name: 'B',
+          portMin: 10400,
+          portMax: 10499,
+          // 故意只填备用、active 却是 mobile 空
+          ingress: { active: 'mobile', mobileHost: '', externalHost: '114.8.8.8' },
+        }),
+      ],
+      landings: [
+        topology.defaultLanding({
+          id: 'Lb',
+          nodeId: 'nb',
+          ixId: 'ix-b',
+          listenPort: 10400,
+          homeReachableHost: '1.2.3.4',
+        }),
+      ],
+    },
+    clients: [
+      {
+        id: 'c',
+        name: 'u',
+        password: 'pass-pass-pass9',
+        enabled: true,
+        route: { landingNodeId: 'nb', ixId: 'ix-b' },
+      },
+    ],
+    nodes: [],
+    server: { listenPort: 7901, protocol: 'TCP' },
+  };
+  topology.ensureTopology(st);
+  const ing = topology.resolveIngress(st, { landingNodeId: 'nb' });
+  assert.ok(ing.externalHost === '114.8.8.8' || ing.mobileHost, JSON.stringify(ing));
+  // active 应切到有 host 的
+  const host = topology.activeIngressHost(st, null, { landingNodeId: 'nb' });
+  assert.ok(host, 'host should not be empty');
+  const dual = mieru.buildDualShareLinks(st, st.clients[0]);
+  assert.ok(dual.preferred, dual);
+  assert.ok(!dual.preferred.includes('undefined'));
+  ok('second IX empty active host falls back');
+}
+
+// 23) diagnose no longer has global ingress id
+{
+  const st = {
+    topology: topology.defaultTopology(),
+    clients: [],
+    nodes: [],
+    server: { listenPort: 7901, protocol: 'TCP', endpoint: '' },
+    mode: 'local',
+  };
+  topology.ensureTopology(st);
+  st.topology.ixes[0].ingress.mobileHost = '1.1.1.1';
+  const d = topology.diagnoseTopology(st, { mode: 'local' });
+  assert.ok(!d.items.some((x) => x.id === 'ingress'), 'global ingress item removed');
+  ok('diagnose dropped useless global ingress item');
+}
+
+// 24) agent bundle version readable
+{
+  const fs = require('fs');
+  const path = require('path');
+  const ver = fs.readFileSync(path.join(__dirname, '..', 'agent', 'VERSION'), 'utf8').trim();
+  assert.strictEqual(ver, '4.3.3');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'agent', 'index.js'), 'utf8');
+  assert.ok(src.includes("const VERSION = '4.3.3'"));
+  assert.ok(src.includes('agentTargetVersion'));
+  ok('agent 4.3.3 bundle present');
+}
+
 console.log('\nsmoke-v4: all passed');
 console.log('tmp data:', tmp);

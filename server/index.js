@@ -62,6 +62,42 @@ function persist() {
   saveState(state);
 }
 
+/** 端口段消毒改了落地 listenPort 后，必须 dirty + 排队 apply，否则 mita 仍听旧端口（CM7 常见 7901） */
+function flushPortSanitizeApplies(reason = 'port-sanitize') {
+  const ids = Array.isArray(state._portSanitizeDirtyNodeIds)
+    ? state._portSanitizeDirtyNodeIds.filter(Boolean)
+    : [];
+  state._portSanitizeDirtyNodeIds = [];
+  if (!ids.length) return [];
+  const applied = [];
+  for (const nid of [...new Set(ids)]) {
+    const node = nodes.findNode(state, nid);
+    if (!node) continue;
+    nodes.markNodeDirty(node);
+    if (state.mode === 'agent') {
+      try {
+        enqueueApply(node, 'mieru_apply');
+        applied.push(nid);
+      } catch (e) {
+        console.warn(`[panel] ${reason} apply queue failed for ${nid}:`, e.message);
+      }
+    }
+  }
+  if (applied.length) {
+    console.log(`[panel] ${reason}: 已排队 apply ${applied.length} 个落地（端口段纠正后）`);
+    state.clientsNeedRescan = true;
+  }
+  return applied;
+}
+
+// 启动时若纠正了跨段端口，立刻下发（否则 CM7 落地仍听 7901）
+try {
+  flushPortSanitizeApplies('boot-port-sanitize');
+  persist();
+} catch (e) {
+  console.warn('[panel] boot port-sanitize apply:', e.message);
+}
+
 function clientIp(req) {
   return (
     (req.headers['x-forwarded-for'] || '').toString().split(',')[0].trim() ||
@@ -772,12 +808,18 @@ app.put('/api/topology', (req, res) => {
   }
   if (endpointChanged) state.clientsNeedRescan = true;
   if (serverConfChanged) markDirtyUnified();
+  // 保存拓扑触发端口段纠正时，自动排队 apply 到对应落地
+  const sanitizedApplied = flushPortSanitizeApplies('topology-save-port-sanitize');
+  if (sanitizedApplied.length) serverConfChanged = true;
   if (state.mode === 'agent') nodes.syncPrimaryFromState(state);
   if (body.wizardDone !== undefined) state.wizardDone = Boolean(body.wizardDone);
   persist();
   const tips = [];
   if (endpointChanged) tips.push('前置入口已更新，请重新复制客户端主入口链接');
   if (serverConfChanged) tips.push('监听参数有变，请在落地「应用配置/一键落地」');
+  if (sanitizedApplied.length) {
+    tips.push(`已自动纠正 ${sanitizedApplied.length} 个落地端口并排队下发 mita（约 10–30 秒）`);
+  }
   res.json({
     ok: true,
     topology: topology.publicTopology(state),
@@ -1319,6 +1361,9 @@ app.put('/api/nodes/:id', (req, res) => {
       state.clientsNeedRescan = true;
     }
   }
+
+  // 端口段纠正（换 IX / 旧 7901）后立刻排队 apply
+  flushPortSanitizeApplies('node-put-port-sanitize');
 
   if (body.listenPort !== undefined) {
     let port = Number(body.listenPort);

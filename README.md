@@ -3,7 +3,7 @@
 中文、新手友好的 **mieru / mita 拓扑出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v4.6.7**（主入口可改 · 单码分享 · Agent 版本判定修复 · 侧栏两字 · 主题提亮）
+当前版本：**v4.6.8**（CM7/第二台 IX：禁止空 Host 偷第一台前置 · 保存不改全局端口 · 端口纠正自动 apply）
 
 - 每台 IX 独立商家前置（IP/域名）与端口段
 - 拓扑 = IX 工作台；落地列表点开详情；客户端按落地分组
@@ -31,6 +31,10 @@
 | **兼容 v3.1** | 单前置 / 单 IX / 单落地自动迁成一条路由，Endpoint 保留 |
 
 路径保持不变。业务流量不经面板。
+
+### v4.6.8
+- **CM7/第二台 IX 通网**：空 Host 不再回落第一台前置（避免分享 `第一台IP:10400` 假通）；保存第二台不改全局 `ingress.port`；跨段端口纠正后自动 dirty 并排队 apply mita。
+- 诊断：第二台空 Host / 可达地址不再被第一台数据「刷绿」。
 
 ### v4.6.7
 - **转发脚本串台根因**：`refreshCore` 请求 `/api/topology` 不带 `ixId`，总用第一台脚本覆盖第二台；现按当前 IX 拉取，且无 `ixId` 不再返回默认脚本。
@@ -257,7 +261,7 @@ git clone https://github.com/cheesydui-cloud/wg.git ~/wg
 cd ~/wg && sudo bash install.sh
 ```
 
-打开 `http://面板IP:51821`，确认版本 **v4.6.7**。
+打开 `http://面板IP:51821`，确认版本 **v4.6.8**。
 
 忘记密码：
 

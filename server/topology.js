@@ -222,17 +222,27 @@ function resolveIngress(state, opts = {}) {
   ensureTopology(state);
   const ix = resolveIx(state, opts);
   const g = state.topology.ingress || {};
-  let ing = ix ? getIxIngress(ix, g) : {
-    active: g.active || 'mobile',
-    mobileHost: g.mobileHost || CM_DEFAULTS.mobileIngress,
-    externalHost: g.externalHost || CM_DEFAULTS.externalIngress,
-    customHost: g.customHost || '',
-    provinceWhitelist: g.provinceWhitelist || CM_DEFAULTS.provinceHint,
-  };
-  // 第二台 IX 常只填了主入口/备用其一，或新建 IX 空 Host：回落到本 IX 任一已填，再回落全局
+  const firstId = state.topology.ixes[0]?.id || null;
+  const isFirstIx = !ix || !firstId || ix.id === firstId;
+  // 本 IX 原始 ingress（不经全局填空），用于判断第二台是否「刻意留空」
+  const raw = ix?.ingress && typeof ix.ingress === 'object' ? ix.ingress : null;
+  // 第一台可从全局补全；第二台禁止用全局 ingress 当 defaultIxIngress 源（否则空 Host 直接变第一台 Host）
+  let ing = ix
+    ? getIxIngress(ix, isFirstIx ? g : null)
+    : {
+        active: g.active || 'mobile',
+        mobileHost: g.mobileHost || CM_DEFAULTS.mobileIngress,
+        externalHost: g.externalHost || CM_DEFAULTS.externalIngress,
+        customHost: g.customHost || '',
+        provinceWhitelist: g.provinceWhitelist || CM_DEFAULTS.provinceHint,
+      };
+  // 字段级：本 IX 已填用本 IX。
+  // 仅第一台允许空字段回落全局；第二台哪怕只填了备用，也禁止用第一台 Host 补主入口
+  // （否则 active=mobile 空时会偷 211 生成「第一台IP:10400」假链）
   const fill = (key) => {
     const v = String(ing[key] || '').trim();
     if (v) return v;
+    if (!isFirstIx) return '';
     return String(g[key] || '').trim();
   };
   ing = {
@@ -365,7 +375,8 @@ function ensureTopology(state) {
         homeReachablePort: clampPort(x.homeReachablePort, t.ingress.port),
         sshPort: clampPort(x.sshPort, 7900),
       },
-      t.ingress
+      // 仅第一台用全局 ingress 补空；第二台空 Host 必须保持空，禁止每次 ensure 偷第一台前置
+      i === 0 ? t.ingress : null
     )
   );
   if (!t.ixes.length) t.ixes = [defaultIx({}, t.ingress)];
@@ -431,9 +442,19 @@ function ensureTopology(state) {
   uniquifyLandingIds(t);
   // 落地端口 / 用户 ixId / 用户专用端口 与多 IX 段对齐
   try {
-    const nL = sanitizeLandingPortsForIxRanges(state);
+    const rL = sanitizeLandingPortsForIxRanges(state);
+    const nL = typeof rL === 'object' ? rL.fixed : rL;
     if (nL > 0) {
       state.clientsNeedRescan = true;
+      const ids = (typeof rL === 'object' && Array.isArray(rL.nodeIds) ? rL.nodeIds : []).filter(
+        Boolean
+      );
+      if (ids.length) {
+        const prev = Array.isArray(state._portSanitizeDirtyNodeIds)
+          ? state._portSanitizeDirtyNodeIds
+          : [];
+        state._portSanitizeDirtyNodeIds = [...new Set(prev.concat(ids))];
+      }
       console.log(`[panel] 已纠正 ${nL} 个落地端口到所属 IX 端口段`);
     }
   } catch (e) {
@@ -900,19 +921,29 @@ function applyTopologyPatch(state, body = {}) {
   ensureTopology(state);
   const t = state.topology;
   const prevEndpoint = activeEndpoint(state);
+  const patchIxId = body.ixId ? String(body.ixId) : '';
+  const firstIxId = t.ixes[0]?.id || null;
+  // 只有「未指定 IX」或「第一台 IX」才允许改全局 ingress（兼容路径/默认端口）
+  // 第二台保存时若把 t.ingress.port 写成 10400，会把全局默认与 CM5 路径搞乱
+  const touchGlobalIngress = !patchIxId || !firstIxId || patchIxId === firstIxId;
 
   if (body.ingress && typeof body.ingress === 'object') {
     const i = body.ingress;
-    if (i.active !== undefined) t.ingress.active = i.active;
-    if (i.mobileHost !== undefined) t.ingress.mobileHost = String(i.mobileHost || '').trim();
-    if (i.externalHost !== undefined) t.ingress.externalHost = String(i.externalHost || '').trim();
-    if (i.customHost !== undefined) t.ingress.customHost = String(i.customHost || '').trim();
-    if (i.port !== undefined) t.ingress.port = clampPort(i.port, t.ingress.port);
-    if (i.protocol !== undefined) {
+    if (touchGlobalIngress) {
+      if (i.active !== undefined) t.ingress.active = i.active;
+      if (i.mobileHost !== undefined) t.ingress.mobileHost = String(i.mobileHost || '').trim();
+      if (i.externalHost !== undefined) t.ingress.externalHost = String(i.externalHost || '').trim();
+      if (i.customHost !== undefined) t.ingress.customHost = String(i.customHost || '').trim();
+      if (i.port !== undefined) t.ingress.port = clampPort(i.port, t.ingress.port);
+      if (i.protocol !== undefined) {
+        t.ingress.protocol = String(i.protocol).toUpperCase() === 'UDP' ? 'UDP' : 'TCP';
+      }
+      if (i.provinceWhitelist !== undefined) {
+        t.ingress.provinceWhitelist = String(i.provinceWhitelist || '');
+      }
+    } else if (i.protocol !== undefined) {
+      // 协议仍全局统一
       t.ingress.protocol = String(i.protocol).toUpperCase() === 'UDP' ? 'UDP' : 'TCP';
-    }
-    if (i.provinceWhitelist !== undefined) {
-      t.ingress.provinceWhitelist = String(i.provinceWhitelist || '');
     }
   }
 
@@ -920,13 +951,14 @@ function applyTopologyPatch(state, body = {}) {
   if (Array.isArray(body.ixes)) {
     t.ixes = body.ixes.map((x, i) => {
       const nm = String(x.name != null ? x.name : '').trim();
+      // 第二台起禁止用全局 ingress 填空 Host，否则保存 CM7 会把 CM5 前置写进本 IX
       return defaultIx(
         {
           id: x.id || (i === 0 ? 'ix-default' : newId('ix')),
           ...x,
           name: nm || (i === 0 ? '沪日IX' : `IX-${i + 1}`),
         },
-        t.ingress
+        i === 0 ? t.ingress : null
       );
     });
     if (!t.ixes.length) t.ixes = [defaultIx({}, t.ingress)];
@@ -956,10 +988,15 @@ function applyTopologyPatch(state, body = {}) {
     }
     if (x.note !== undefined) target.note = String(x.note || '');
     if (x.ingress && typeof x.ingress === 'object') {
-      target.ingress = defaultIxIngress(x.ingress, target.ingress || t.ingress);
+      const isFirstTarget = target.id === t.ixes[0]?.id;
+      target.ingress = defaultIxIngress(
+        x.ingress,
+        isFirstTarget ? target.ingress || t.ingress : target.ingress || null
+      );
     }
     const idx = t.ixes.findIndex((i) => i.id === target.id);
-    const normalized = defaultIx(target, t.ingress);
+    const isFirstTarget = target.id === t.ixes[0]?.id;
+    const normalized = defaultIx(target, isFirstTarget ? t.ingress : null);
     if (idx >= 0) t.ixes[idx] = normalized;
     else t.ixes[0] = normalized;
     // mirror home to default landing if landing empty
@@ -974,9 +1011,10 @@ function applyTopologyPatch(state, body = {}) {
     const targetId = body.ixId || t.ixes[0]?.id;
     const target = t.ixes.find((i) => i.id === targetId) || t.ixes[0];
     if (target) {
+      const isFirstTarget = target.id === t.ixes[0]?.id;
+      // 显式字段以 body 为准；第二台不要拿全局 Host 填空
       target.ingress = defaultIxIngress(
         {
-          ...(target.ingress || {}),
           active: body.ingress.active !== undefined ? body.ingress.active : target.ingress?.active,
           mobileHost:
             body.ingress.mobileHost !== undefined
@@ -995,7 +1033,7 @@ function applyTopologyPatch(state, body = {}) {
               ? body.ingress.provinceWhitelist
               : target.ingress?.provinceWhitelist,
         },
-        t.ingress
+        isFirstTarget ? t.ingress : null
       );
     }
   }
@@ -1048,12 +1086,13 @@ function applyTopologyPatch(state, body = {}) {
  * 由 ensureTopology 调用：禁止再调 getLandingByNodeId/resolveIx
  */
 function sanitizeLandingPortsForIxRanges(state) {
-  if (!state || !state.topology) return 0;
+  if (!state || !state.topology) return { fixed: 0, nodeIds: [] };
   const t = state.topology;
   const ixes = Array.isArray(t.ixes) ? t.ixes : [];
   const landings = Array.isArray(t.landings) ? t.landings : [];
-  if (!ixes.length || !landings.length) return 0;
+  if (!ixes.length || !landings.length) return { fixed: 0, nodeIds: [] };
   let fixed = 0;
+  const nodeIds = [];
 
   const usedOnIx = (ixId, excludeLandingId) => {
     const used = new Set();
@@ -1097,6 +1136,8 @@ function sanitizeLandingPortsForIxRanges(state) {
         const n = state.nodes.find((x) => x && x.id === L.nodeId);
         if (n) {
           n.server = { ...(n.server || {}), listenPort: next };
+          if (n._dirtyFlag !== true) n._dirtyFlag = true;
+          nodeIds.push(n.id);
         }
       }
       fixed += 1;
@@ -1105,10 +1146,11 @@ function sanitizeLandingPortsForIxRanges(state) {
       const hp = Number(L.homeReachablePort);
       if ((hp === 7901 || !hp) && port !== 7901) {
         L.homeReachablePort = port;
+        if (L.nodeId) nodeIds.push(L.nodeId);
       }
     }
   }
-  return fixed;
+  return { fixed, nodeIds: [...new Set(nodeIds)] };
 }
 
 /** 用户 route.ixId 与落地所属 IX 对齐（落地优先） */
@@ -1195,18 +1237,22 @@ function diagnoseTopology(state, opts = {}) {
     null;
 
   for (const ix of ixes) {
-    const ing = getIxIngress(ix, t.ingress);
-    const home =
-      t.landings.find((L) => L.ixId === ix.id && L.homeReachableHost)?.homeReachableHost ||
-      t.landings.find((L) => L.homeReachableHost)?.homeReachableHost ||
-      ix.homeReachableHost ||
-      '';
+    const isFirst = ix.id === ixes[0]?.id;
+    // 诊断用本 IX 真实 Host，禁止第二台空 Host 被全局填成「看起来有前置」
+    const ing = getIxIngress(ix, isFirst ? t.ingress : null);
     // 本 IX 绑定落地；未绑 ix 的老数据只算在第一台 IX，避免第二台误吞
     const ixLandings = (t.landings || []).filter((L) => {
       if (L.ixId === ix.id) return true;
       if (!L.ixId && t.ixes[0]?.id === ix.id) return true;
       return false;
     });
+    const home =
+      ixLandings.find((L) => String(L.homeReachableHost || '').trim())?.homeReachableHost ||
+      (isFirst
+        ? t.landings.find((L) => String(L.homeReachableHost || '').trim())?.homeReachableHost
+        : '') ||
+      ix.homeReachableHost ||
+      '';
     const checkPorts = [
       port,
       ...ixLandings.map((L) => Number(L.listenPort) || 0).filter(Boolean),

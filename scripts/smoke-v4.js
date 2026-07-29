@@ -99,6 +99,13 @@ state.topology.ixes.push(
     name: 'IX-2',
     lanIp: '172.16.2.80',
     homeReachableHost: '1.2.3.4',
+    // 第二台必须自有前置（ensure 不再从全局偷 Host）
+    ingress: {
+      active: 'mobile',
+      mobileHost: '211.136.162.184',
+      externalHost: '114.111.176.37',
+      customHost: '',
+    },
   })
 );
 state.topology.landings.push(
@@ -848,7 +855,7 @@ ok('publicTopology per-IX ingress/endpoints');
 
 
 
-// 22) resolveIngress falls back when second IX active host empty
+// 22) resolveIngress: 第二台只填备用时切到有 host 的入口（本 IX 内）
 {
   const st = {
     topology: {
@@ -905,10 +912,114 @@ ok('publicTopology per-IX ingress/endpoints');
   // active 应切到有 host 的
   const host = topology.activeIngressHost(st, null, { landingNodeId: 'nb' });
   assert.ok(host, 'host should not be empty');
+  assert.strictEqual(host, '114.8.8.8', 'must use own external, not first IX mobile');
   const dual = mieru.buildDualShareLinks(st, st.clients[0]);
   assert.ok(dual.preferred, dual);
   assert.ok(!dual.preferred.includes('undefined'));
+  assert.ok(dual.preferred.includes('114.8.8.8'));
+  assert.ok(!dual.preferred.includes('211.0.0.1'), 'must not steal first IX host');
   ok('second IX empty active host falls back');
+}
+
+// 22b) 第二台全空 Host：禁止偷第一台前置（CM7 空配置不得生成 CM5 Host:10400）
+{
+  const st = {
+    topology: {
+      profile: 'cm-ix-home',
+      ingress: {
+        active: 'external',
+        port: 7901,
+        protocol: 'TCP',
+        mobileHost: '211.0.0.1',
+        externalHost: '114.0.0.1',
+      },
+      ixes: [
+        topology.defaultIx({
+          id: 'ix-cm5',
+          name: 'CM5',
+          portMin: 7900,
+          portMax: 7999,
+          ingress: { active: 'external', mobileHost: '211.0.0.1', externalHost: '114.0.0.1' },
+        }),
+        topology.defaultIx({
+          id: 'ix-cm7',
+          name: 'CM7',
+          portMin: 10400,
+          portMax: 10499,
+          ingress: { active: 'mobile', mobileHost: '', externalHost: '', customHost: '' },
+        }),
+      ],
+      landings: [
+        // 故意写 7901（CM5 段），ensure 应纠正到 104xx 并标记 dirty
+        topology.defaultLanding({
+          id: 'l7',
+          nodeId: 'n7',
+          ixId: 'ix-cm7',
+          listenPort: 7901,
+          homeReachableHost: '9.9.9.9',
+          homeReachablePort: 7901,
+        }),
+      ],
+    },
+    clients: [
+      {
+        id: 'c7',
+        name: 'ucm7',
+        password: 'pass-pass-pass7',
+        enabled: true,
+        route: { landingNodeId: 'n7', ixId: 'ix-cm7' },
+      },
+    ],
+    nodes: [{ id: 'n7', name: 'CM7-home', server: { listenPort: 7901 }, jobs: [] }],
+    server: { listenPort: 7901, protocol: 'TCP' },
+    mode: 'agent',
+  };
+  topology.ensureTopology(st);
+  // 纠正 7901 → 10400 并记录 dirty node
+  assert.ok(
+    Number(st.topology.landings[0].listenPort) >= 10400,
+    'landing port sanitized to 104xx'
+  );
+  assert.ok(
+    Array.isArray(st._portSanitizeDirtyNodeIds) && st._portSanitizeDirtyNodeIds.includes('n7'),
+    'sanitize should mark node dirty for apply: ' + JSON.stringify(st._portSanitizeDirtyNodeIds)
+  );
+  const ing = topology.resolveIngress(st, { landingNodeId: 'n7', ixId: 'ix-cm7' });
+  assert.strictEqual(String(ing.mobileHost || ''), '', JSON.stringify(ing));
+  assert.strictEqual(String(ing.externalHost || ''), '', JSON.stringify(ing));
+  const host = topology.activeIngressHost(st, null, { landingNodeId: 'n7' });
+  assert.ok(!host, 'empty second IX must not resolve first IX host');
+  let threw = false;
+  try {
+    mieru.buildDualShareLinks(st, st.clients[0]);
+  } catch (e) {
+    threw = e.code === 'NO_ENDPOINT' || /前置|endpoint|Host/i.test(String(e.message || ''));
+  }
+  // preferred 可能是空串而非 throw，两种都算对
+  if (!threw) {
+    const dual = mieru.buildDualShareLinks(st, st.clients[0]);
+    assert.ok(!dual.preferred || !/211\.0\.0\.1|114\.0\.0\.1/.test(dual.preferred), dual);
+  }
+  // 保存第二台不得改全局 port
+  const gPortBefore = st.topology.ingress.port;
+  topology.applyTopologyPatch(st, {
+    ixId: 'ix-cm7',
+    ingress: {
+      active: 'mobile',
+      port: 10400,
+      mobileHost: '',
+      externalHost: '',
+      customHost: '',
+      protocol: 'TCP',
+    },
+    ixes: st.topology.ixes.map((x) => ({ ...x, ingress: { ...(x.ingress || {}) } })),
+  });
+  assert.strictEqual(
+    Number(st.topology.ingress.port),
+    Number(gPortBefore),
+    'saving CM7 must not overwrite global ingress.port'
+  );
+  ok('second IX empty hosts isolated + global port preserved');
 }
 
 // 23) diagnose no longer has global ingress id

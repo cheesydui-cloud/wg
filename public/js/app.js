@@ -1530,13 +1530,13 @@ async function renderTopology() {
           <input class="field mono" id="t-pmax" value="${esc(portMax)}" />
         </div>
         <div>
-          <label>默认端口（仅全局兼容）</label>
+          <label>${ixes[0]?.id === ix.id ? '全局默认端口' : '本 IX 展示端口（不改全局）'}</label>
           <input class="field mono" id="t-port" value="${esc(
-            portInIxRange(landing.listenPort || t.ingress?.port, portMin, portMax) ||
+            portInIxRange(landing.listenPort || (ixes[0]?.id === ix.id ? t.ingress?.port : portMin), portMin, portMax) ||
               landing.listenPort ||
               portMin ||
               7901
-          )}" />
+          )}" title="${ixes[0]?.id === ix.id ? '写入全局兼容默认端口' : '仅本页展示；保存第二台不会改全局 7901'}" />
         </div>
         <div>
           <label>白名单提示</label>

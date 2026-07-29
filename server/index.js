@@ -968,6 +968,18 @@ app.get('/api/clients/:id/config', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${c.name || 'mieru'}.json"`);
     return res.json(clientJson);
   }
+  if (format === 'yaml' || format === 'clash' || format === 'download-yaml') {
+    let yaml;
+    try {
+      yaml = mieru.buildClashYaml(state, c, proto);
+    } catch (err) {
+      return res.status(400).json({ error: err.message, code: err.code });
+    }
+    const safe = String(c.name || 'mieru').replace(/[^\w.-]+/g, '_');
+    res.setHeader('Content-Type', 'text/yaml; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${safe}-openclash.yaml"`);
+    return res.send(yaml);
+  }
   if (format === 'qr') {
     const [qrMobile, qrExternal, qr] = await Promise.all([
       QRCode.toDataURL(dual.mobile, { margin: 1, width: 280 }),

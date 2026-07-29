@@ -458,6 +458,141 @@ function buildClientJson(state, client, protocol, hostOverride) {
   };
 }
 
+/** YAML 安全双引号字符串 */
+function yamlQuote(s) {
+  return `"${String(s ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')}"`;
+}
+
+/** 从 `host:port` / `[ipv6]:port` / 裸 host 取出 host（不可对 IPv4 用 split(':')[0]） */
+function hostFromEndpoint(ep) {
+  const s = String(ep || '').trim();
+  if (!s) return '';
+  if (s.startsWith('[')) {
+    const m = s.match(/^\[([^\]]+)\](?::\d+)?$/);
+    return m ? m[1] : s;
+  }
+  const idx = s.lastIndexOf(':');
+  if (idx > 0 && /^\d+$/.test(s.slice(idx + 1))) return s.slice(0, idx);
+  return s;
+}
+
+/**
+ * 生成该客户完整 mihomo/OpenClash 配置（下载即用）
+ * 含 211/114 双节点（有则）、DNS、分组、前置 DIRECT 防环
+ */
+function buildClashYaml(state, client, protocol) {
+  ensureMieruDefaults(state);
+  const dual = buildDualShareLinks(state, client, protocol);
+  const s = state.server || {};
+  const mode = normalizeProtocol(s.protocol);
+  const proto = String(protocol || protocolsForMode(mode)[0]).toUpperCase();
+  const listenPort = clientListenPort(client, state);
+  const port = portForProtocol(listenPort, proto, mode);
+  const multiplexing = s.multiplexing || DEFAULT_MULTIPLEXING;
+  const baseName = String(client.note || client.name || 'mieru').trim() || 'mieru';
+  const user = String(client.name || '').trim();
+  const pass = String(client.password || '');
+  if (!user || !pass) {
+    const err = new Error('用户缺少账号或密码');
+    err.code = 'NO_CREDENTIALS';
+    throw err;
+  }
+
+  const hosts = [];
+  const seen = new Set();
+  const pushHost = (label, host) => {
+    const h = String(host || '').trim();
+    if (!h || seen.has(h)) return;
+    seen.add(h);
+    hosts.push({ label, host: h });
+  };
+  // 优先 211/114，再补 active（自定义前置）
+  const mHost = hostFromEndpoint(dual.endpoints?.mobile);
+  const eHost = hostFromEndpoint(dual.endpoints?.external);
+  const aHost = hostFromEndpoint(dual.endpoints?.active);
+  pushHost('211', mHost);
+  pushHost('114', eHost);
+  pushHost('前置', aHost);
+  if (!hosts.length) {
+    const err = new Error('请先填写客户端连接地址（商家前置 IP 或域名）');
+    err.code = 'NO_ENDPOINT';
+    throw err;
+  }
+
+  const proxyNames = [];
+  const proxyBlocks = hosts.map(({ label, host }) => {
+    const name = hosts.length > 1 ? `${baseName}-${label}` : baseName;
+    proxyNames.push(name);
+    return `  - name: ${yamlQuote(name)}
+    type: mieru
+    server: ${host}
+    port: ${port}
+    transport: ${proto === 'UDP' ? 'UDP' : 'TCP'}
+    username: ${yamlQuote(user)}
+    password: ${yamlQuote(pass)}
+    multiplexing: ${multiplexing}
+    handshake-mode: HANDSHAKE_STANDARD`;
+  });
+
+  const directRules = hosts
+    .filter((h) => looksLikeIp(h.host))
+    .map((h) => `  - IP-CIDR,${h.host}/32,DIRECT,no-resolve`)
+    .join('\n');
+
+  const groupList = proxyNames.map((n) => `      - ${yamlQuote(n)}`).join('\n');
+
+  return `# mieru · OpenClash/mihomo · ${baseName}
+# 面板导出 · 登录名 ${user} · 端口 ${port}
+# 只连商家前置，勿连 IX / 家宽公网
+mixed-port: 7890
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: info
+ipv6: false
+external-controller: 0.0.0.0:9090
+
+dns:
+  enable: true
+  listen: 0.0.0.0:7874
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - 223.5.5.5
+    - 8.8.8.8
+  fallback:
+    - 1.1.1.1
+    - 8.8.4.4
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+
+proxies:
+${proxyBlocks.join('\n')}
+
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies:
+${groupList}
+      - DIRECT
+
+  - name: "FINAL"
+    type: select
+    proxies:
+      - "PROXY"
+      - DIRECT
+
+rules:
+  # 前置 IP 必须直连，避免环路
+${directRules ? `${directRules}\n` : ''}  - GEOIP,CN,DIRECT
+  - MATCH,FINAL
+`;
+}
+
 function formatRate(bytesPerSec) {
   const n = Number(bytesPerSec) || 0;
   if (n <= 0) return '—';
@@ -629,7 +764,8 @@ function mergeUsageFromReport(state, nodeId, usage) {
     // 相邻两次用量差估算瞬时速率（mita 无实时速率接口；间隔过短/回绕则清零）
     let downBps = 0;
     let upBps = 0;
-    if (dtSec >= 5 && dtSec <= 3600) {
+    // 最短 2s：客户端页 2–3s 轮询时也能算出网速跳动
+    if (dtSec >= 2 && dtSec <= 3600) {
       const dDown = download - (Number(prev.downloadBytes) || 0);
       const dUp = upload - (Number(prev.uploadBytes) || 0);
       if (dDown >= 0) downBps = dDown / dtSec;
@@ -843,6 +979,7 @@ module.exports = {
   buildDualShareLinks,
   shareLinkForHost,
   buildClientJson,
+  buildClashYaml,
   publicClient,
   diagnose,
   portForProtocol,

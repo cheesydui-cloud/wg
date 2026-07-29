@@ -215,10 +215,43 @@ assert.ok(dualDom.preferred.includes('front-ix2.example.com'));
 const jsonDom = mieru.buildClientJson(state, state.clients[1], 'TCP', 'front-ix2.example.com');
 assert.strictEqual(jsonDom.profiles[0].servers[0].domainName, 'front-ix2.example.com');
 assert.strictEqual(jsonDom.profiles[0].servers[0].ipAddress, '');
-const jsonIp = mieru.buildClientJson(state, state.clients[1], 'TCP', '114.9.9.9');
-assert.strictEqual(jsonIp.profiles[0].servers[0].ipAddress, '114.9.9.9');
-assert.strictEqual(jsonIp.profiles[0].servers[0].domainName, '');
-ok('share links + domain/IP client JSON by IX');
+  const jsonIp = mieru.buildClientJson(state, state.clients[1], 'TCP', '114.9.9.9');
+  assert.strictEqual(jsonIp.profiles[0].servers[0].ipAddress, '114.9.9.9');
+  assert.strictEqual(jsonIp.profiles[0].servers[0].domainName, '');
+  ok('share links + domain/IP client JSON by IX');
+
+  // 9b) OpenClash/mihomo YAML export per client
+  {
+    const yaml = mieru.buildClashYaml(state, state.clients[1], 'TCP');
+    assert.ok(yaml.includes('type: mieru'), 'yaml has type mieru');
+    assert.ok(yaml.includes('mixed-port: 7890'), 'yaml has mixed-port');
+    assert.ok(yaml.includes('proxy-groups:'), 'yaml has groups');
+    assert.ok(yaml.includes('username:'), 'yaml has username');
+    assert.ok(/IP-CIDR,.*\/32,DIRECT/.test(yaml), 'yaml has DIRECT for front IP');
+    assert.ok(yaml.includes('MATCH,FINAL'), 'yaml has MATCH FINAL');
+    // 必须是完整 IPv4，不能被 split(':') 截成 114 / 211
+    assert.ok(
+      /server:\s*114\.9\.9\.9\b/.test(yaml) || /server:\s*211\.9\.9\.9\b/.test(yaml) || /server:\s*front-ix2\.example\.com\b/.test(yaml),
+      'yaml server must be full host, not first IPv4 octet'
+    );
+    assert.ok(!/server:\s*114\s*$/m.test(yaml) && !/server:\s*211\s*$/m.test(yaml), 'no truncated server IP');
+    ok('buildClashYaml complete OpenClash config');
+  }
+
+  // 9c) disable user drops from enabledUsers / server config
+  {
+    const target = state.clients[1];
+    target.enabled = true;
+    const before = mieru.enabledUsers(state).length;
+    assert.ok(before >= 1, 'has enabled users');
+    target.enabled = false;
+    const after = mieru.enabledUsers(state).length;
+    assert.strictEqual(after, before - 1, 'disabled user excluded from enabledUsers');
+    const names = mieru.enabledUsers(state).map((c) => c.name);
+    assert.ok(!names.includes(target.name), 'disabled name not in apply list');
+    target.enabled = true;
+    ok('disable excludes user from mita apply users');
+  }
 
 // 10) publicTopology exposes per-IX endpoints
 const pub2 = topology.publicTopology(state);

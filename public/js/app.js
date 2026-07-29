@@ -2037,9 +2037,9 @@ function rateCellHtml(c) {
   const down = u.downRateHuman || '—';
   const up = u.upRateHuman || '—';
   const active = (Number(u.downBps) || 0) + (Number(u.upBps) || 0) > 0;
-  return `<div class="rate-cell mono ${active ? 'rate-on' : ''}" title="由相邻两次用量差估算，约 30s 刷新；非网卡瞬时速率">
-    <div><span class="usage-dir down">↓</span> ${esc(down)}</div>
-    <div><span class="usage-dir up">↑</span> ${esc(up)}</div>
+  return `<div class="rate-cell mono ${active ? 'rate-on' : ''}" data-rate-for="${esc(c.id)}" title="由相邻两次用量差估算；本页约 3s 自动刷新">
+    <div><span class="usage-dir down">↓</span> <span data-rate-down>${esc(down)}</span></div>
+    <div><span class="usage-dir up">↑</span> <span data-rate-up>${esc(up)}</span></div>
   </div>`;
 }
 
@@ -2095,6 +2095,9 @@ function clientRowHtml(c) {
     </div>
     <div class="user-card-actions btn-row tight">
       <button class="btn btn-sm btn-primary" data-qr="${c.id}" title="分享链接与二维码（含备注）">链接</button>
+      <button class="btn btn-sm ${c.enabled === false ? 'btn-success' : 'btn-secondary'}" data-toggle-enable="${c.id}" title="${
+    c.enabled === false ? '启用后需应用本落地' : '禁用后需应用本落地，用户将无法认证'
+  }">${c.enabled === false ? '启用' : '禁用'}</button>
       <button class="btn btn-sm btn-secondary" data-edit="${c.id}" title="编辑用户/路由/套餐">编辑</button>
       <button class="btn btn-sm btn-danger" data-del="${c.id}" title="删除该用户">删除</button>
     </div>
@@ -2229,17 +2232,113 @@ async function renderClients() {
       }
     };
   });
-  // 客户端页约 20s 静默刷新用量/网速（不打断弹窗）
-  if (window.__clientsRefreshTimer) clearTimeout(window.__clientsRefreshTimer);
-  window.__clientsRefreshTimer = setTimeout(() => {
-    if (state.page !== 'clients') return;
-    if (document.querySelector('.modal-backdrop, .modal.show, #modal-root .modal')) return;
-    refreshCore()
-      .then(() => {
-        if (state.page === 'clients') renderClients();
-      })
-      .catch(() => {});
-  }, 20000);
+  document.querySelectorAll('[data-toggle-enable]').forEach((b) => {
+    b.onclick = async () => {
+      const id = b.dataset.toggleEnable;
+      const c = (state.clients || []).find((x) => x.id === id);
+      if (!c) return toast('用户不存在，请刷新', 'err');
+      const next = c.enabled === false;
+      const tip = next
+        ? `启用「${c.name}」？保存后请点「应用本落地」，用户才能重新连上。`
+        : `禁用「${c.name}」？保存后请点「应用本落地」，该用户将无法认证上网。`;
+      if (!confirm(tip)) return;
+      try {
+        await api(`/api/clients/${encodeURIComponent(id)}`, {
+          method: 'PUT',
+          body: { enabled: next },
+        });
+        const landingId = c.route?.landingNodeId;
+        toast(next ? '已启用（请应用本落地）' : '已禁用（请应用本落地）');
+        // 在线落地时自动排队 apply，真正从 mita 去掉/加回账号
+        if (landingId) {
+          try {
+            await api(`/api/nodes/${encodeURIComponent(landingId)}/apply`, {
+              method: 'POST',
+              body: {},
+            });
+            toast(next ? '已下发启用' : '已下发禁用', 'ok');
+          } catch (ae) {
+            toast(`状态已改，自动应用失败：${ae.data?.error || ae.message}，请手动点「应用本落地」`, 'err');
+          }
+        }
+        await refreshCore();
+        render();
+      } catch (e) {
+        toast(e.data?.error || e.message, 'err');
+      }
+    };
+  });
+  // 客户端页约 3s 静默刷新用量/网速（有弹窗时不整页重绘，只更新网速格）
+  startClientsLivePoll();
+}
+
+function stopClientsLivePoll() {
+  if (window.__clientsRefreshTimer) {
+    clearTimeout(window.__clientsRefreshTimer);
+    window.__clientsRefreshTimer = null;
+  }
+}
+
+function patchClientLiveStats() {
+  for (const c of state.clients || []) {
+    const card = document.querySelector(`.user-card[data-user-id="${CSS.escape(c.id)}"]`);
+    if (!card) continue;
+    const rate = card.querySelector(`[data-rate-for="${CSS.escape(c.id)}"]`) || card.querySelector('[data-rate-for]');
+    if (rate) {
+      const u = c.usage || {};
+      const down = u.downRateHuman || '—';
+      const up = u.upRateHuman || '—';
+      const active = (Number(u.downBps) || 0) + (Number(u.upBps) || 0) > 0;
+      rate.classList.toggle('rate-on', active);
+      const dEl = rate.querySelector('[data-rate-down]');
+      const uEl = rate.querySelector('[data-rate-up]');
+      if (dEl) dEl.textContent = down;
+      if (uEl) uEl.textContent = up;
+    }
+    // 累计流量轻量更新
+    const stats = card.querySelectorAll('.stat');
+    if (stats[1]) {
+      const label = stats[1].querySelector('.stat-label');
+      if (label && /累计/.test(label.textContent || '')) {
+        const box = stats[1];
+        const next = usageCellHtml(c);
+        if (box.children[1]) box.children[1].outerHTML = next;
+        else box.insertAdjacentHTML('beforeend', next);
+      }
+    }
+  }
+}
+
+function startClientsLivePoll() {
+  stopClientsLivePoll();
+  const tick = () => {
+    window.__clientsRefreshTimer = setTimeout(async () => {
+      if (state.page !== 'clients') return;
+      try {
+        await refreshCore();
+        if (state.page !== 'clients') return;
+        const modalOpen = Boolean(
+          document.querySelector('.modal-backdrop, .modal.show, #modal-root .modal, #modal-root [class*="modal"]')
+        );
+        if (modalOpen) {
+          // 弹窗打开时不整页重绘，只补丁网速
+          patchClientLiveStats();
+        } else {
+          // 无弹窗：优先局部更新，避免闪烁；每 5 次整页同步徽章等
+          window.__clientsLiveN = (window.__clientsLiveN || 0) + 1;
+          if (window.__clientsLiveN % 5 === 0) {
+            await renderClients();
+            return;
+          }
+          patchClientLiveStats();
+        }
+      } catch {
+        /* */
+      }
+      if (state.page === 'clients') tick();
+    }, 3000);
+  };
+  tick();
 }
 
 function openClientModal(client, preferLandingId) {
@@ -2286,10 +2385,19 @@ function openClientModal(client, preferLandingId) {
           <input class="field mono" id="c-qdays" value="${esc(client?.package?.quotaDays ?? 30)}" />
         </div>
       </div>
-      <label>到期日（YYYY-MM-DD，空=不限）</label>
-      <input class="field mono" id="c-expire" value="${esc(
-        client?.package?.expireAt ? String(client.package.expireAt).slice(0, 10) : ''
-      )}" placeholder="2026-12-31" />
+      <label>到期日（点选日期，清空=不限）</label>
+      <div class="field-with-btn">
+        <input class="field mono" type="date" id="c-expire" value="${esc(
+          client?.package?.expireAt ? String(client.package.expireAt).slice(0, 10) : ''
+        )}" />
+        <button type="button" class="btn btn-secondary" id="c-expire-clear" title="清空为不限">不限</button>
+      </div>
+      <div class="btn-row tight" style="margin:6px 0 10px;flex-wrap:wrap">
+        <button type="button" class="btn btn-sm btn-ghost" data-expire-days="7">+7天</button>
+        <button type="button" class="btn btn-sm btn-ghost" data-expire-days="30">+30天</button>
+        <button type="button" class="btn btn-sm btn-ghost" data-expire-days="90">+90天</button>
+        <button type="button" class="btn btn-sm btn-ghost" data-expire-days="365">+1年</button>
+      </div>
       ${
         isEdit
           ? `<label class="check-row"><input type="checkbox" id="c-enabled" ${
@@ -2312,6 +2420,25 @@ function openClientModal(client, preferLandingId) {
     for (let i = 0; i < 16; i++) s += chars[Math.floor(Math.random() * chars.length)];
     document.getElementById('c-pass').value = s;
     toast('已填入随机密码');
+  });
+  document.getElementById('c-expire-clear')?.addEventListener('click', () => {
+    const el = document.getElementById('c-expire');
+    if (el) el.value = '';
+    toast('已设为不限');
+  });
+  document.querySelectorAll('[data-expire-days]').forEach((b) => {
+    b.addEventListener('click', () => {
+      const days = Number(b.dataset.expireDays) || 0;
+      if (!days) return;
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      d.setDate(d.getDate() + days);
+      const yyyy = d.getFullYear();
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      const el = document.getElementById('c-expire');
+      if (el) el.value = `${yyyy}-${mm}-${dd}`;
+    });
   });
   document.getElementById('c-save').onclick = async () => {
     try {
@@ -2403,10 +2530,12 @@ async function showClientQr(id) {
             <button class="btn btn-sm btn-ghost btn-block" id="qr-copy-e">复制 114 链接</button>
           </div>
         </div>
-        <div class="btn-row center" style="margin-top:12px">
+        <div class="btn-row center" style="margin-top:12px;flex-wrap:wrap">
           <button class="btn btn-ghost" id="qr-copy-json">复制 JSON</button>
           <a class="btn btn-ghost" href="/api/clients/${id}/config?format=download">下载 JSON</a>
+          <a class="btn btn-primary" href="/api/clients/${id}/config?format=yaml" title="完整 OpenClash/mihomo 配置，导入即用">下载 YAML</a>
         </div>
+        <p class="field-hint center" style="margin-top:6px">YAML = 完整 mihomo/OpenClash 配置（含 211/114 节点与防环规则），下载后直接导入即可</p>
         <pre class="code-block" style="margin-top:12px;max-height:120px;overflow:auto;font-size:11px">${esc(
           mobile
         )}</pre>
@@ -2793,6 +2922,7 @@ function closeModal() {
 
 async function render() {
   if (!state.status?.loggedIn) return;
+  if (state.page !== 'clients') stopClientsLivePoll();
   if (!state.wizardDone && !state._skipWizardOnce) return renderWizard();
   if (state.page === 'dashboard') return renderDashboard();
   if (state.page === 'topology') return renderTopology();

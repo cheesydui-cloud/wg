@@ -464,7 +464,7 @@ function renderBoot(msg = '正在加载…') {
     <div class="boot-screen">
       <div class="boot-card">
         <div class="logo">M</div>
-        <h1>mieru 出口面板</h1>
+        <h1>mieru 控制台</h1>
         <p class="muted">${esc(msg)}</p>
       </div>
     </div>`;
@@ -524,7 +524,7 @@ function renderLogin() {
       <div class="auth-card">
         <div class="logo">M</div>
         <h1>登录</h1>
-        <p class="sub">mieru 拓扑面板 v${esc(state.status?.version || '')} · 多 IX / 多落地</p>
+        <p class="sub">Premium Ops · v${esc(state.status?.version || '')} · 多 IX / 多落地</p>
         <form id="li-form" autocomplete="on">
           <label for="li-user">用户名</label>
           <input class="field" id="li-user" name="username" type="text" autocomplete="username"
@@ -597,8 +597,8 @@ function shell(content) {
     <div class="layout">
       <aside class="sidebar">
         <div class="brand"><div class="logo sm">M</div><div>
-          <div class="brand-title">mieru 面板</div>
-          <div class="brand-sub">v${esc(state.status?.version || '')} · 多落地</div>
+          <div class="brand-title">mieru Console</div>
+          <div class="brand-sub">v${esc(state.status?.version || '')} · Ops</div>
         </div></div>
         <nav class="nav">
           ${nav

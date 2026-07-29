@@ -9,3 +9,9 @@ data/
 
 vendor/
 mieru-OneClick*.tar.gz
+
+# local AI agent skills (ui-ux-pro-max etc.)
+.agents/
+
+# local design system export (ui-ux-pro-max)
+design-system/

@@ -792,6 +792,17 @@ app.get('/api/topology', (req, res) => {
 
 app.put('/api/topology', (req, res) => {
   const body = req.body || {};
+  // 拓扑页改落地 listenPort 时必须对比旧值并排队 apply（否则 mita 仍听 7902、IX 却 DNAT 10401）
+  const prevLandingPorts = new Map();
+  try {
+    topology.ensureTopology(state);
+    for (const L of state.topology.landings || []) {
+      if (!L?.nodeId) continue;
+      prevLandingPorts.set(String(L.nodeId), Number(L.listenPort) || 0);
+    }
+  } catch {
+    /* */
+  }
   const prevHash = (() => {
     try {
       return mieru.configHash(state);
@@ -811,6 +822,42 @@ app.put('/api/topology', (req, res) => {
   // 保存拓扑触发端口段纠正时，自动排队 apply 到对应落地
   const sanitizedApplied = flushPortSanitizeApplies('topology-save-port-sanitize');
   if (sanitizedApplied.length) serverConfChanged = true;
+  // 显式/间接改了落地端口 → 同步 node.server 并 apply
+  const portChangedApplied = [];
+  try {
+    topology.ensureTopology(state);
+    for (const L of state.topology.landings || []) {
+      if (!L?.nodeId) continue;
+      const next = Number(L.listenPort) || 0;
+      const prev = prevLandingPorts.has(String(L.nodeId))
+        ? prevLandingPorts.get(String(L.nodeId))
+        : null;
+      const node = nodes.findNode(state, L.nodeId);
+      if (!node) continue;
+      if (next && Number(node.server?.listenPort) !== next) {
+        node.server = { ...(node.server || {}), listenPort: next };
+      }
+      // home 与 listen 对齐（防 DNAT 到 10401 而 home 仍 7902 的半截配置由脚本侧处理；这里保 mita）
+      if (next && (!L.homeReachablePort || Number(L.homeReachablePort) === 7901) && next !== 7901) {
+        L.homeReachablePort = next;
+      }
+      if (next && prev != null && prev !== next) {
+        nodes.markNodeDirty(node);
+        if (state.mode === 'agent') {
+          try {
+            enqueueApply(node, 'mieru_apply');
+            portChangedApplied.push(node.id);
+          } catch (e) {
+            console.warn('[panel] topology port-change apply:', e.message);
+          }
+        }
+        state.clientsNeedRescan = true;
+        serverConfChanged = true;
+      }
+    }
+  } catch (e) {
+    console.warn('[panel] topology landing port sync:', e.message);
+  }
   if (state.mode === 'agent') nodes.syncPrimaryFromState(state);
   if (body.wizardDone !== undefined) state.wizardDone = Boolean(body.wizardDone);
   persist();
@@ -819,6 +866,11 @@ app.put('/api/topology', (req, res) => {
   if (serverConfChanged) tips.push('监听参数有变，请在落地「应用配置/一键落地」');
   if (sanitizedApplied.length) {
     tips.push(`已自动纠正 ${sanitizedApplied.length} 个落地端口并排队下发 mita（约 10–30 秒）`);
+  }
+  if (portChangedApplied.length) {
+    tips.push(
+      `拓扑端口变更已排队下发 ${portChangedApplied.length} 个落地 mita（约 10–30 秒后 ss 应见新端口）`
+    );
   }
   res.json({
     ok: true,
@@ -1984,6 +2036,49 @@ app.post('/api/agent/heartbeat', (req, res) => {
     } catch (e) {
       console.warn('[panel] usage merge failed:', e.message);
     }
+  }
+  // mita 实际端口 ≠ 面板落地端口（CM7：面板 10401、mita 仍 7902）→ 自动重下发
+  try {
+    topology.ensureTopology(state);
+    const L = topology.getLandingByNodeId(state, node.id);
+    const want = Number(L?.listenPort) || Number(node.server?.listenPort) || 0;
+    const mita = body.status?.mita || node.lastReport?.mita || {};
+    const actualPorts = Array.isArray(mita.listenPorts)
+      ? mita.listenPorts.map(Number).filter((p) => p > 0)
+      : [];
+    const configured = Number(mita.configuredPort) || actualPorts[0] || 0;
+    const mismatch =
+      want > 0 &&
+      (mita.portMismatch === true ||
+        (actualPorts.length > 0 && !actualPorts.includes(want)) ||
+        (configured > 0 && configured !== want && !actualPorts.includes(want)));
+    if (mismatch && state.mode === 'agent') {
+      const now = Date.now();
+      const last = Number(node._lastPortMismatchApplyAt) || 0;
+      // 冷却 90s，避免心跳风暴
+      if (now - last > 90 * 1000) {
+        node._lastPortMismatchApplyAt = now;
+        nodes.markNodeDirty(node);
+        if (want) node.server = { ...(node.server || {}), listenPort: want };
+        const hasPending = (node.jobs || []).some(
+          (j) =>
+            (j.status === 'pending' || j.status === 'running') &&
+            (j.type === 'mieru_apply' || j.type === 'apply' || j.type === 'mieru_install')
+        );
+        if (!hasPending) {
+          try {
+            enqueueApply(node, 'mieru_apply');
+            console.log(
+              `[panel] mita 端口不一致 node=${node.name || node.id} want=${want} actual=${actualPorts.join(',') || configured || '?'} → 已排队 apply`
+            );
+          } catch (e) {
+            console.warn('[panel] port-mismatch apply:', e.message);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[panel] port mismatch check:', e.message);
   }
   nodes.reclaimStaleJobs(node);
   const pending = nodes.getPendingJobs(node, 3);

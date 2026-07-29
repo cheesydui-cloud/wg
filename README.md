@@ -3,7 +3,7 @@
 中文、新手友好的 **mieru / mita 拓扑出口管理面板**。
 
 仓库：https://github.com/cheesydui-cloud/wg  
-当前版本：**v4.6.8**（CM7/第二台 IX：禁止空 Host 偷第一台前置 · 保存不改全局端口 · 端口纠正自动 apply）
+当前版本：**v4.6.9**（CM7：拓扑改端口自动 apply · mita 端口不一致自动重下发 · Agent 4.3.4 上报真实端口）
 
 - 每台 IX 独立商家前置（IP/域名）与端口段
 - 拓扑 = IX 工作台；落地列表点开详情；客户端按落地分组
@@ -31,6 +31,11 @@
 | **兼容 v3.1** | 单前置 / 单 IX / 单落地自动迁成一条路由，Endpoint 保留 |
 
 路径保持不变。业务流量不经面板。
+
+### v4.6.9
+- **现场根因（pro-664）**：IX 已 DNAT `10401→家宽:10401`，但落地 mita 仍 `portBindings:7902`。拓扑页改端口原先不排队 apply。
+- 拓扑保存：落地 `listenPort` 变化 → 自动 `mieru_apply`；心跳发现 mita 实际端口 ≠ 面板端口 → 冷却后自动重下发。
+- Agent **4.3.4**：`describe config` 上报 `listenPorts`；诊断/落地列表显示端口不一致。
 
 ### v4.6.8
 - **CM7/第二台 IX 通网**：空 Host 不再回落第一台前置（避免分享 `第一台IP:10400` 假通）；保存第二台不改全局 `ingress.port`；跨段端口纠正后自动 dirty 并排队 apply mita。
@@ -261,7 +266,7 @@ git clone https://github.com/cheesydui-cloud/wg.git ~/wg
 cd ~/wg && sudo bash install.sh
 ```
 
-打开 `http://面板IP:51821`，确认版本 **v4.6.8**。
+打开 `http://面板IP:51821`，确认版本 **v4.6.9**。
 
 忘记密码：
 

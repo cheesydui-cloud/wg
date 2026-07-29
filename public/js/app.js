@@ -2113,7 +2113,16 @@ async function renderServer() {
             </div>
             <div class="landing-row-meta">
               <span>mita <span class="mono">${esc(n.mita?.status || '-')}</span></span>
-              <span>端口 <span class="mono">:${esc(L.listenPort || n.listenPort || 7901)}</span></span>
+              <span>端口 <span class="mono">:${esc(L.listenPort || n.listenPort || 7901)}</span>${
+                Array.isArray(n.mita?.listenPorts) && n.mita.listenPorts.length
+                  ? n.mita.listenPorts.map(Number).includes(Number(L.listenPort || n.listenPort))
+                    ? ''
+                    : ` <span class="badge warn" title="mita 实际端口与面板不一致">mita:${esc(n.mita.listenPorts.join('/'))}</span>`
+                  : n.mita?.configuredPort &&
+                      Number(n.mita.configuredPort) !== Number(L.listenPort || n.listenPort)
+                    ? ` <span class="badge warn">mita:${esc(n.mita.configuredPort)}</span>`
+                    : ''
+              }</span>
               <span>IX ${esc(ixName(L.ixId || ixes[0]?.id))}</span>
               <span>用户 ${userN || n.clientCount || 0}</span>
               <span class="mono">${esc(n.exitPublicIp || '出网—')}</span>
@@ -2131,6 +2140,20 @@ async function renderServer() {
                 : ''
             }
             <div class="kv"><span>出网 IP</span><span class="mono">${esc(n.exitPublicIp || '-')}</span></div>
+            ${
+              (Array.isArray(n.mita?.listenPorts) &&
+                n.mita.listenPorts.length &&
+                !n.mita.listenPorts.map(Number).includes(Number(L.listenPort || n.listenPort || 0))) ||
+              (n.mita?.configuredPort &&
+                Number(n.mita.configuredPort) !== Number(L.listenPort || n.listenPort || 0))
+                ? `<div class="alert warn compact" style="margin-top:8px"><div>
+                    <strong>mita 端口未跟上</strong>
+                    <span class="muted"> · 面板 :${esc(L.listenPort || n.listenPort)} · mita 实际 :${esc(
+                      (n.mita.listenPorts && n.mita.listenPorts.join('/')) || n.mita.configuredPort || '?'
+                    )} · 点「应用配置」或「一键落地」下发（约 10–30 秒）</span>
+                  </div></div>`
+                : ''
+            }
             <div class="inline-fields" style="margin-top:10px">
               <div>
                 <label>落地显示名称</label>
@@ -2142,21 +2165,21 @@ async function renderServer() {
               </div>
               <div>
                 <label>本落地监听端口</label>
-                <input class="field mono" id="n-port-${n.id}" value="${esc(L.listenPort || n.listenPort || 7901)}" title="同 IX 多落地须不同，如 7902" />
+                <input class="field mono" id="n-port-${n.id}" value="${esc(L.listenPort || n.listenPort || 7901)}" title="同 IX 多落地须不同；CM7 用 104xx" />
               </div>
               <div>
                 <label>家宽可达地址（IX→家宽）</label>
                 <input class="field mono" id="n-home-${n.id}" value="${esc(L.homeReachableHost || '')}" placeholder="家宽公网 IP 或隧道" />
               </div>
             </div>
-            <p class="field-hint">保存后到「拓扑」生成该 IX 转发脚本。改端口后需「应用配置」。</p>
+            <p class="field-hint">保存配置会自动排队 apply 新端口；仍不对时再点「应用配置」。改完后到拓扑重新生成 IX 转发脚本。</p>
             <div class="landing-actions">
               <div class="btn-row landing-actions-primary">
-                <button class="btn btn-sm btn-primary" data-save-node="${n.id}" title="保存本机名称/端口/IX/可达地址">保存配置</button>
+                <button class="btn btn-sm btn-primary" data-save-node="${n.id}" title="保存本机名称/端口/IX/可达地址并自动 apply">保存配置</button>
                 <button class="btn btn-sm btn-success" data-exit-node="${n.id}" title="安装/启动 mita 并套用基础参数">一键落地</button>
-                <button class="btn btn-sm btn-success" data-apply-node="${n.id}" title="下发本机用户到 mita" ${userN ? '' : 'disabled'}>应用配置</button>
+                <button class="btn btn-sm btn-success" data-apply-node="${n.id}" title="下发本机用户与端口到 mita（0 用户也可用占位覆盖端口）">应用配置</button>
                 <button class="btn btn-sm btn-secondary" data-users-node="${n.id}" title="查看绑定到本落地的客户端">本机用户</button>
-                ${userN ? '' : '<span class="muted" style="font-size:12px">0 用户 · 先到客户端绑定</span>'}
+                ${userN ? '' : '<span class="muted" style="font-size:12px">0 用户 · 仍可应用以切换 mita 端口</span>'}
               </div>
               <details class="landing-more">
                 <summary>更多操作 · Agent / 危险</summary>

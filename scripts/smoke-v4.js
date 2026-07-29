@@ -1043,11 +1043,12 @@ ok('publicTopology per-IX ingress/endpoints');
   const fs = require('fs');
   const path = require('path');
   const ver = fs.readFileSync(path.join(__dirname, '..', 'agent', 'VERSION'), 'utf8').trim();
-  assert.strictEqual(ver, '4.3.3');
+  assert.strictEqual(ver, '4.3.4');
   const src = fs.readFileSync(path.join(__dirname, '..', 'agent', 'index.js'), 'utf8');
-  assert.ok(src.includes("const VERSION = '4.3.3'"));
+  assert.ok(src.includes("const VERSION = '4.3.4'"));
   assert.ok(src.includes('agentTargetVersion'));
-  ok('agent 4.3.3 bundle present');
+  assert.ok(src.includes('mitaConfiguredPorts') || src.includes('describe'));
+  ok('agent 4.3.4 bundle present');
 }
 
 

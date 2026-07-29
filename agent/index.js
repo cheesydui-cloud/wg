@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Edge Agent v4.3.3 — mieru / mita 落地（支持多落地 + 流量/套餐）
+ * Edge Agent v4.3.4 — mieru / mita 落地（支持多落地 + 流量/套餐）
  * 连接中心面板，拉取任务：安装/应用 mita、上报状态与用量
  *
  * 环境变量：
@@ -19,7 +19,7 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
-const VERSION = '4.3.3';
+const VERSION = '4.3.4';
 
 const PANEL_URL = (process.env.WG_PANEL_URL || '').replace(/\/$/, '');
 const TOKEN = process.env.WG_AGENT_TOKEN || '';
@@ -346,6 +346,25 @@ function findMitaBin() {
   return 'mita';
 }
 
+/** 从 mita describe config 解析真实 portBindings（CM7 常面板 10401 但 mita 仍 7902） */
+async function mitaConfiguredPorts() {
+  const bin = findMitaBin();
+  const r = await run(bin, ['describe', 'config'], { timeout: 15000 });
+  if (!r.ok && !(r.stdout || '').trim()) return [];
+  const text = `${r.stdout || ''}\n${r.stderr || ''}`;
+  const ports = new Set();
+  for (const m of text.matchAll(/"port"\s*:\s*(\d{1,5})/g)) {
+    const p = Number(m[1]);
+    if (p >= 1 && p <= 65535) ports.add(p);
+  }
+  // 人类可读：port: 7902 / Port 7902
+  for (const m of text.matchAll(/\b[Pp]ort(?:Bindings)?\b[^0-9]{0,40}?(\d{2,5})\b/g)) {
+    const p = Number(m[1]);
+    if (p >= 1 && p <= 65535) ports.add(p);
+  }
+  return [...ports];
+}
+
 async function mitaStatus() {
   const bin = findMitaBin();
   const st = await run(bin, ['status'], { timeout: 15000 });
@@ -357,6 +376,11 @@ async function mitaStatus() {
   let version = '';
   const ver = await run(bin, ['version'], { timeout: 8000 });
   if (ver.ok) version = ver.stdout.split('\n')[0] || '';
+  try {
+    listenPorts = await mitaConfiguredPorts();
+  } catch {
+    listenPorts = [];
+  }
 
   return {
     ok: st.ok || running || idle,
@@ -365,6 +389,7 @@ async function mitaStatus() {
     idle,
     listening,
     listenPorts,
+    configuredPort: listenPorts[0] || null,
     version,
     raw: text.slice(0, 2000),
     installed: st.ok || running || idle || !/not found|No such file/i.test(text),
@@ -1109,10 +1134,37 @@ async function collectStatus() {
     }
   }
 
-  const ss = await run('ss', ['-lntu']);
-  if (ss.ok && local.listenPort) {
-    const re = new RegExp(':' + local.listenPort + '(?:\\s|$)', 'm');
-    mita.listening = re.test(ss.stdout || '');
+  const expectedPort = Number(local.listenPort) || null;
+  mita.expectedPort = expectedPort;
+  if (!Array.isArray(mita.listenPorts)) mita.listenPorts = [];
+  // ss：期望端口是否在听；并补充本机 TCP 监听端口列表（辅助）
+  const ss = await run('ss', ['-lnt']);
+  if (ss.ok) {
+    const out = ss.stdout || '';
+    if (expectedPort) {
+      const re = new RegExp(':' + expectedPort + '(?:\\s|$)', 'm');
+      mita.listening = re.test(out);
+    }
+    // 若 describe 没解析到，从 ss 里抓常见 mieru 段（7900–7999 / 10400–10499）
+    if (!mita.listenPorts.length) {
+      const found = new Set();
+      for (const m of out.matchAll(/:((?:79\d{2}|104\d{2}))\s/g)) {
+        found.add(Number(m[1]));
+      }
+      mita.listenPorts = [...found];
+      if (mita.listenPorts[0]) mita.configuredPort = mita.listenPorts[0];
+    }
+  } else if (expectedPort) {
+    mita.listening = await portIsListeningOnce(expectedPort);
+  }
+  // 配置端口与期望不一致时明确标 false（面板据此自动重 apply）
+  if (
+    expectedPort &&
+    mita.listenPorts.length &&
+    !mita.listenPorts.map(Number).includes(expectedPort)
+  ) {
+    mita.listening = false;
+    mita.portMismatch = true;
   }
 
   let usage = local.lastUsage || null;

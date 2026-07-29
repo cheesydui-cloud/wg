@@ -1353,23 +1353,54 @@ function diagnoseTopology(state, opts = {}) {
       const report = node?.lastReport || null;
       const mita = report?.mita || {};
       const running = Boolean(mita.running) || /RUNNING/i.test(String(mita.status || ''));
+      const wantPort = Number(L.listenPort) || 0;
+      const actualPorts = Array.isArray(mita.listenPorts)
+        ? mita.listenPorts.map(Number).filter((p) => p > 0)
+        : [];
+      const configured = Number(mita.configuredPort) || actualPorts[0] || 0;
+      const portMismatch =
+        online &&
+        running &&
+        wantPort > 0 &&
+        (mita.portMismatch === true ||
+          (actualPorts.length > 0 && !actualPorts.includes(wantPort)) ||
+          (configured > 0 && configured !== wantPort && !actualPorts.includes(wantPort)));
+      let landLevel = online && running ? 'ok' : online ? 'warn' : 'error';
+      let landFix = online
+        ? running
+          ? L.homeReachableHost
+            ? ''
+            : '填写本落地「家宽可达地址」并重新生成 IX 转发'
+          : '点「一键落地」'
+        : '在落地页安装 Agent';
+      let landDetail = online
+        ? `Agent 在线${node?.hostname ? ' · ' + node.hostname : ''} · mita ${mita.status || '未知'} · 面板端口 ${L.listenPort}${
+            actualPorts.length ? ` · mita实际 ${actualPorts.join('/')}` : configured ? ` · mita实际 ${configured}` : ''
+          } · IX可达 ${L.homeReachableHost || '未填'}`
+        : L.nodeId
+          ? 'Agent 离线'
+          : '未绑定 Agent 节点';
+      if (portMismatch) {
+        landLevel = 'error';
+        landDetail += ` · 端口不一致（面板 ${wantPort} ≠ mita ${actualPorts.join('/') || configured}）`;
+        landFix = `落地页点「应用配置/一键落地」把 mita 改到 ${wantPort}；成功后 ss 应见 :${wantPort}（你现场常见：面板 10401、mita 仍 7902）`;
+      }
       push({
         id: `landing_${L.id}`,
-        level: online && running ? 'ok' : online ? 'warn' : 'error',
+        level: landLevel,
         title: `落地 · ${L.name}`,
-        detail: online
-          ? `Agent 在线${node?.hostname ? ' · ' + node.hostname : ''} · mita ${mita.status || '未知'} · 端口 ${L.listenPort} · IX可达 ${L.homeReachableHost || '未填'}`
-          : L.nodeId
-            ? 'Agent 离线'
-            : '未绑定 Agent 节点',
-        fix: online
-          ? running
-            ? L.homeReachableHost
-              ? ''
-              : '填写本落地「家宽可达地址」并重新生成 IX 转发'
-            : '点「一键落地」'
-          : '在落地页安装 Agent',
+        detail: landDetail,
+        fix: landFix,
       });
+      if (portMismatch) {
+        push({
+          id: `landing_port_mismatch_${L.id}`,
+          level: 'error',
+          title: `mita 端口未跟上 · ${L.name}`,
+          detail: `面板/IX 按 :${wantPort}，落地 mita 仍在 :${actualPorts.join('/') || configured || '?'}`,
+          fix: landFix,
+        });
+      }
       if (report?.exitPublicIp) {
         push({
           id: `egress_${L.id}`,
